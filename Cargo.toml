@@ -1,0 +1,86 @@
+[package]
+name = "molecular-autoencoder"
+version = "0.1.0"
+edition = "2024"
+description = "Molecular representation autoencoder models built with Burn."
+repository = "https://github.com/earth-metabolome-initiative/molecular-autoencoder"
+license = "MIT"
+readme = "README.md"
+keywords = ["autoencoder", "burn", "fingerprints", "molecular", "pubchem"]
+categories = ["science"]
+
+[lib]
+name = "molecular_autoencoder"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "ndarray", "train", "tui"]
+std = [
+    "burn/dataset",
+    "burn/std",
+    "finge-rs/smiles-support",
+    "serde/std",
+    "thiserror/std",
+]
+ndarray = ["burn/ndarray"]
+train = ["burn/train", "ndarray", "dep:indicatif"]
+tui = ["train", "burn/tui"]
+cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl"]
+cuda-fusion = ["cuda", "burn/fusion", "burn/autotune", "dep:burn-fusion", "dep:burn-ir"]
+cuda-no-fusion = ["cuda", "burn/autotune"]
+fingerprints = ["finge-rs/smiles-support"]
+datasets = ["std", "dep:flate2", "dep:indicatif", "dep:rayon", "smiles-parser/datasets"]
+
+[dependencies]
+burn = { version = "=0.21.0", default-features = false }
+burn-cubecl = { version = "=0.21.0", default-features = false, optional = true }
+burn-fusion = { version = "=0.21.0", default-features = false, optional = true }
+burn-ir = { version = "=0.21.0", default-features = false, optional = true }
+cubecl = { version = "=0.10.0", default-features = false, optional = true }
+elements_rs = "0.2.7"
+finge-rs = { git = "https://github.com/earth-metabolome-initiative/finge-rs", default-features = false, features = ["smiles-support"] }
+flate2 = { version = "1.1", optional = true }
+indicatif = { version = "0.18", optional = true }
+rayon = { version = "1.11", optional = true }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main", default-features = false }
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = 1
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+dbg_macro = "deny"
+default_trait_access = "allow"
+doc_markdown = "allow"
+float_cmp = "allow"
+missing_const_for_fn = "allow"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+needless_pass_by_value = "allow"
+redundant_clone = "allow"
+similar_names = "allow"
+suboptimal_flops = "allow"
+todo = "deny"
+too_many_lines = "allow"
+unimplemented = "deny"
+unwrap_used = "deny"
