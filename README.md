@@ -26,6 +26,11 @@ The default training architecture uses a 512-d latent space with
 side-loss weights are 0.05 for descriptor regression and 0.10 for latent
 Tanimoto ranking.
 
+The command below is tuned for the current training workstation: an NVIDIA
+GeForce RTX 5090 with 32607 MiB VRAM, CUDA 12.9, and WSL CUDA libraries under
+`/usr/lib/wsl/lib`. It uses `RUSTFLAGS="-C target-cpu=native"` and a 32768
+batch size; lower the batch size on smaller GPUs.
+
 ```bash
 CUDA_PATH=/usr/local/cuda-12.9 \
 PATH=/usr/local/cuda-12.9/bin:$PATH \
@@ -33,14 +38,17 @@ LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:/usr/lib/wsl/lib:$LD_LIBRARY_PATH \
 CUDARC_CUDA_VERSION=12090 \
 RUSTFLAGS="-C target-cpu=native" \
 cargo run --release --no-default-features --features std,cuda-fusion,train,tui,datasets \
-  --example train_cached_shards -- all shards/pubchem-zinc20 runs/cuda-ae \
-  --rows-per-shard 10000000 --epochs 10 --batch-size 24576 --loader-workers 20 \
+  --example train_cached_shards -- all shards/pubchem-zinc20 runs/cuda-ae-pubchem-zinc20-large-100e \
+  --rows-per-shard 10000000 --epochs 100 --batch-size 32768 --loader-workers 20 \
   --metric-every 50 --descriptor-weight 0.05 --tanimoto-ranking-weight 0.10 \
-  --cuda-device 0
+  --preprocess-threads 64 --cuda-device 0
 ```
 
 Use `pubchem` or `zinc20` instead of `all` to preprocess one source. For a
 partial ZINC20 pass, add `--zinc20-chunks FIRST-LAST`.
 
-Add `--resume` to continue from `runs/cuda-ae/model.mpk`,
-`runs/cuda-ae/optimizer.mpk`, and `runs/cuda-ae/state.json`.
+Use a fresh checkpoint directory when changing architecture or loss defaults;
+`--resume` reuses the existing `model-config.json`. Add `--resume` to continue
+from `runs/cuda-ae-pubchem-zinc20-large-100e/model.mpk`,
+`runs/cuda-ae-pubchem-zinc20-large-100e/optimizer.mpk`, and
+`runs/cuda-ae-pubchem-zinc20-large-100e/state.json`.
