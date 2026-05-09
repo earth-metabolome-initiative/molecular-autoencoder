@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check
+        run: cargo check --locked --no-default-features --features std,ndarray,train,tui,datasets --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --no-default-features --features std,ndarray,train,tui,datasets --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --no-default-features --features std,ndarray,train,datasets --all-targets
+
+      - name: Documentation
+        run: cargo doc --locked --no-default-features --features std,ndarray,train,datasets --no-deps
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Generate coverage
+        run: >-
+          cargo tarpaulin --engine llvm --locked --no-default-features
+          --features std,ndarray,train,datasets
+          --all-targets --out Xml --output-dir coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          files: coverage/cobertura.xml
+          flags: rust
+          name: rust-coverage
+          fail_ci_if_error: true
