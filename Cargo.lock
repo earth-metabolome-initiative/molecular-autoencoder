@@ -3772,7 +3772,6 @@ dependencies = [
  "cubecl",
  "elements_rs",
  "finge-rs",
- "flate2",
  "indicatif",
  "rayon",
  "serde",
@@ -5636,7 +5635,7 @@ dependencies = [
 [[package]]
 name = "smiles-parser"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smiles-parser?branch=main#ad15ce7205f4e3ad842f5eaa153d562f3548bd79"
+source = "git+https://github.com/earth-metabolome-initiative/smiles-parser?branch=main#b32caea4cf0e046546ee1e2ec3d47c2e195ccc25"
 dependencies = [
  "elements_rs",
  "flate2",
@@ -5646,6 +5645,7 @@ dependencies = [
  "molecular-formulas",
  "reqwest 0.13.3",
  "smallvec",
+ "tar",
  "thiserror 2.0.18",
 ]
 

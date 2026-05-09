@@ -1,4 +1,4 @@
-//! Train the molecular autoencoder from cached PubChem shard files.
+//! Train the molecular autoencoder from cached dataset shard files.
 
 #[cfg(all(
     feature = "std",
@@ -59,9 +59,10 @@ use molecular_autoencoder::tanimoto_cuda::{
     any(feature = "cuda", feature = "ndarray")
 ))]
 use molecular_autoencoder::{
-    DEFAULT_PREPROCESS_CHUNK_ROWS, DEFAULT_PREPROCESS_THREADS, DEFAULT_PUBCHEM_ROWS_PER_SHARD,
-    PreprocessingConfig, PubChemPreprocessOptions, features::REGRESSION_TARGET_WIDTH,
-    preprocess_cid_smiles_record_chunks, pubchem_records_from_path,
+    DEFAULT_PREPROCESS_CHUNK_ROWS, DEFAULT_PREPROCESS_THREADS, DEFAULT_ROWS_PER_SHARD,
+    DatasetPreprocessOptions, MoleculeRecord, PreprocessingConfig,
+    features::REGRESSION_TARGET_WIDTH, molecule_records_from_smiles_dataset,
+    preprocess_dataset_record_chunks,
 };
 #[cfg(all(
     feature = "std",
@@ -76,7 +77,7 @@ const DEFAULT_PREPROCESS_THREADS: usize = 64;
     not(feature = "datasets"),
     any(feature = "cuda", feature = "ndarray")
 ))]
-const DEFAULT_PUBCHEM_ROWS_PER_SHARD: usize = 10_000_000;
+const DEFAULT_ROWS_PER_SHARD: usize = 10_000_000;
 #[cfg(all(
     feature = "std",
     feature = "train",
@@ -100,7 +101,10 @@ use serde::{Deserialize, Serialize};
     feature = "datasets",
     any(feature = "cuda", feature = "ndarray")
 ))]
-use smiles_parser::prelude::{DatasetFetchOptions, DatasetSource, GzipMode, PUBCHEM_SMILES};
+use smiles_parser::prelude::{
+    DatasetCollectionSource, DatasetFetchOptions, DatasetSource, GzipMode, PUBCHEM_SMILES,
+    SmilesDatasetRecordSource, Zinc20Smiles,
+};
 
 #[cfg(all(
     feature = "std",
@@ -134,6 +138,20 @@ const DEFAULT_DEVICE_PREFETCH_BATCHES: usize = 0;
 ))]
 const DEFAULT_METRIC_EVERY: usize = 10;
 
+#[cfg(all(
+    feature = "std",
+    feature = "train",
+    any(feature = "cuda", feature = "ndarray")
+))]
+const ZINC20_FIRST_CHUNK: u8 = 1;
+
+#[cfg(all(
+    feature = "std",
+    feature = "train",
+    any(feature = "cuda", feature = "ndarray")
+))]
+const ZINC20_LAST_CHUNK: u8 = 20;
+
 #[cfg(all(feature = "std", feature = "train", feature = "cuda"))]
 trait TanimotoMetricBackend: Backend + CountedTanimotoKernelBackend {}
 
@@ -161,10 +179,63 @@ impl<B> TanimotoMetricBackend for B where B: Backend {}
     feature = "train",
     any(feature = "cuda", feature = "ndarray")
 ))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceSelection {
+    PubChem,
+    Zinc20 { first_chunk: u8, last_chunk: u8 },
+    PubChemAndZinc20 { first_chunk: u8, last_chunk: u8 },
+}
+
+#[cfg(all(
+    feature = "std",
+    feature = "train",
+    any(feature = "cuda", feature = "ndarray")
+))]
+impl SourceSelection {
+    fn with_zinc20_chunks(self, first_chunk: u8, last_chunk: u8) -> AppResult<Self> {
+        let updated = match self {
+            Self::PubChem => {
+                return Err(invalid_input(
+                    "--zinc20-chunks is only valid for `zinc20` or `all` sources",
+                ));
+            }
+            Self::Zinc20 { .. } => Self::Zinc20 {
+                first_chunk,
+                last_chunk,
+            },
+            Self::PubChemAndZinc20 { .. } => Self::PubChemAndZinc20 {
+                first_chunk,
+                last_chunk,
+            },
+        };
+        Ok(updated)
+    }
+
+    fn manifest_source(self) -> String {
+        match self {
+            Self::PubChem => "pubchem-smiles".to_string(),
+            Self::Zinc20 {
+                first_chunk,
+                last_chunk,
+            } => format!("zinc20-smiles chunks {first_chunk}..={last_chunk}"),
+            Self::PubChemAndZinc20 {
+                first_chunk,
+                last_chunk,
+            } => format!("pubchem-smiles + zinc20-smiles chunks {first_chunk}..={last_chunk}"),
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "std",
+    feature = "train",
+    any(feature = "cuda", feature = "ndarray")
+))]
 #[derive(Debug, Clone)]
 struct Args {
     manifest_path: PathBuf,
     cache_dir: Option<PathBuf>,
+    source_selection: Option<SourceSelection>,
     checkpoint_dir: PathBuf,
     rows_per_shard: usize,
     epochs: usize,
@@ -1738,26 +1809,46 @@ fn prepare_manifest(args: &Args) -> AppResult<PathBuf> {
     let Some(cache_dir) = &args.cache_dir else {
         return Ok(args.manifest_path.clone());
     };
+    let Some(source_selection) = args.source_selection else {
+        return Ok(args.manifest_path.clone());
+    };
     let manifest_path = cache_dir.join("manifest.json");
+    let expected_source = source_selection.manifest_source();
 
     if manifest_path.exists() && !args.force_preprocess {
         let manifest = ShardManifest::read_from_path(&manifest_path)?;
-        if manifest.manifest_version == SHARD_MANIFEST_VERSION {
+        if manifest.manifest_version == SHARD_MANIFEST_VERSION && manifest.source == expected_source
+        {
             println!(
-                "using_cached_manifest={} source=pubchem-smiles",
-                manifest_path.display()
+                "using_cached_manifest={} source={}",
+                manifest_path.display(),
+                manifest.source
             );
             return Ok(manifest_path);
         }
-        println!(
-            "ignoring_cached_manifest={} reason=manifest_version_mismatch found={} expected={}",
-            manifest_path.display(),
-            manifest.manifest_version,
-            SHARD_MANIFEST_VERSION
-        );
+        if manifest.manifest_version == SHARD_MANIFEST_VERSION {
+            println!(
+                "ignoring_cached_manifest={} reason=source_mismatch found={} expected={}",
+                manifest_path.display(),
+                manifest.source,
+                expected_source
+            );
+        } else {
+            println!(
+                "ignoring_cached_manifest={} reason=manifest_version_mismatch found={} expected={}",
+                manifest_path.display(),
+                manifest.manifest_version,
+                SHARD_MANIFEST_VERSION
+            );
+        }
     }
 
-    preprocess_cache(cache_dir, args.rows_per_shard, args.preprocess_threads)?;
+    preprocess_cache(
+        cache_dir,
+        args.rows_per_shard,
+        args.preprocess_threads,
+        source_selection,
+    )?;
     Ok(manifest_path)
 }
 
@@ -1771,6 +1862,7 @@ fn preprocess_cache(
     cache_dir: &Path,
     rows_per_shard: usize,
     preprocess_threads: usize,
+    source_selection: SourceSelection,
 ) -> AppResult<()> {
     if rows_per_shard == 0 {
         return Err(invalid_input("rows per shard must be greater than zero"));
@@ -1778,81 +1870,62 @@ fn preprocess_cache(
 
     std::fs::create_dir_all(cache_dir)?;
     let source_cache_dir = cache_dir.join("source");
-    let source_progress = spinner(format!(
-        "checking PubChem source cache at {}",
-        source_cache_dir.display()
-    ));
-    let artifact = PUBCHEM_SMILES.fetch_with_options(&DatasetFetchOptions {
-        cache_dir: Some(source_cache_dir),
-        gzip_mode: GzipMode::KeepCompressed,
-        ..DatasetFetchOptions::default()
-    })?;
-    source_progress.finish_with_message(format!(
-        "PubChem source ready artifact={}",
-        artifact.path().display()
-    ));
     let config = PreprocessingConfig::default();
-    let source = format!("{} ({})", PUBCHEM_SMILES.url(), artifact.path().display());
-    let mut manifest = ShardManifest::new(source, config.clone());
+    let mut manifest = ShardManifest::new(source_selection.manifest_source(), config.clone());
     let mut shard = SparseMoleculeShard::new(config.counted_ecfp.size, REGRESSION_TARGET_WIDTH);
     let mut shard_index = 0_usize;
+    let mut records_seen_total = 0_usize;
     let start = Instant::now();
 
     println!(
-        "preprocess_start source=pubchem-smiles artifact={} cache_dir={} rows_per_shard={} chunk_rows={} threads={}",
-        artifact.path().display(),
+        "preprocess_start source={} cache_dir={} rows_per_shard={} chunk_rows={} threads={}",
+        source_selection.manifest_source(),
         cache_dir.display(),
         rows_per_shard,
         DEFAULT_PREPROCESS_CHUNK_ROWS,
         preprocess_threads
     );
 
-    // smiles-parser owns PubChem acquisition/cache. Its SMILES iterator drops
-    // CIDs, so we retain CID extraction here for deterministic splits.
-    let progress = PreprocessProgress::new(cache_dir, rows_per_shard, preprocess_threads);
-    let records_seen = preprocess_cid_smiles_record_chunks(
-        pubchem_records_from_path(artifact.path())?,
-        &config,
-        PubChemPreprocessOptions {
-            chunk_rows: DEFAULT_PREPROCESS_CHUNK_ROWS,
-            threads: Some(preprocess_threads),
-        },
-        |chunk| {
-            for result in chunk.results {
-                match result {
-                    Ok(targets) => {
-                        shard.push_targets(&targets, config.descriptors)?;
-                        if shard.len() >= rows_per_shard {
-                            write_preprocessed_shard(
-                                cache_dir,
-                                shard_index,
-                                &mut manifest,
-                                &shard,
-                            )?;
-                            progress.shard_written(&manifest, 0);
-                            shard = SparseMoleculeShard::new(
-                                config.counted_ecfp.size,
-                                REGRESSION_TARGET_WIDTH,
-                            );
-                            shard_index += 1;
-                        }
-                    }
-                    Err(error) => {
-                        manifest.error_count += 1;
-                        eprintln!("{error}");
-                    }
-                }
+    let progress = PreprocessProgress::new(
+        cache_dir,
+        source_selection,
+        rows_per_shard,
+        preprocess_threads,
+    );
+    {
+        let mut context = PreprocessContext {
+            cache_dir,
+            source_cache_dir: &source_cache_dir,
+            rows_per_shard,
+            preprocess_threads,
+            config: &config,
+            manifest: &mut manifest,
+            shard: &mut shard,
+            shard_index: &mut shard_index,
+            progress: &progress,
+            records_seen_total: &mut records_seen_total,
+        };
+        match source_selection {
+            SourceSelection::PubChem => context.preprocess_pubchem_source()?,
+            SourceSelection::Zinc20 {
+                first_chunk,
+                last_chunk,
+            } => context.preprocess_zinc20_source(first_chunk, last_chunk)?,
+            SourceSelection::PubChemAndZinc20 {
+                first_chunk,
+                last_chunk,
+            } => {
+                context.preprocess_pubchem_source()?;
+                context.preprocess_zinc20_source(first_chunk, last_chunk)?;
             }
-            progress.record(chunk.records_seen, &manifest, shard.len());
-            Ok(())
-        },
-    )?;
+        }
+    }
     if !shard.is_empty() {
         write_preprocessed_shard(cache_dir, shard_index, &mut manifest, &shard)?;
         progress.shard_written(&manifest, 0);
     }
     manifest.write_to_path(cache_dir.join("manifest.json"))?;
-    progress.finish(records_seen, &manifest, start.elapsed());
+    progress.finish(records_seen_total, &manifest, start.elapsed());
     Ok(())
 }
 
@@ -1866,10 +1939,123 @@ fn preprocess_cache(
     _cache_dir: &Path,
     _rows_per_shard: usize,
     _preprocess_threads: usize,
+    _source_selection: SourceSelection,
 ) -> AppResult<()> {
     Err(invalid_input(
         "source input requires the `datasets` feature; rebuild with `--features std,cuda-fusion,train,datasets`",
     ))
+}
+
+#[cfg(all(
+    feature = "std",
+    feature = "train",
+    feature = "datasets",
+    any(feature = "cuda", feature = "ndarray")
+))]
+struct PreprocessContext<'a> {
+    cache_dir: &'a Path,
+    source_cache_dir: &'a Path,
+    rows_per_shard: usize,
+    preprocess_threads: usize,
+    config: &'a PreprocessingConfig,
+    manifest: &'a mut ShardManifest,
+    shard: &'a mut SparseMoleculeShard,
+    shard_index: &'a mut usize,
+    progress: &'a PreprocessProgress,
+    records_seen_total: &'a mut usize,
+}
+
+#[cfg(all(
+    feature = "std",
+    feature = "train",
+    feature = "datasets",
+    any(feature = "cuda", feature = "ndarray")
+))]
+impl PreprocessContext<'_> {
+    fn preprocess_pubchem_source(&mut self) -> AppResult<()> {
+        let source_progress = spinner(format!(
+            "opening PubChem records cache at {}",
+            self.source_cache_dir.display()
+        ));
+        let records = PUBCHEM_SMILES.iter_records_with_options(&DatasetFetchOptions {
+            cache_dir: Some(self.source_cache_dir.to_path_buf()),
+            gzip_mode: GzipMode::KeepCompressed,
+            ..DatasetFetchOptions::default()
+        })?;
+        source_progress.finish_with_message(format!(
+            "PubChem records ready source={}",
+            PUBCHEM_SMILES.url()
+        ));
+        let records = molecule_records_from_smiles_dataset(PUBCHEM_SMILES.id(), records);
+        self.preprocess_records("PubChem", records)
+    }
+
+    fn preprocess_zinc20_source(&mut self, first_chunk: u8, last_chunk: u8) -> AppResult<()> {
+        let dataset = Zinc20Smiles::chunk_range(first_chunk, last_chunk)?;
+        let label = format!("ZINC20 chunks {first_chunk}..={last_chunk}");
+        let source_progress = spinner(format!(
+            "opening {label} records cache at {}",
+            self.source_cache_dir.display()
+        ));
+        let records = dataset.iter_records_with_options(&DatasetFetchOptions {
+            cache_dir: Some(self.source_cache_dir.to_path_buf()),
+            gzip_mode: GzipMode::Decompress,
+            ..DatasetFetchOptions::default()
+        })?;
+        source_progress.finish_with_message(format!("{label} records ready"));
+        let records = molecule_records_from_smiles_dataset(dataset.id(), records);
+        self.preprocess_records(&label, records)
+    }
+
+    fn preprocess_records<I>(&mut self, dataset_label: &str, records: I) -> AppResult<()>
+    where
+        I: IntoIterator<Item = molecular_autoencoder::Result<MoleculeRecord>>,
+    {
+        let source_records_seen = preprocess_dataset_record_chunks(
+            records,
+            self.config,
+            DatasetPreprocessOptions {
+                chunk_rows: DEFAULT_PREPROCESS_CHUNK_ROWS,
+                threads: Some(self.preprocess_threads),
+            },
+            |chunk| {
+                for result in chunk.results {
+                    match result {
+                        Ok(targets) => {
+                            self.shard.push_targets(&targets, self.config.descriptors)?;
+                            if self.shard.len() >= self.rows_per_shard {
+                                write_preprocessed_shard(
+                                    self.cache_dir,
+                                    *self.shard_index,
+                                    self.manifest,
+                                    self.shard,
+                                )?;
+                                self.progress.shard_written(self.manifest, 0);
+                                *self.shard = SparseMoleculeShard::new(
+                                    self.config.counted_ecfp.size,
+                                    REGRESSION_TARGET_WIDTH,
+                                );
+                                *self.shard_index += 1;
+                            }
+                        }
+                        Err(error) => {
+                            self.manifest.error_count += 1;
+                            eprintln!("{error}");
+                        }
+                    }
+                }
+                self.progress.record(
+                    dataset_label,
+                    *self.records_seen_total + chunk.records_seen,
+                    self.manifest,
+                    self.shard.len(),
+                );
+                Ok(())
+            },
+        )?;
+        *self.records_seen_total += source_records_seen;
+        Ok(())
+    }
 }
 
 #[cfg(all(
@@ -2100,9 +2286,15 @@ struct PreprocessProgress {
     any(feature = "cuda", feature = "ndarray")
 ))]
 impl PreprocessProgress {
-    fn new(cache_dir: &Path, rows_per_shard: usize, threads: usize) -> Self {
+    fn new(
+        cache_dir: &Path,
+        source_selection: SourceSelection,
+        rows_per_shard: usize,
+        threads: usize,
+    ) -> Self {
         let bar = spinner(format!(
-            "preprocessing PubChem into {} rows_per_shard={rows_per_shard} chunk_rows={} threads={}",
+            "preprocessing {} into {} rows_per_shard={rows_per_shard} chunk_rows={} threads={}",
+            source_selection.manifest_source(),
             cache_dir.display(),
             DEFAULT_PREPROCESS_CHUNK_ROWS,
             threads
@@ -2110,10 +2302,16 @@ impl PreprocessProgress {
         Self { bar }
     }
 
-    fn record(&self, records_seen: usize, manifest: &ShardManifest, current_shard_rows: usize) {
+    fn record(
+        &self,
+        dataset_label: &str,
+        records_seen: usize,
+        manifest: &ShardManifest,
+        current_shard_rows: usize,
+    ) {
         if records_seen == 1 || records_seen.is_multiple_of(1024) {
             self.bar.set_message(format!(
-                "preprocessing PubChem records={} rows={} errors={} shards={} current_shard_rows={}",
+                "preprocessing {dataset_label} records={} rows={} errors={} shards={} current_shard_rows={}",
                 records_seen,
                 manifest.row_count + current_shard_rows,
                 manifest.error_count,
@@ -2975,7 +3173,7 @@ impl Args {
         let Some(first) = values.next() else {
             return Err(invalid_input(Self::usage()));
         };
-        let (manifest_path, cache_dir, checkpoint_dir) = match first.as_str() {
+        let (manifest_path, cache_dir, source_selection, checkpoint_dir) = match first.as_str() {
             "pubchem" => {
                 let cache_dir = PathBuf::from(next_value(&mut values, "pubchem <cache-dir>")?);
                 let checkpoint_dir =
@@ -2983,6 +3181,35 @@ impl Args {
                 (
                     cache_dir.join("manifest.json"),
                     Some(cache_dir),
+                    Some(SourceSelection::PubChem),
+                    checkpoint_dir,
+                )
+            }
+            "zinc20" => {
+                let cache_dir = PathBuf::from(next_value(&mut values, "zinc20 <cache-dir>")?);
+                let checkpoint_dir =
+                    PathBuf::from(next_value(&mut values, "zinc20 <checkpoint-dir>")?);
+                (
+                    cache_dir.join("manifest.json"),
+                    Some(cache_dir),
+                    Some(SourceSelection::Zinc20 {
+                        first_chunk: ZINC20_FIRST_CHUNK,
+                        last_chunk: ZINC20_LAST_CHUNK,
+                    }),
+                    checkpoint_dir,
+                )
+            }
+            "all" | "pubchem-zinc20" => {
+                let cache_dir = PathBuf::from(next_value(&mut values, "all <cache-dir>")?);
+                let checkpoint_dir =
+                    PathBuf::from(next_value(&mut values, "all <checkpoint-dir>")?);
+                (
+                    cache_dir.join("manifest.json"),
+                    Some(cache_dir),
+                    Some(SourceSelection::PubChemAndZinc20 {
+                        first_chunk: ZINC20_FIRST_CHUNK,
+                        last_chunk: ZINC20_LAST_CHUNK,
+                    }),
                     checkpoint_dir,
                 )
             }
@@ -2990,18 +3217,19 @@ impl Args {
                 let manifest_path = PathBuf::from(next_value(&mut values, "manifest <path>")?);
                 let checkpoint_dir =
                     PathBuf::from(next_value(&mut values, "manifest <checkpoint-dir>")?);
-                (manifest_path, None, checkpoint_dir)
+                (manifest_path, None, None, checkpoint_dir)
             }
             manifest_path => {
                 let checkpoint_dir = PathBuf::from(next_value(&mut values, "<checkpoint-dir>")?);
-                (PathBuf::from(manifest_path), None, checkpoint_dir)
+                (PathBuf::from(manifest_path), None, None, checkpoint_dir)
             }
         };
         let mut args = Self {
             manifest_path,
             cache_dir,
+            source_selection,
             checkpoint_dir,
-            rows_per_shard: DEFAULT_PUBCHEM_ROWS_PER_SHARD,
+            rows_per_shard: DEFAULT_ROWS_PER_SHARD,
             epochs: 10,
             batch_size: 4096,
             learning_rate: 1.0e-3,
@@ -3041,6 +3269,17 @@ impl Args {
                     args.hidden_widths = parse_hidden_widths(&value)?;
                 }
                 "--rows-per-shard" => args.rows_per_shard = parse_value(&mut values, &flag)?,
+                "--zinc20-chunks" => {
+                    let value = next_value(&mut values, &flag)?;
+                    let (first_chunk, last_chunk) = parse_zinc20_chunks(&value)?;
+                    let Some(selection) = args.source_selection else {
+                        return Err(invalid_input(
+                            "--zinc20-chunks is only valid with a dataset source",
+                        ));
+                    };
+                    args.source_selection =
+                        Some(selection.with_zinc20_chunks(first_chunk, last_chunk)?);
+                }
                 "--checkpoint-every" => args.checkpoint_every = parse_value(&mut values, &flag)?,
                 "--validate-every" => args.validate_every = parse_value(&mut values, &flag)?,
                 "--max-train-batches" => {
@@ -3094,6 +3333,8 @@ impl Args {
 
     fn usage() -> String {
         "usage: train_cached_shards pubchem <cache-dir> <checkpoint-dir> \
+         OR train_cached_shards zinc20 <cache-dir> <checkpoint-dir> \
+         OR train_cached_shards all <cache-dir> <checkpoint-dir> \
          OR train_cached_shards manifest <manifest.json> <checkpoint-dir> \
          [--epochs N] [--batch-size N] [--learning-rate LR] [--latent-width N] \
          [--latent-noise-std STD] \
@@ -3105,7 +3346,8 @@ impl Args {
          [--tanimoto-ranking-min-gap G] [--tanimoto-ranking-candidates N] \
          [--tanimoto-ranking-pairs-per-batch N] \
          [--full-validation] \
-         [--rows-per-shard N] [--preprocess-threads N] [--force-preprocess] \
+         [--rows-per-shard N] [--zinc20-chunks FIRST-LAST] \
+         [--preprocess-threads N] [--force-preprocess] \
          [--resume] [--cuda-device N]"
             .to_string()
     }
@@ -3223,6 +3465,37 @@ fn parse_positive_value(values: &mut impl Iterator<Item = String>, flag: &str) -
         return Err(invalid_input(format!("`{flag}` must be greater than zero")));
     }
     Ok(value)
+}
+
+#[cfg(all(
+    feature = "std",
+    feature = "train",
+    any(feature = "cuda", feature = "ndarray")
+))]
+fn parse_zinc20_chunks(value: &str) -> AppResult<(u8, u8)> {
+    let value = value.trim();
+    let (first, last) = if let Some((first, last)) = value.split_once("..=") {
+        (first, last)
+    } else if let Some((first, last)) = value.split_once('-') {
+        (first, last)
+    } else {
+        (value, value)
+    };
+    let first_chunk = first.parse::<u8>().map_err(|source| {
+        invalid_input(format!("invalid ZINC20 first chunk `{first}`: {source}"))
+    })?;
+    let last_chunk = last
+        .parse::<u8>()
+        .map_err(|source| invalid_input(format!("invalid ZINC20 last chunk `{last}`: {source}")))?;
+    if first_chunk < ZINC20_FIRST_CHUNK
+        || last_chunk > ZINC20_LAST_CHUNK
+        || first_chunk > last_chunk
+    {
+        return Err(invalid_input(format!(
+            "ZINC20 chunks must be an inclusive range within {ZINC20_FIRST_CHUNK}..={ZINC20_LAST_CHUNK}"
+        )));
+    }
+    Ok((first_chunk, last_chunk))
 }
 
 #[cfg(all(

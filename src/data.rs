@@ -1,9 +1,9 @@
-//! PubChem materialized-record parsing and tensor-ready sparse shard IO.
+//! Dataset SMILES preprocessing and tensor-ready sparse shard IO.
 
 use std::{
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    path::Path,
 };
 
 use serde::{Deserialize, Serialize};
@@ -15,136 +15,111 @@ use crate::{
 };
 
 const SHARD_MAGIC: [u8; 8] = *b"MAESH02\0";
+const STABLE_ID_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const STABLE_ID_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const HASH_STABLE_ID_NAMESPACE: u64 = 0x4000_0000_0000_0000;
+const HASH_STABLE_ID_MASK: u64 = 0x3fff_ffff_ffff_ffff;
+const ZINC20_STABLE_ID_NAMESPACE: u64 = 0x8000_0000_0000_0000;
+const ZINC20_STABLE_ID_SUFFIX_SHIFT: u32 = 48;
+const ZINC20_STABLE_ID_NUMBER_MASK: u64 = 0x0000_ffff_ffff_ffff;
+const ZINC20_STABLE_ID_SUFFIX_MASK: u64 = 0x7fff;
 /// Current cached-shard manifest schema version.
 pub const SHARD_MANIFEST_VERSION: u32 = 2;
-/// Default number of PubChem records preprocessed per Rayon chunk.
+/// Default number of dataset records preprocessed per Rayon chunk.
 #[cfg(feature = "datasets")]
 pub const DEFAULT_PREPROCESS_CHUNK_ROWS: usize = 8192;
-/// Default Rayon workers for PubChem preprocessing.
+/// Default Rayon workers for dataset preprocessing.
 #[cfg(feature = "datasets")]
 pub const DEFAULT_PREPROCESS_THREADS: usize = 64;
-/// Default number of preprocessed PubChem rows written per sparse shard.
+/// Default number of preprocessed rows written per sparse shard.
 #[cfg(feature = "datasets")]
-pub const DEFAULT_PUBCHEM_ROWS_PER_SHARD: usize = 10_000_000;
+pub const DEFAULT_ROWS_PER_SHARD: usize = 10_000_000;
 
-/// One record from a materialized PubChem CID-SMILES artifact.
+/// One SMILES record from a supported dataset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CidSmilesRecord {
-    /// PubChem compound identifier.
-    pub cid: u64,
+pub struct MoleculeRecord {
+    /// Stable source dataset identifier.
+    pub dataset_id: String,
+    /// Dataset-specific record identifier.
+    pub record_id: String,
+    /// Stable numeric molecule identifier used by shard metadata and splits.
+    pub stable_id: u64,
     /// Source SMILES text.
     pub smiles: String,
 }
 
-/// Parses one materialized PubChem `CID-SMILES` line.
-///
-/// # Errors
-///
-/// Returns [`Error::PubChemRecord`] when the line is missing a CID, contains an
-/// invalid CID, or has no SMILES field.
-pub fn parse_pubchem_cid_smiles_line(line_number: usize, line: &str) -> Result<CidSmilesRecord> {
-    let line = line.trim_end_matches(['\n', '\r']);
-    let mut fields = line.splitn(2, char::is_whitespace);
-    let cid = fields
-        .next()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::PubChemRecord {
-            line_number,
-            message: "missing CID".to_string(),
-        })?
-        .parse::<u64>()
-        .map_err(|source| Error::PubChemRecord {
-            line_number,
-            message: format!("invalid CID: {source}"),
-        })?;
-    let smiles = fields
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::PubChemRecord {
-            line_number,
-            message: "missing SMILES".to_string(),
-        })?;
+impl MoleculeRecord {
+    /// Creates a dataset molecule record with a deterministic numeric id.
+    #[must_use]
+    pub fn new(
+        dataset_id: impl Into<String>,
+        record_id: impl Into<String>,
+        smiles: impl Into<String>,
+    ) -> Self {
+        let dataset_id = dataset_id.into();
+        let record_id = record_id.into();
+        let stable_id = stable_molecule_id(&dataset_id, &record_id);
+        Self {
+            dataset_id,
+            record_id,
+            stable_id,
+            smiles: smiles.into(),
+        }
+    }
 
-    Ok(CidSmilesRecord {
-        cid,
-        smiles: smiles.to_string(),
+    /// Converts a `smiles-parser` dataset record into a preprocessing record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DatasetRecord`] when the source-specific identifier is
+    /// malformed.
+    #[cfg(feature = "datasets")]
+    pub fn from_dataset_smiles_record(
+        dataset_id: &'static str,
+        record: smiles_parser::prelude::DatasetSmilesRecord,
+    ) -> Result<Self> {
+        if dataset_id == "pubchem-smiles"
+            && let Err(source) = record.id().parse::<u64>()
+        {
+            return Err(Error::DatasetRecord {
+                message: format!("invalid PubChem CID `{}`: {source}", record.id()),
+            });
+        }
+        if dataset_id == "zinc20-smiles" && zinc20_stable_molecule_id(record.id()).is_none() {
+            return Err(Error::DatasetRecord {
+                message: format!("invalid ZINC20 identifier `{}`", record.id()),
+            });
+        }
+        Ok(Self::new(dataset_id, record.id(), record.smiles()))
+    }
+}
+
+/// Maps `smiles-parser` dataset records into molecule preprocessing records.
+#[cfg(feature = "datasets")]
+pub fn molecule_records_from_smiles_dataset<I>(
+    dataset_id: &'static str,
+    records: I,
+) -> impl Iterator<Item = Result<MoleculeRecord>>
+where
+    I: IntoIterator<
+        Item = std::result::Result<
+            smiles_parser::prelude::DatasetSmilesRecord,
+            smiles_parser::prelude::DatasetError,
+        >,
+    >,
+{
+    records.into_iter().map(move |record| {
+        let record = record.map_err(|source| Error::DatasetRecord {
+            message: source.to_string(),
+        })?;
+        MoleculeRecord::from_dataset_smiles_record(dataset_id, record)
     })
 }
 
-/// Streaming parser for materialized PubChem CID-SMILES artifacts.
-#[derive(Debug)]
-pub struct PubChemRecordIter<R: BufRead> {
-    reader: R,
-    line_number: usize,
-    buffer: String,
-}
-
-impl<R: BufRead> PubChemRecordIter<R> {
-    /// Creates an iterator from an existing buffered reader.
-    #[must_use]
-    pub fn from_reader(reader: R) -> Self {
-        Self {
-            reader,
-            line_number: 0,
-            buffer: String::new(),
-        }
-    }
-}
-
-impl<R: BufRead> Iterator for PubChemRecordIter<R> {
-    type Item = Result<CidSmilesRecord>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            self.buffer.clear();
-            let read = match self.reader.read_line(&mut self.buffer) {
-                Ok(read) => read,
-                Err(source) => {
-                    return Some(Err(Error::io(PathBuf::from("<pubchem stream>"), source)));
-                }
-            };
-            if read == 0 {
-                return None;
-            }
-            self.line_number += 1;
-            if self.buffer.trim().is_empty() {
-                continue;
-            }
-            return Some(parse_pubchem_cid_smiles_line(
-                self.line_number,
-                &self.buffer,
-            ));
-        }
-    }
-}
-
-/// Opens a plain-text or gzip-compressed materialized PubChem CID-SMILES artifact.
-///
-/// Upstream acquisition/cache should be handled by `smiles-parser`; this helper
-/// keeps CIDs for deterministic splits and shard metadata.
-///
-/// # Errors
-///
-/// Returns [`Error::Io`] when the source artifact cannot be opened.
-#[cfg(feature = "datasets")]
-pub fn pubchem_records_from_path(
-    path: impl AsRef<Path>,
-) -> Result<PubChemRecordIter<Box<dyn BufRead>>> {
-    let path = path.as_ref();
-    let file = File::open(path).map_err(|source| Error::io(path, source))?;
-    let reader: Box<dyn BufRead> = if path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
-        Box::new(BufReader::new(flate2::read::GzDecoder::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
-    Ok(PubChemRecordIter::from_reader(reader))
-}
-
-/// Parallel PubChem preprocessing controls.
+/// Parallel dataset preprocessing controls.
 #[cfg(feature = "datasets")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PubChemPreprocessOptions {
+pub struct DatasetPreprocessOptions {
     /// Number of records read before dispatching work to Rayon.
     pub chunk_rows: usize,
     /// Optional local Rayon thread count.
@@ -152,7 +127,7 @@ pub struct PubChemPreprocessOptions {
 }
 
 #[cfg(feature = "datasets")]
-impl Default for PubChemPreprocessOptions {
+impl Default for DatasetPreprocessOptions {
     fn default() -> Self {
         Self {
             chunk_rows: DEFAULT_PREPROCESS_CHUNK_ROWS,
@@ -161,17 +136,17 @@ impl Default for PubChemPreprocessOptions {
     }
 }
 
-/// Ordered result of one parallel PubChem preprocessing chunk.
+/// Ordered result of one parallel dataset preprocessing chunk.
 #[cfg(feature = "datasets")]
 #[derive(Debug)]
-pub struct PreprocessedPubChemChunk {
+pub struct PreprocessedDatasetChunk {
     /// Total records read from the source after this chunk.
     pub records_seen: usize,
     /// Per-record preprocessing results, preserving source order.
     pub results: Vec<Result<MoleculeTargets>>,
 }
 
-/// Reads PubChem records sequentially, then preprocesses each chunk in parallel.
+/// Reads dataset records sequentially, then preprocesses each chunk in parallel.
 ///
 /// # Errors
 ///
@@ -179,15 +154,15 @@ pub struct PreprocessedPubChemChunk {
 /// Rayon pool cannot be built, an input record is malformed, or the consumer
 /// callback returns an error.
 #[cfg(feature = "datasets")]
-pub fn preprocess_cid_smiles_record_chunks<I, F>(
+pub fn preprocess_dataset_record_chunks<I, F>(
     records: I,
     config: &PreprocessingConfig,
-    options: PubChemPreprocessOptions,
+    options: DatasetPreprocessOptions,
     mut consume: F,
 ) -> Result<usize>
 where
-    I: IntoIterator<Item = Result<CidSmilesRecord>>,
-    F: FnMut(PreprocessedPubChemChunk) -> Result<()>,
+    I: IntoIterator<Item = Result<MoleculeRecord>>,
+    F: FnMut(PreprocessedDatasetChunk) -> Result<()>,
 {
     validate_preprocess_options(options)?;
     let mut records = records.into_iter();
@@ -219,7 +194,7 @@ where
             Some(pool) => pool.install(|| preprocess_record_chunk_parallel(chunk, config)),
             None => preprocess_record_chunk_parallel(chunk, config),
         };
-        consume(PreprocessedPubChemChunk {
+        consume(PreprocessedDatasetChunk {
             records_seen,
             results,
         })?;
@@ -227,7 +202,7 @@ where
 }
 
 #[cfg(feature = "datasets")]
-fn validate_preprocess_options(options: PubChemPreprocessOptions) -> Result<()> {
+fn validate_preprocess_options(options: DatasetPreprocessOptions) -> Result<()> {
     if options.chunk_rows == 0 {
         return Err(Error::InvalidBatch(
             "preprocess chunk size must be greater than zero".to_string(),
@@ -243,7 +218,7 @@ fn validate_preprocess_options(options: PubChemPreprocessOptions) -> Result<()> 
 
 #[cfg(feature = "datasets")]
 fn preprocess_record_chunk_parallel(
-    chunk: Vec<Result<CidSmilesRecord>>,
+    chunk: Vec<Result<MoleculeRecord>>,
     config: &PreprocessingConfig,
 ) -> Vec<Result<MoleculeTargets>> {
     use rayon::prelude::*;
@@ -305,11 +280,11 @@ impl Default for PreprocessingConfig {
 }
 
 impl PreprocessingConfig {
-    /// Assigns a deterministic split from CID using a fixed SplitMix64 hash.
+    /// Assigns a deterministic split from a stable molecule id.
     #[must_use]
-    pub fn split_for_cid(&self, cid: u64) -> DataSplit {
+    pub fn split_for_stable_id(&self, stable_id: u64) -> DataSplit {
         let validation_per_mille = u64::from(self.validation_per_mille.min(1000));
-        if splitmix64(cid) % 1000 < validation_per_mille {
+        if splitmix64(stable_id) % 1000 < validation_per_mille {
             DataSplit::Validation
         } else {
             DataSplit::Train
@@ -320,7 +295,7 @@ impl PreprocessingConfig {
 /// Parsed, fingerprinted, descriptor-rich molecule target.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoleculeTargets {
-    /// PubChem compound identifier.
+    /// Stable numeric molecule identifier.
     pub cid: u64,
     /// Source SMILES text.
     pub source_smiles: String,
@@ -332,14 +307,14 @@ pub struct MoleculeTargets {
     pub split: DataSplit,
 }
 
-/// Parses and fingerprints one PubChem record.
+/// Parses and fingerprints one dataset record.
 ///
 /// # Errors
 ///
 /// Returns an error when the SMILES cannot be parsed or fingerprint preparation
 /// fails.
 pub fn preprocess_record(
-    record: &CidSmilesRecord,
+    record: &MoleculeRecord,
     config: &PreprocessingConfig,
     scratch: &mut finge_rs::smiles_support::SmilesRdkitScratch,
 ) -> Result<MoleculeTargets> {
@@ -347,16 +322,16 @@ pub fn preprocess_record(
         .smiles
         .parse::<Smiles>()
         .map_err(|source| Error::SmilesParse {
-            cid: record.cid,
-            message: source.to_string(),
+            molecule_id: record.stable_id,
+            message: format!("{}:{}: {source}", record.dataset_id, record.record_id),
         })?;
     let descriptors = DescriptorTargets::from_smiles(&smiles);
     let fingerprint =
-        compute_fingerprint_targets(record.cid, &smiles, config.counted_ecfp, scratch)?;
-    let split = config.split_for_cid(record.cid);
+        compute_fingerprint_targets(record.stable_id, &smiles, config.counted_ecfp, scratch)?;
+    let split = config.split_for_stable_id(record.stable_id);
 
     Ok(MoleculeTargets {
-        cid: record.cid,
+        cid: record.stable_id,
         source_smiles: record.smiles.clone(),
         fingerprint,
         descriptors,
@@ -367,7 +342,7 @@ pub fn preprocess_record(
 /// One row view into a sparse molecule shard.
 #[derive(Debug, Clone, Copy)]
 pub struct MoleculeShardRow<'a> {
-    /// PubChem compound identifier.
+    /// Stable numeric molecule identifier.
     pub cid: u64,
     /// Sparse fingerprint indices.
     pub fingerprint_indices: &'a [u16],
@@ -386,7 +361,7 @@ pub struct SparseMoleculeShard {
     pub fingerprint_size: usize,
     /// Descriptor regression target width.
     pub descriptor_width: usize,
-    /// PubChem CIDs, one per row.
+    /// Stable numeric molecule identifiers, one per row.
     pub cids: Vec<u64>,
     /// Sparse row offsets, length `row_count + 1`.
     pub row_offsets: Vec<u64>,
@@ -660,8 +635,8 @@ impl SparseMoleculeShard {
             checked_add(
                 path,
                 layout.cids,
-                checked_mul(path, start_row, 8, "CID byte offset")?,
-                "CID byte offset",
+                checked_mul(path, start_row, 8, "molecule-id byte offset")?,
+                "molecule-id byte offset",
             )?,
             row_count,
         )?;
@@ -824,7 +799,7 @@ pub struct ShardManifestEntry {
     pub nnz: usize,
 }
 
-/// Preprocessing manifest for a cached PubChem run.
+/// Preprocessing manifest for cached dataset shards.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardManifest {
     /// Manifest schema version.
@@ -897,6 +872,42 @@ impl ShardManifest {
     }
 }
 
+fn stable_molecule_id(dataset_id: &str, record_id: &str) -> u64 {
+    if dataset_id == "pubchem-smiles"
+        && let Ok(cid) = record_id.parse::<u64>()
+    {
+        return cid;
+    }
+
+    if dataset_id == "zinc20-smiles"
+        && let Some(stable_id) = zinc20_stable_molecule_id(record_id)
+    {
+        return stable_id;
+    }
+
+    let mut hash = STABLE_ID_FNV_OFFSET;
+    for byte in dataset_id
+        .bytes()
+        .chain(std::iter::once(0xff))
+        .chain(record_id.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(STABLE_ID_FNV_PRIME);
+    }
+    HASH_STABLE_ID_NAMESPACE | (splitmix64(hash) & HASH_STABLE_ID_MASK)
+}
+
+fn zinc20_stable_molecule_id(record_id: &str) -> Option<u64> {
+    let rest = record_id.strip_prefix("ZINC")?;
+    let (number, suffix) = rest.split_once('_').unwrap_or((rest, "0"));
+    let number = number.parse::<u64>().ok()?;
+    let suffix = suffix.parse::<u64>().ok()?;
+    if number > ZINC20_STABLE_ID_NUMBER_MASK || suffix > ZINC20_STABLE_ID_SUFFIX_MASK {
+        return None;
+    }
+    Some(ZINC20_STABLE_ID_NAMESPACE | (suffix << ZINC20_STABLE_ID_SUFFIX_SHIFT) | number)
+}
+
 fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -929,7 +940,7 @@ impl ShardFileLayout {
         let row_offsets = checked_add(
             path,
             cids,
-            checked_mul(path, row_count, 8, "CID section length")?,
+            checked_mul(path, row_count, 8, "molecule-id section length")?,
             "row-offset section start",
         )?;
         let indices = checked_add(
@@ -1150,88 +1161,88 @@ mod tests {
     }
 
     #[test]
-    fn parses_pubchem_cid_smiles_lines() {
-        let record = parse_pubchem_cid_smiles_line(7, "702\tCCO\n").expect("record");
+    fn molecule_record_preserves_pubchem_cid_as_stable_id() {
+        let record = MoleculeRecord::new("pubchem-smiles", "702", "CCO");
 
-        assert_eq!(record.cid, 702);
+        assert_eq!(record.dataset_id, "pubchem-smiles");
+        assert_eq!(record.record_id, "702");
+        assert_eq!(record.stable_id, 702);
         assert_eq!(record.smiles, "CCO");
     }
 
     #[test]
-    fn rejects_malformed_pubchem_records() {
-        let missing_cid = parse_pubchem_cid_smiles_line(1, "\tCCO").expect_err("missing cid");
-        assert!(matches!(
-            missing_cid,
-            Error::PubChemRecord {
-                line_number: 1,
-                message
-            } if message == "missing CID"
-        ));
+    fn molecule_record_packs_zinc20_ids_deterministically() {
+        let first = MoleculeRecord::new("zinc20-smiles", "ZINC000000000001_1", "CCO");
+        let second = MoleculeRecord::new("zinc20-smiles", "ZINC000000000001_1", "CCO");
+        let different_number = MoleculeRecord::new("zinc20-smiles", "ZINC000000000002_1", "CCO");
+        let different_suffix = MoleculeRecord::new("zinc20-smiles", "ZINC000000000001_2", "CCO");
 
-        let invalid_cid = parse_pubchem_cid_smiles_line(2, "abc CCO").expect_err("invalid cid");
-        assert!(matches!(
-            invalid_cid,
-            Error::PubChemRecord {
-                line_number: 2,
-                message
-            } if message.contains("invalid CID")
-        ));
-
-        let missing_smiles = parse_pubchem_cid_smiles_line(3, "702").expect_err("missing smiles");
-        assert!(matches!(
-            missing_smiles,
-            Error::PubChemRecord {
-                line_number: 3,
-                message
-            } if message == "missing SMILES"
-        ));
+        assert_eq!(first.stable_id, 0x8001_0000_0000_0001);
+        assert_eq!(first.stable_id, second.stable_id);
+        assert_ne!(first.stable_id, different_number.stable_id);
+        assert_ne!(first.stable_id, different_suffix.stable_id);
     }
 
+    #[cfg(feature = "datasets")]
     #[test]
-    fn pubchem_iterator_skips_empty_lines() {
-        let input = std::io::Cursor::new(b"\n702\tCCO\n");
-        let mut iter = PubChemRecordIter::from_reader(input);
-
-        assert_eq!(iter.next().expect("row").expect("valid").cid, 702);
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn pubchem_iterator_reports_malformed_line_numbers() {
-        let input = std::io::Cursor::new(b"\nabc CCO\n");
-        let mut iter = PubChemRecordIter::from_reader(input);
-        let error = iter.next().expect("row").expect_err("invalid row");
+    fn dataset_record_conversion_rejects_invalid_pubchem_cids() {
+        let record =
+            smiles_parser::prelude::DatasetSmilesRecord::new("not-a-cid".to_string(), "CCO".into());
+        let error = MoleculeRecord::from_dataset_smiles_record("pubchem-smiles", record)
+            .expect_err("invalid pubchem cid");
 
         assert!(matches!(
             error,
-            Error::PubChemRecord {
-                line_number: 2,
-                message
-            } if message.contains("invalid CID")
+            Error::DatasetRecord { message } if message.contains("invalid PubChem CID")
         ));
+    }
+
+    #[cfg(feature = "datasets")]
+    #[test]
+    fn dataset_record_conversion_rejects_invalid_zinc20_ids() {
+        let record =
+            smiles_parser::prelude::DatasetSmilesRecord::new("not-zinc".to_string(), "CCO".into());
+        let error = MoleculeRecord::from_dataset_smiles_record("zinc20-smiles", record)
+            .expect_err("invalid zinc20 id");
+
+        assert!(matches!(
+            error,
+            Error::DatasetRecord { message } if message.contains("invalid ZINC20 identifier")
+        ));
+    }
+
+    #[test]
+    fn molecule_record_hashes_unknown_dataset_ids_deterministically() {
+        let first = MoleculeRecord::new("fixture-smiles", "record-1", "CCO");
+        let second = MoleculeRecord::new("fixture-smiles", "record-1", "CCO");
+        let different = MoleculeRecord::new("fixture-smiles", "record-2", "CCO");
+
+        assert_eq!(first.stable_id >> 62, 1);
+        assert_eq!(first.stable_id, second.stable_id);
+        assert_ne!(first.stable_id, different.stable_id);
     }
 
     #[test]
     fn split_is_deterministic() {
         let config = PreprocessingConfig::default();
 
-        assert_eq!(config.split_for_cid(123), config.split_for_cid(123));
+        assert_eq!(
+            config.split_for_stable_id(123),
+            config.split_for_stable_id(123)
+        );
     }
 
     #[test]
     fn preprocess_record_reports_invalid_smiles() {
         let config = PreprocessingConfig::default();
         let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
-        let record = CidSmilesRecord {
-            cid: 1,
-            smiles: "(".to_string(),
-        };
+        let record = MoleculeRecord::new("pubchem-smiles", "1", "(");
         let error = preprocess_record(&record, &config, &mut scratch).expect_err("invalid smiles");
 
         assert!(matches!(
             error,
             Error::SmilesParse {
-                cid: 1,
+                molecule_id: 1,
                 message
             } if !message.is_empty()
         ));
@@ -1240,14 +1251,21 @@ mod tests {
     #[cfg(feature = "datasets")]
     #[test]
     fn parallel_preprocessing_preserves_order_and_reports_record_errors() {
-        let input = std::io::Cursor::new(b"702\tCCO\n703\t(\n704\tO\nbad C\n");
         let config = PreprocessingConfig::default();
         let mut chunks = Vec::new();
+        let records = vec![
+            Ok(MoleculeRecord::new("pubchem-smiles", "702", "CCO")),
+            Ok(MoleculeRecord::new("pubchem-smiles", "703", "(")),
+            Ok(MoleculeRecord::new("pubchem-smiles", "704", "O")),
+            Err(Error::DatasetRecord {
+                message: "bad record".to_string(),
+            }),
+        ];
 
-        let records_seen = preprocess_cid_smiles_record_chunks(
-            PubChemRecordIter::from_reader(input),
+        let records_seen = preprocess_dataset_record_chunks(
+            records,
             &config,
-            PubChemPreprocessOptions {
+            DatasetPreprocessOptions {
                 chunk_rows: 2,
                 threads: Some(2),
             },
@@ -1272,17 +1290,14 @@ mod tests {
         assert!(matches!(
             &results[1],
             Err(Error::SmilesParse {
-                cid: 703,
+                molecule_id: 703,
                 message
             }) if !message.is_empty()
         ));
         assert_eq!(results[2].as_ref().expect("water").cid, 704);
         assert!(matches!(
             &results[3],
-            Err(Error::PubChemRecord {
-                line_number: 4,
-                message
-            }) if message.contains("invalid CID")
+            Err(Error::DatasetRecord { message }) if message == "bad record"
         ));
     }
 
@@ -1291,10 +1306,10 @@ mod tests {
     fn parallel_preprocessing_rejects_invalid_options() {
         let config = PreprocessingConfig::default();
 
-        let zero_chunk_error = preprocess_cid_smiles_record_chunks(
-            std::iter::empty::<Result<CidSmilesRecord>>(),
+        let zero_chunk_error = preprocess_dataset_record_chunks(
+            std::iter::empty::<Result<MoleculeRecord>>(),
             &config,
-            PubChemPreprocessOptions {
+            DatasetPreprocessOptions {
                 chunk_rows: 0,
                 threads: None,
             },
@@ -1306,10 +1321,10 @@ mod tests {
             Error::InvalidBatch(message) if message.contains("chunk size")
         ));
 
-        let zero_threads_error = preprocess_cid_smiles_record_chunks(
-            std::iter::empty::<Result<CidSmilesRecord>>(),
+        let zero_threads_error = preprocess_dataset_record_chunks(
+            std::iter::empty::<Result<MoleculeRecord>>(),
             &config,
-            PubChemPreprocessOptions {
+            DatasetPreprocessOptions {
                 chunk_rows: 1,
                 threads: Some(0),
             },
@@ -1324,8 +1339,8 @@ mod tests {
 
     #[cfg(feature = "datasets")]
     #[test]
-    fn pubchem_preprocessing_defaults_to_sixty_four_threads() {
-        let options = PubChemPreprocessOptions::default();
+    fn dataset_preprocessing_defaults_to_sixty_four_threads() {
+        let options = DatasetPreprocessOptions::default();
 
         assert_eq!(options.chunk_rows, DEFAULT_PREPROCESS_CHUNK_ROWS);
         assert_eq!(options.threads, Some(DEFAULT_PREPROCESS_THREADS));
@@ -1529,7 +1544,7 @@ mod tests {
         let path = dir.path().join("manifest.json");
         let config = PreprocessingConfig::default();
         let shard = test_shard();
-        let mut manifest = ShardManifest::new("CID-SMILES.gz", config);
+        let mut manifest = ShardManifest::new("dataset-fixture", config);
         manifest.skipped_count = 2;
         manifest.error_count = 3;
         manifest.push_shard("shard-00000.maeshard", &shard);

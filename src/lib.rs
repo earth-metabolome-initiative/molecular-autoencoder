@@ -23,16 +23,15 @@ pub use batch::{
 };
 #[cfg(feature = "std")]
 pub use batch::{MoleculeAutoencoderHostBatch, MoleculeBatchBuildProfile};
-pub use data::{
-    CidSmilesRecord, DataSplit, MoleculeShardRow, MoleculeTargets, PreprocessingConfig,
-    PubChemRecordIter, SHARD_MANIFEST_VERSION, ShardManifest, SparseMoleculeShard,
-    parse_pubchem_cid_smiles_line, preprocess_record,
-};
 #[cfg(feature = "datasets")]
 pub use data::{
-    DEFAULT_PREPROCESS_CHUNK_ROWS, DEFAULT_PREPROCESS_THREADS, DEFAULT_PUBCHEM_ROWS_PER_SHARD,
-    PreprocessedPubChemChunk, PubChemPreprocessOptions, preprocess_cid_smiles_record_chunks,
-    pubchem_records_from_path,
+    DEFAULT_PREPROCESS_CHUNK_ROWS, DEFAULT_PREPROCESS_THREADS, DEFAULT_ROWS_PER_SHARD,
+    DatasetPreprocessOptions, PreprocessedDatasetChunk, molecule_records_from_smiles_dataset,
+    preprocess_dataset_record_chunks,
+};
+pub use data::{
+    DataSplit, MoleculeRecord, MoleculeShardRow, MoleculeTargets, PreprocessingConfig,
+    SHARD_MANIFEST_VERSION, ShardManifest, SparseMoleculeShard, preprocess_record,
 };
 pub use error::{Error, Result};
 pub use features::{DescriptorConfig, DescriptorTargets};

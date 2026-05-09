@@ -83,7 +83,7 @@ impl FingerprintTargets {
 /// Returns an error when the configured fingerprint width exceeds sparse index
 /// storage or when `finge-rs` cannot prepare the molecule for fingerprinting.
 pub fn compute_fingerprint_targets(
-    cid: u64,
+    molecule_id: u64,
     smiles: &Smiles,
     config: CountedEcfpConfig,
     scratch: &mut finge_rs::smiles_support::SmilesRdkitScratch,
@@ -100,7 +100,7 @@ pub fn compute_fingerprint_targets(
     let prepared = scratch
         .try_prepare(smiles)
         .map_err(|source| Error::FingerprintPreparation {
-            cid,
+            molecule_id,
             message: source.to_string(),
         })?;
     let fingerprint = config.to_fingerprint().compute(&prepared);

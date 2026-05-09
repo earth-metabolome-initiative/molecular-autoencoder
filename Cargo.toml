@@ -29,7 +29,7 @@ cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl"]
 cuda-fusion = ["cuda", "burn/fusion", "burn/autotune", "dep:burn-fusion", "dep:burn-ir"]
 cuda-no-fusion = ["cuda", "burn/autotune"]
 fingerprints = ["finge-rs/smiles-support"]
-datasets = ["std", "dep:flate2", "dep:indicatif", "dep:rayon", "smiles-parser/datasets"]
+datasets = ["std", "dep:indicatif", "dep:rayon", "smiles-parser/datasets"]
 
 [dependencies]
 burn = { version = "=0.21.0", default-features = false }
@@ -39,7 +39,6 @@ burn-ir = { version = "=0.21.0", default-features = false, optional = true }
 cubecl = { version = "=0.10.0", default-features = false, optional = true }
 elements_rs = "0.2.7"
 finge-rs = { git = "https://github.com/earth-metabolome-initiative/finge-rs", default-features = false, features = ["smiles-support"] }
-flate2 = { version = "1.1", optional = true }
 indicatif = { version = "0.18", optional = true }
 rayon = { version = "1.11", optional = true }
 serde = { version = "1", default-features = false, features = ["derive"] }

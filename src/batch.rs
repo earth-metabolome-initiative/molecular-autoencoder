@@ -19,7 +19,7 @@ use crate::{
 /// One vectorized molecule sample.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MoleculeAutoencoderSample {
-    /// PubChem compound identifier.
+    /// Stable numeric molecule identifier.
     pub cid: u64,
     /// Sparse counted ECFP indices.
     pub fingerprint_indices: Vec<u16>,
@@ -70,7 +70,7 @@ impl<B: Backend> SparseFingerprintBatch<B> {
 /// Batched tensors for molecular autoencoder training.
 #[derive(Debug, Clone)]
 pub struct MoleculeAutoencoderBatch<B: Backend> {
-    /// PubChem compound identifiers.
+    /// Stable numeric molecule identifiers.
     pub cids: Vec<u64>,
     /// Sparse counted ECFP input and reconstruction target.
     pub fingerprints: SparseFingerprintBatch<B>,
@@ -84,7 +84,7 @@ pub struct MoleculeAutoencoderBatch<B: Backend> {
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MoleculeAutoencoderHostBatch {
-    /// PubChem compound identifiers.
+    /// Stable numeric molecule identifiers.
     pub cids: Vec<u64>,
     /// Padded sparse counted ECFP indices with shape `[batch, max_nnz]`.
     pub fingerprint_indices: Vec<i64>,

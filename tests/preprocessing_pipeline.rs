@@ -4,9 +4,9 @@
 
 use burn::data::dataloader::batcher::Batcher;
 use molecular_autoencoder::{
-    CidSmilesRecord, MoleculeAutoencoderBatcher, MoleculeAutoencoderConfig,
-    MoleculeAutoencoderSample, PreprocessingConfig, SparseMoleculeShard,
-    features::REGRESSION_TARGET_WIDTH, preprocess_record,
+    MoleculeAutoencoderBatcher, MoleculeAutoencoderConfig, MoleculeAutoencoderSample,
+    MoleculeRecord, PreprocessingConfig, SparseMoleculeShard, features::REGRESSION_TARGET_WIDTH,
+    preprocess_record,
 };
 
 #[test]
@@ -14,10 +14,7 @@ fn preprocessing_batching_and_model_loss_are_finite() {
     type B = burn::backend::NdArray<f32, i64>;
 
     let config = PreprocessingConfig::default();
-    let record = CidSmilesRecord {
-        cid: 702,
-        smiles: "CCO".to_string(),
-    };
+    let record = MoleculeRecord::new("pubchem-smiles", "702", "CCO");
     let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
     let targets = preprocess_record(&record, &config, &mut scratch).expect("preprocess");
     let mut shard = SparseMoleculeShard::new(config.counted_ecfp.size, REGRESSION_TARGET_WIDTH);

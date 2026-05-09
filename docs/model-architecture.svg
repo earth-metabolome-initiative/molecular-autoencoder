@@ -43,16 +43,15 @@
 
   <rect class="bg" width="1600" height="1000"/>
   <text x="70" y="70" class="heading">Molecular Autoencoder</text>
-  <text x="70" y="104" class="small">Sparse counted ECFP rows are encoded into a compact latent, then decoded to reconstruct the clean fingerprint.</text>
+  <text x="70" y="104" class="small">PubChem (~123M SMILES) and ZINC20 (~1G SMILES) records are converted to sparse counted ECFP rows, encoded into a compact latent, then decoded to reconstruct the clean fingerprint.</text>
 
   <rect x="55" y="130" width="1490" height="335" rx="18" class="panel" filter="url(#shadow)"/>
   <text x="85" y="168" class="subheading">Model Path</text>
 
   <rect x="85" y="205" width="205" height="225" rx="16" class="inputBox"/>
-  <text x="188" y="242" class="label" text-anchor="middle">PubChem molecule</text>
-  <text x="188" y="272" class="small" text-anchor="middle">CID + SMILES</text>
-  <text x="188" y="296" class="small" text-anchor="middle">parsed molecule</text>
-  <text x="188" y="320" class="small" text-anchor="middle">descriptor targets</text>
+  <text x="188" y="242" class="label" text-anchor="middle">Dataset molecule</text>
+  <text x="188" y="278" class="small" text-anchor="middle">PubChem ~123M</text>
+  <text x="188" y="306" class="small" text-anchor="middle">ZINC20 ~1G</text>
   <circle cx="147" cy="362" r="17" fill="#bae6fd" stroke="#0284c7" stroke-width="2"/>
   <circle cx="188" cy="342" r="17" fill="#bae6fd" stroke="#0284c7" stroke-width="2"/>
   <circle cx="229" cy="362" r="17" fill="#bae6fd" stroke="#0284c7" stroke-width="2"/>

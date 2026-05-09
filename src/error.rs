@@ -10,27 +10,25 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Errors raised by preprocessing, shard loading, and modeling helpers.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// PubChem CID-SMILES line was malformed.
-    #[error("invalid PubChem CID-SMILES record at line {line_number}: {message}")]
-    PubChemRecord {
-        /// One-based line number.
-        line_number: usize,
+    /// Dataset SMILES record was malformed.
+    #[error("invalid dataset SMILES record: {message}")]
+    DatasetRecord {
         /// Human-readable parse error.
         message: String,
     },
     /// A SMILES string failed to parse.
-    #[error("failed to parse SMILES for CID {cid}: {message}")]
+    #[error("failed to parse SMILES for molecule {molecule_id}: {message}")]
     SmilesParse {
-        /// PubChem compound identifier.
-        cid: u64,
+        /// Stable numeric molecule identifier.
+        molecule_id: u64,
         /// Underlying parser error text.
         message: String,
     },
     /// RDKit-style fingerprint preparation failed.
-    #[error("failed to prepare SMILES for fingerprinting for CID {cid}: {message}")]
+    #[error("failed to prepare SMILES for fingerprinting for molecule {molecule_id}: {message}")]
     FingerprintPreparation {
-        /// PubChem compound identifier.
-        cid: u64,
+        /// Stable numeric molecule identifier.
+        molecule_id: u64,
         /// Underlying preparation error text.
         message: String,
     },
