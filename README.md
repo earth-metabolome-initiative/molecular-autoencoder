@@ -21,6 +21,11 @@ This command resolves PubChem (~123M SMILES) and ZINC20 (~1G SMILES)
 through `smiles-parser`, creates cached numeric shards if needed, and trains the
 CUDA model:
 
+The default training architecture uses a 512-d latent space with
+4096,2048,1024 encoder hidden widths and a mirrored decoder. The default
+side-loss weights are 0.05 for descriptor regression and 0.10 for latent
+Tanimoto ranking.
+
 ```bash
 CUDA_PATH=/usr/local/cuda-12.9 \
 PATH=/usr/local/cuda-12.9/bin:$PATH \
@@ -29,7 +34,8 @@ CUDARC_CUDA_VERSION=12090 \
 RUSTFLAGS="-C target-cpu=native" \
 cargo run --release --no-default-features --features std,cuda-fusion,train,tui,datasets \
   --example train_cached_shards -- all shards/pubchem-zinc20 runs/cuda-ae \
-  --rows-per-shard 10000000 --epochs 10 --batch-size 24576 --loader-workers 6 \
+  --rows-per-shard 10000000 --epochs 10 --batch-size 24576 --loader-workers 20 \
+  --metric-every 50 --descriptor-weight 0.05 --tanimoto-ranking-weight 0.10 \
   --cuda-device 0
 ```
 

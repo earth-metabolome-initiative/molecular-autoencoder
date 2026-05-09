@@ -110,6 +110,7 @@ impl Default for ReconstructionLossConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AuxiliaryLossWeights {
     /// Weight for scalar descriptor regression.
+    #[serde(default = "default_descriptor_weight")]
     pub descriptors: f64,
     /// Weight for preserving counted-fingerprint Tanimoto ordering in latent space.
     #[serde(default = "default_tanimoto_ranking_weight")]
@@ -119,14 +120,18 @@ pub struct AuxiliaryLossWeights {
 impl Default for AuxiliaryLossWeights {
     fn default() -> Self {
         Self {
-            descriptors: 0.02,
+            descriptors: default_descriptor_weight(),
             tanimoto_ranking: default_tanimoto_ranking_weight(),
         }
     }
 }
 
-const fn default_tanimoto_ranking_weight() -> f64 {
+const fn default_descriptor_weight() -> f64 {
     0.05
+}
+
+const fn default_tanimoto_ranking_weight() -> f64 {
+    0.10
 }
 
 const fn default_latent_noise_std() -> f64 {
@@ -182,10 +187,10 @@ pub struct MoleculeAutoencoderConfig {
 }
 
 impl MoleculeAutoencoderConfig {
-    /// Starting v1 configuration: 4k counted ECFP input and 256-d latent.
+    /// Starting v1 configuration: 4k counted ECFP input and 512-d latent.
     #[must_use]
     pub fn v1_counted_ecfp() -> Self {
-        Self::symmetric(DEFAULT_ECFP_SIZE, 256, vec![2048, 1024, 512])
+        Self::symmetric(DEFAULT_ECFP_SIZE, 512, vec![4096, 2048, 1024])
     }
 
     /// Creates a symmetric MLP autoencoder configuration.
@@ -553,14 +558,17 @@ mod tests {
     use crate::batch::{MoleculeAutoencoderBatcher, MoleculeAutoencoderSample};
 
     #[test]
-    fn v1_config_uses_4k_ecfp_and_256_latent() {
+    fn v1_config_uses_4k_ecfp_and_512_latent() {
         let config = MoleculeAutoencoderConfig::v1_counted_ecfp();
 
         assert_eq!(config.encoder.input_width, 4096);
-        assert_eq!(config.encoder.latent_width, 256);
+        assert_eq!(config.encoder.hidden_widths, vec![4096, 2048, 1024]);
+        assert_eq!(config.encoder.latent_width, 512);
+        assert_eq!(config.decoder.hidden_widths, vec![1024, 2048, 4096]);
         assert_eq!(config.decoder.output_width, 4096);
         assert_eq!(config.descriptor_width, REGRESSION_TARGET_WIDTH);
-        assert_eq!(config.auxiliary_weights.tanimoto_ranking, 0.05);
+        assert_eq!(config.auxiliary_weights.descriptors, 0.05);
+        assert_eq!(config.auxiliary_weights.tanimoto_ranking, 0.10);
         assert_eq!(config.tanimoto_ranking.margin, 0.05);
         assert_eq!(config.tanimoto_ranking.min_gap, 0.05);
         assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 4);

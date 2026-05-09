@@ -252,6 +252,7 @@ struct Args {
     device_prefetch_batches: usize,
     loader_profile_every: usize,
     metric_every: usize,
+    descriptor_weight: f64,
     tanimoto_ranking_weight: f64,
     tanimoto_ranking_margin: f64,
     tanimoto_ranking_min_gap: f64,
@@ -573,6 +574,7 @@ where
             args.latent_width,
             args.hidden_widths.clone(),
         );
+        config.auxiliary_weights.descriptors = args.descriptor_weight;
         config.auxiliary_weights.tanimoto_ranking = args.tanimoto_ranking_weight;
         config.latent_noise_std = args.latent_noise_std;
         config.tanimoto_ranking = TanimotoRankingConfig {
@@ -623,7 +625,7 @@ where
         args.loader_profile_every
     };
     println!(
-        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} tanimoto_ranking_weight={} tanimoto_ranking_margin={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={}",
+        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_margin={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={}",
         manifest_path.display(),
         shards.len(),
         args.checkpoint_dir.display(),
@@ -637,6 +639,7 @@ where
         loader_profile_every,
         args.learning_rate,
         model_config.latent_noise_std,
+        model_config.auxiliary_weights.descriptors,
         tanimoto_ranking.weight,
         tanimoto_ranking.margin,
         tanimoto_ranking.min_gap,
@@ -2093,6 +2096,13 @@ fn validate_model_config(
             "model fingerprint width does not match manifest width {fingerprint_size}"
         )));
     }
+    if !(config.auxiliary_weights.descriptors.is_finite()
+        && config.auxiliary_weights.descriptors >= 0.0)
+    {
+        return Err(invalid_input(
+            "descriptor weight must be finite and non-negative",
+        ));
+    }
     if !(config.auxiliary_weights.tanimoto_ranking.is_finite()
         && config.auxiliary_weights.tanimoto_ranking >= 0.0)
     {
@@ -3233,9 +3243,9 @@ impl Args {
             epochs: 10,
             batch_size: 4096,
             learning_rate: 1.0e-3,
-            latent_width: 256,
+            latent_width: 512,
             latent_noise_std: 0.02,
-            hidden_widths: vec![2048, 1024, 512],
+            hidden_widths: vec![4096, 2048, 1024],
             checkpoint_every: 1,
             validate_every: 1,
             max_train_batches: None,
@@ -3244,7 +3254,8 @@ impl Args {
             device_prefetch_batches: DEFAULT_DEVICE_PREFETCH_BATCHES,
             loader_profile_every: 0,
             metric_every: DEFAULT_METRIC_EVERY,
-            tanimoto_ranking_weight: 0.05,
+            descriptor_weight: 0.05,
+            tanimoto_ranking_weight: 0.10,
             tanimoto_ranking_margin: 0.05,
             tanimoto_ranking_min_gap: 0.05,
             tanimoto_ranking_candidates: 4,
@@ -3296,6 +3307,9 @@ impl Args {
                     args.loader_profile_every = parse_value(&mut values, &flag)?;
                 }
                 "--metric-every" => args.metric_every = parse_positive_value(&mut values, &flag)?,
+                "--descriptor-weight" => {
+                    args.descriptor_weight = parse_value(&mut values, &flag)?;
+                }
                 "--tanimoto-ranking-weight" => {
                     args.tanimoto_ranking_weight = parse_value(&mut values, &flag)?;
                 }
@@ -3338,10 +3352,11 @@ impl Args {
          OR train_cached_shards manifest <manifest.json> <checkpoint-dir> \
          [--epochs N] [--batch-size N] [--learning-rate LR] [--latent-width N] \
          [--latent-noise-std STD] \
-         [--hidden-widths 2048,1024,512] [--checkpoint-every N] \
+         [--hidden-widths 4096,2048,1024] [--checkpoint-every N] \
          [--validate-every N] [--max-train-batches N] [--max-valid-batches N] \
          [--loader-workers N] [--device-prefetch-batches N] \
          [--metric-every N] [--loader-profile-every N] \
+         [--descriptor-weight W] \
          [--tanimoto-ranking-weight W] [--tanimoto-ranking-margin M] \
          [--tanimoto-ranking-min-gap G] [--tanimoto-ranking-candidates N] \
          [--tanimoto-ranking-pairs-per-batch N] \
