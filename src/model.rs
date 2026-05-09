@@ -182,10 +182,10 @@ pub struct MoleculeAutoencoderConfig {
 }
 
 impl MoleculeAutoencoderConfig {
-    /// Starting v1 configuration: 4k counted ECFP input and 128-d latent.
+    /// Starting v1 configuration: 4k counted ECFP input and 256-d latent.
     #[must_use]
     pub fn v1_counted_ecfp() -> Self {
-        Self::symmetric(DEFAULT_ECFP_SIZE, 128, vec![2048, 1024, 512])
+        Self::symmetric(DEFAULT_ECFP_SIZE, 256, vec![2048, 1024, 512])
     }
 
     /// Creates a symmetric MLP autoencoder configuration.
@@ -553,11 +553,11 @@ mod tests {
     use crate::batch::{MoleculeAutoencoderBatcher, MoleculeAutoencoderSample};
 
     #[test]
-    fn v1_config_uses_4k_ecfp_and_128_latent() {
+    fn v1_config_uses_4k_ecfp_and_256_latent() {
         let config = MoleculeAutoencoderConfig::v1_counted_ecfp();
 
         assert_eq!(config.encoder.input_width, 4096);
-        assert_eq!(config.encoder.latent_width, 128);
+        assert_eq!(config.encoder.latent_width, 256);
         assert_eq!(config.decoder.output_width, 4096);
         assert_eq!(config.descriptor_width, REGRESSION_TARGET_WIDTH);
         assert_eq!(config.auxiliary_weights.tanimoto_ranking, 0.05);

@@ -3005,7 +3005,7 @@ impl Args {
             epochs: 10,
             batch_size: 4096,
             learning_rate: 1.0e-3,
-            latent_width: 128,
+            latent_width: 256,
             latent_noise_std: 0.02,
             hidden_widths: vec![2048, 1024, 512],
             checkpoint_every: 1,
