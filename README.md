@@ -7,7 +7,7 @@
 
 Burn components for a molecular autoencoder trained from counted ECFP targets
 and molecule-derived descriptor side tasks over PubChem (~123M SMILES) and
-ZINC20 (1,006,651,037 SMILES). The crate provides
+ZINC20 (~1G SMILES). The crate provides
 deterministic preprocessing, sparse shard IO, Burn batch types, model code,
 losses, metrics, and CUDA counted-Tanimoto ranking support.
 
@@ -17,7 +17,7 @@ losses, metrics, and CUDA counted-Tanimoto ranking support.
 
 ## Training
 
-This command resolves PubChem (~123M SMILES) and ZINC20 (1,006,651,037 SMILES)
+This command resolves PubChem (~123M SMILES) and ZINC20 (~1G SMILES)
 through `smiles-parser`, creates cached numeric shards if needed, and trains the
 CUDA model:
 
