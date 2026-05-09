@@ -51,7 +51,13 @@ thiserror = { version = "2", default-features = false }
 tempfile = "3"
 
 [profile.release]
-debug = 1
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 0
+strip = "symbols"
+incremental = false
 
 [lints.rust]
 missing_docs = "deny"
