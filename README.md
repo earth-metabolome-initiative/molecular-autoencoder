@@ -9,7 +9,7 @@ Burn components for a molecular autoencoder trained from counted ECFP targets
 and molecule-derived descriptor side tasks over PubChem (~123M SMILES) and
 ZINC20 (~1G SMILES). The crate provides
 deterministic preprocessing, sparse shard IO, Burn batch types, model code,
-losses, metrics, and CUDA counted-Tanimoto ranking support.
+losses, metrics, and CUDA counted-Tanimoto geometry support.
 
 ## Architecture
 
@@ -24,7 +24,8 @@ CUDA model:
 The default training architecture uses a 512-d latent space with
 4096,2048,1024 encoder hidden widths and a mirrored decoder. The default
 side-loss weights are 0.05 for descriptor regression and 0.10 for latent
-Tanimoto ranking.
+Tanimoto geometry. The Tanimoto geometry loss uses gap-weighted pairwise
+logistic targets with default latent and counted-Tanimoto temperatures of 0.10.
 
 The command below is tuned for the current training workstation: an NVIDIA
 GeForce RTX 5090 with 32607 MiB VRAM, CUDA 12.9, and WSL CUDA libraries under
