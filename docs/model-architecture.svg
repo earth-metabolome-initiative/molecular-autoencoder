@@ -161,15 +161,15 @@
 
   <rect x="455" y="660" width="315" height="330" rx="14" class="card"/>
   <text x="612" y="697" class="label" text-anchor="middle">Latent stability</text>
-  <text x="612" y="727" class="small" text-anchor="middle">latent perturbation</text>
-  <text x="612" y="751" class="small" text-anchor="middle">shared reconstruction target</text>
+  <text x="612" y="727" class="small" text-anchor="middle">decode embedding plus noise</text>
+  <text x="612" y="751" class="small" text-anchor="middle">against clean target</text>
   <polygon points="527.0,817.0 541.0,792.8 569.0,792.8 583.0,817.0 569.0,841.2 541.0,841.2" class="embeddingHex"/>
   <image class="formula" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAhCAYAAACiGknfAAAAAXNSR0IB2cksfwAAAAlwSFlzAAAuIwAALiMBeKU/dgAAAlpJREFUWMPtmD1oFEEUx/9jLnoXFD0iwa9CRYyNxCooqAjxI4ogmCgiNhGUgCAidiIWaqOINlYSIZ2KhQSJWlglphA0ItpELIIgJoVEIkdOCT+bBy7r7Mrd3p53cK/Ze/P+M++3j5mbmZUa1rD6NhcVAPZJup9g7BlJB51zHyoJnImJtUlaFmqbkDQu6ZukYqC9W9KmkDYrqVC10gNn+WOTwJEIXSdQ5G87VdW5AlwOJN8WoWm1lwnbYNUnN3Dbkg9FxB0w7IF9B7SkxbUgJpa352hE/KKk/aG2WUm9zrlCCYVZCfQDbUkrPGQVO+SJdQHznur2lphjIfDV+t5JCrwT6AHyofZVwJQH9lYZORYBX4A5oDuNeZ0BRj2wY0BzmWPmgOVpLcSbHthpYE3NbYnAYQ/sPLDbo70KfAaO/y/YDcB3D/ClCP2zqAUbnF5pweaAtx7Yp4CL6PPJNFs9sdXAExtzGrhSaeABD+wk0Bqh3xzQrfPsjK+BPebfNd2xSsGe9MAWgc6YPvcC2pZQbBA4F/Afmu56JWA7gIIH+ExMnxPAL9P9CMXW2xTImp8FZkqtcCYi8RJJjyTlQqERSS+A9sARMi+pQ1KPpB0B7VSo7wpJ15xzc+YflbTUzs2Pk1a3j+Q29o8cI+VsyVF/LcOSLkhanOC9P8bAtkvabu5Azd/LgBtW3fF6gG0OHJ5OB9r7ga5aBD5gsD9tcQtosq18Y5IDfFq2xZ6vnHOz9rtP0kvn3EQtVnivVfiB+buAN4lvHClDn7ebxnvgObC2Lr7iAE2Nb1kNS2i/AcO9S2lTT3dqAAAAAElFTkSuQmCC" x="540" y="807" width="30" height="22" preserveAspectRatio="xMidYMid meet"/>
-  <path d="M 592 817 L 638 817" class="thin"/>
-  <text x="615" y="804" class="tiny" text-anchor="middle">noise</text>
-  <polygon points="641.0,817.0 655.0,792.8 683.0,792.8 697.0,817.0 683.0,841.2 655.0,841.2" class="embeddingHex"/>
-  <image class="formula" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAXCAYAAAAP6L+eAAAAAXNSR0IB2cksfwAAAAlwSFlzAAAXEQAAFxEByibzPwAAAWZJREFUOMvt1D1oVEEUxfEzaywSFhtRkDRaBW38QARjoVaxEywCCiKktBDsbBXBUsVGEC21EgvbiJImhYhgGpNSBMWPJk2QoD+bCT6WNW83plDwNjNz7pk/d96bO8k/G+jgIubwEU9xtMezHzeGge7EA5xBF6M4h0W8wG3M4iq2DgPejW4ffQQncBrb8z8242bMYQVf8BLP8bZqK5jZKHgJT9Z+JLZVDRYwtlHwZ+xrrB9X6DImfrNnFJ028CNsqfPLfsX0OnterZfvNU9itUJvtXjHUQaB7sD7Cp1f6zRcwvVBP+tI73uR5GGS8SRfk0yXUlZr+kiSNw3v+SR7knwqpdxtq/ZarfQ7phr6wXrdLtT1cUzhJBbboAfwo4Lf4Q7u4Rm+Vf1U9R6q433c7McrDfBYksNNrU+8LqUsV383yYckk6WUhc3s0hnM1/nZ3nznD9h7k8ziWMsph654F64M3Bx/ffwEOSCAIQBghU4AAAAASUVORK5CYII=" x="657" y="805" width="24" height="25" preserveAspectRatio="xMidYMid meet"/>
-  <text x="612" y="894" class="tiny" text-anchor="middle">same fingerprint target after perturbation</text>
+  <path d="M 592 817 H 638" class="bus"/>
+  <text x="615" y="804" class="tiny" text-anchor="middle">+ eps</text>
+  <path class="decoderShape" d="M 656 793 Q 648 795 648 803 L 648 831 Q 648 839 656 841 L 704 850 Q 712 852 712 844 L 712 790 Q 712 782 704 784 Z"/>
+  <text x="681" y="825" class="label" text-anchor="middle">D</text>
+  <text x="612" y="894" class="tiny" text-anchor="middle">no separate loss term</text>
 
   <rect x="810" y="660" width="315" height="330" rx="14" class="card"/>
   <text x="967" y="697" class="label" text-anchor="middle">Molecule descriptors</text>
