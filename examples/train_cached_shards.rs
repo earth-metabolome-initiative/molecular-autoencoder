@@ -321,7 +321,6 @@ struct BatchLossMetrics {
     descriptors: f32,
     tanimoto_ranking: f32,
     tanimoto_ranking_accuracy: f32,
-    tanimoto_ranking_pairs: f32,
 }
 
 #[cfg(all(
@@ -1684,12 +1683,11 @@ where
         .register(losses.descriptors.clone())
         .register(losses.tanimoto_ranking.clone())
         .register(losses.tanimoto_ranking_accuracy.clone())
-        .register(losses.tanimoto_ranking_pairs.clone())
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read training metrics: {source}")))?;
-    if data.len() != 6 {
+    if data.len() != 5 {
         return Err(invalid_input(format!(
-            "training metrics transaction returned {} tensors instead of 6",
+            "training metrics transaction returned {} tensors instead of 5",
             data.len()
         )));
     }
@@ -1699,7 +1697,6 @@ where
         descriptors: scalar_data(&data[2], "descriptor loss")?,
         tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
         tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
-        tanimoto_ranking_pairs: scalar_data(&data[5], "Tanimoto geometry pairs")?,
     })
 }
 
@@ -1722,13 +1719,12 @@ where
         .register(losses.descriptors.clone())
         .register(losses.tanimoto_ranking.clone())
         .register(losses.tanimoto_ranking_accuracy.clone())
-        .register(losses.tanimoto_ranking_pairs.clone())
         .register(tanimoto)
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read validation metrics: {source}")))?;
-    if data.len() != 7 {
+    if data.len() != 6 {
         return Err(invalid_input(format!(
-            "validation metrics transaction returned {} tensors instead of 7",
+            "validation metrics transaction returned {} tensors instead of 6",
             data.len()
         )));
     }
@@ -1739,9 +1735,8 @@ where
             descriptors: scalar_data(&data[2], "descriptor loss")?,
             tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
             tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
-            tanimoto_ranking_pairs: scalar_data(&data[5], "Tanimoto geometry pairs")?,
         },
-        scalar_data(&data[6], "count Tanimoto")?,
+        scalar_data(&data[5], "count Tanimoto")?,
     ))
 }
 
@@ -2429,13 +2424,12 @@ impl IndicatifTrainingBars {
         let step_ms = step_time.as_secs_f64() * 1000.0;
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} pairs={:.0} data_ms={data_ms:.1} step_ms={step_ms:.1}",
+                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} data_ms={data_ms:.1} step_ms={step_ms:.1}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.descriptors,
                 metrics.tanimoto_ranking,
                 metrics.tanimoto_ranking_accuracy,
-                metrics.tanimoto_ranking_pairs,
             )),
             None => bar.set_message(format!("data_ms={data_ms:.1} step_ms={step_ms:.1}")),
         }
@@ -2454,13 +2448,12 @@ impl IndicatifTrainingBars {
         bar.set_position(processed as u64);
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} pairs={:.0} tanimoto={tanimoto:.4}",
+                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} tanimoto={tanimoto:.4}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.descriptors,
                 metrics.tanimoto_ranking,
                 metrics.tanimoto_ranking_accuracy,
-                metrics.tanimoto_ranking_pairs,
             )),
             None => bar.set_message(format!("tanimoto={tanimoto:.4}")),
         }
@@ -2531,10 +2524,7 @@ struct ReporterMetricIds {
     descriptors: burn::train::metric::MetricId,
     tanimoto_ranking: burn::train::metric::MetricId,
     tanimoto_ranking_accuracy: burn::train::metric::MetricId,
-    tanimoto_ranking_pairs: burn::train::metric::MetricId,
     tanimoto: burn::train::metric::MetricId,
-    data_wait_ms: burn::train::metric::MetricId,
-    step_ms: burn::train::metric::MetricId,
 }
 
 #[cfg(all(
@@ -2646,22 +2636,7 @@ impl TrainingReporter {
                     metrics.tanimoto_ranking_accuracy,
                     examples,
                 ));
-                renderer.update_train(metric_state(
-                    self.metric_ids.tanimoto_ranking_pairs.clone(),
-                    metrics.tanimoto_ranking_pairs,
-                    1,
-                ));
             }
-            renderer.update_train(metric_state(
-                self.metric_ids.data_wait_ms.clone(),
-                data_time.as_secs_f64() * 1000.0,
-                1,
-            ));
-            renderer.update_train(metric_state(
-                self.metric_ids.step_ms.clone(),
-                step_time.as_secs_f64() * 1000.0,
-                1,
-            ));
             renderer.render_train(
                 training_progress(
                     self.train_processed,
@@ -2742,11 +2717,6 @@ impl TrainingReporter {
                     self.metric_ids.tanimoto_ranking_accuracy.clone(),
                     metrics.tanimoto_ranking_accuracy,
                     examples,
-                ));
-                renderer.update_valid(metric_state(
-                    self.metric_ids.tanimoto_ranking_pairs.clone(),
-                    metrics.tanimoto_ranking_pairs,
-                    1,
                 ));
             }
             renderer.update_valid(metric_state(
@@ -2939,10 +2909,7 @@ enum ReporterMetric {
     Descriptors,
     TanimotoRanking,
     TanimotoRankingAccuracy,
-    TanimotoRankingPairs,
     Tanimoto,
-    DataWaitMs,
-    StepMs,
 }
 
 #[cfg(all(
@@ -2952,16 +2919,13 @@ enum ReporterMetric {
     any(feature = "cuda", feature = "ndarray")
 ))]
 impl ReporterMetric {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 6] = [
         Self::Loss,
         Self::Reconstruction,
         Self::Descriptors,
         Self::TanimotoRanking,
         Self::TanimotoRankingAccuracy,
-        Self::TanimotoRankingPairs,
         Self::Tanimoto,
-        Self::DataWaitMs,
-        Self::StepMs,
     ];
 
     const fn name(self) -> &'static str {
@@ -2971,10 +2935,7 @@ impl ReporterMetric {
             Self::Descriptors => "Descriptor Loss",
             Self::TanimotoRanking => "Tanimoto Geometry Loss",
             Self::TanimotoRankingAccuracy => "Tanimoto Geometry Accuracy",
-            Self::TanimotoRankingPairs => "Tanimoto Geometry Pairs",
             Self::Tanimoto => "Count Tanimoto",
-            Self::DataWaitMs => "Data Wait",
-            Self::StepMs => "Step Time",
         }
     }
 
@@ -2985,18 +2946,12 @@ impl ReporterMetric {
             Self::Descriptors => "descriptor side-task loss",
             Self::TanimotoRanking => "latent counted-Tanimoto pairwise logistic loss",
             Self::TanimotoRankingAccuracy => "latent ordering accuracy for sampled Tanimoto pairs",
-            Self::TanimotoRankingPairs => "valid sampled Tanimoto geometry anchors",
             Self::Tanimoto => "counted fingerprint Tanimoto reconstruction metric",
-            Self::DataWaitMs => "time spent waiting for the next queued batch",
-            Self::StepMs => "batch training or validation step time",
         }
     }
 
     const fn higher_is_better(self) -> bool {
-        matches!(
-            self,
-            Self::Tanimoto | Self::TanimotoRankingAccuracy | Self::TanimotoRankingPairs
-        )
+        matches!(self, Self::Tanimoto | Self::TanimotoRankingAccuracy)
     }
 
     fn definition(
@@ -3008,18 +2963,10 @@ impl ReporterMetric {
             name: self.name().to_string(),
             description: Some(self.description().to_string()),
             attributes: burn::train::metric::NumericAttributes {
-                unit: self.unit().map(str::to_string),
+                unit: None,
                 higher_is_better: self.higher_is_better(),
             }
             .into(),
-        }
-    }
-
-    const fn unit(self) -> Option<&'static str> {
-        match self {
-            Self::DataWaitMs | Self::StepMs => Some("ms"),
-            Self::TanimotoRankingPairs => Some("pairs"),
-            _ => None,
         }
     }
 }
@@ -3038,10 +2985,7 @@ impl ReporterMetricIds {
             descriptors: metric_id(ReporterMetric::Descriptors),
             tanimoto_ranking: metric_id(ReporterMetric::TanimotoRanking),
             tanimoto_ranking_accuracy: metric_id(ReporterMetric::TanimotoRankingAccuracy),
-            tanimoto_ranking_pairs: metric_id(ReporterMetric::TanimotoRankingPairs),
             tanimoto: metric_id(ReporterMetric::Tanimoto),
-            data_wait_ms: metric_id(ReporterMetric::DataWaitMs),
-            step_ms: metric_id(ReporterMetric::StepMs),
         }
     }
 
@@ -3052,10 +2996,7 @@ impl ReporterMetricIds {
             ReporterMetric::Descriptors => self.descriptors.clone(),
             ReporterMetric::TanimotoRanking => self.tanimoto_ranking.clone(),
             ReporterMetric::TanimotoRankingAccuracy => self.tanimoto_ranking_accuracy.clone(),
-            ReporterMetric::TanimotoRankingPairs => self.tanimoto_ranking_pairs.clone(),
             ReporterMetric::Tanimoto => self.tanimoto.clone(),
-            ReporterMetric::DataWaitMs => self.data_wait_ms.clone(),
-            ReporterMetric::StepMs => self.step_ms.clone(),
         }
     }
 }
