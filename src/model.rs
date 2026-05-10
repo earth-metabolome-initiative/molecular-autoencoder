@@ -138,23 +138,40 @@ const fn default_latent_noise_std() -> f64 {
     0.02
 }
 
-/// Counted Tanimoto latent-ranking loss configuration.
+const fn default_tanimoto_ranking_latent_temperature() -> f64 {
+    0.10
+}
+
+const fn default_tanimoto_ranking_metric_temperature() -> f64 {
+    0.10
+}
+
+/// Counted Tanimoto pairwise latent-geometry loss configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TanimotoRankingConfig {
-    /// Margin applied to latent cosine ordering.
-    pub margin: f64,
+    /// Temperature applied to latent cosine gaps in the pairwise logistic loss.
+    #[serde(
+        default = "default_tanimoto_ranking_latent_temperature",
+        alias = "margin",
+        alias = "tanimoto_ranking_margin"
+    )]
+    pub latent_temperature: f64,
+    /// Temperature applied to counted Tanimoto gaps in the pairwise logistic loss.
+    #[serde(default = "default_tanimoto_ranking_metric_temperature")]
+    pub metric_temperature: f64,
     /// Minimum counted Tanimoto gap required for an anchor to contribute.
     pub min_gap: f64,
     /// Random candidate partners sampled for each anchor by the GPU metric kernel.
     pub candidates_per_anchor: usize,
-    /// Maximum anchors used by the latent ranking loss; `0` means all rows.
+    /// Maximum anchors used by the latent geometry loss; `0` means all rows.
     pub pairs_per_batch: usize,
 }
 
 impl Default for TanimotoRankingConfig {
     fn default() -> Self {
         Self {
-            margin: 0.05,
+            latent_temperature: default_tanimoto_ranking_latent_temperature(),
+            metric_temperature: default_tanimoto_ranking_metric_temperature(),
             min_gap: 0.05,
             candidates_per_anchor: 4,
             pairs_per_batch: 0,
@@ -175,7 +192,7 @@ pub struct MoleculeAutoencoderConfig {
     pub reconstruction_loss: ReconstructionLossConfig,
     /// Side-task loss weights.
     pub auxiliary_weights: AuxiliaryLossWeights,
-    /// Counted Tanimoto latent-ranking side task.
+    /// Counted Tanimoto pairwise latent-geometry side task.
     #[serde(default)]
     pub tanimoto_ranking: TanimotoRankingConfig,
     /// Decoder-side latent Gaussian noise as a fraction of batch latent standard deviation.
@@ -229,7 +246,8 @@ impl MoleculeAutoencoderConfig {
             nonzero_weight: self.reconstruction_loss.nonzero_weight,
             descriptor_weight: self.auxiliary_weights.descriptors,
             tanimoto_ranking_weight: self.auxiliary_weights.tanimoto_ranking,
-            tanimoto_ranking_margin: self.tanimoto_ranking.margin,
+            tanimoto_ranking_latent_temperature: self.tanimoto_ranking.latent_temperature,
+            tanimoto_ranking_metric_temperature: self.tanimoto_ranking.metric_temperature,
             tanimoto_ranking_min_gap: self.tanimoto_ranking.min_gap,
             tanimoto_ranking_pairs_per_batch: self.tanimoto_ranking.pairs_per_batch,
             latent_noise_std: self.latent_noise_std,
@@ -326,11 +344,11 @@ pub struct MoleculeLossBreakdown<B: Backend> {
     pub reconstruction: Tensor<B, 1>,
     /// Weighted descriptor regression loss.
     pub descriptors: Tensor<B, 1>,
-    /// Weighted latent Tanimoto-ranking loss.
+    /// Weighted latent Tanimoto pairwise logistic loss.
     pub tanimoto_ranking: Tensor<B, 1>,
-    /// Latent Tanimoto-ranking ordering accuracy.
+    /// Latent Tanimoto geometry ordering accuracy.
     pub tanimoto_ranking_accuracy: Tensor<B, 1>,
-    /// Number of valid anchors contributing to the Tanimoto-ranking loss.
+    /// Number of valid anchors contributing to the Tanimoto geometry loss.
     pub tanimoto_ranking_pairs: Tensor<B, 1>,
 }
 
@@ -354,7 +372,8 @@ pub struct MoleculeAutoencoder<B: Backend> {
     nonzero_weight: f64,
     descriptor_weight: f64,
     tanimoto_ranking_weight: f64,
-    tanimoto_ranking_margin: f64,
+    tanimoto_ranking_latent_temperature: f64,
+    tanimoto_ranking_metric_temperature: f64,
     tanimoto_ranking_min_gap: f64,
     tanimoto_ranking_pairs_per_batch: usize,
     latent_noise_std: f64,
@@ -445,7 +464,8 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             latent,
             tanimoto_ranking,
             self.tanimoto_ranking_pairs_per_batch,
-            self.tanimoto_ranking_margin,
+            self.tanimoto_ranking_latent_temperature,
+            self.tanimoto_ranking_metric_temperature,
             self.tanimoto_ranking_min_gap,
             self.tanimoto_ranking_weight,
         );
@@ -569,11 +589,28 @@ mod tests {
         assert_eq!(config.descriptor_width, REGRESSION_TARGET_WIDTH);
         assert_eq!(config.auxiliary_weights.descriptors, 0.05);
         assert_eq!(config.auxiliary_weights.tanimoto_ranking, 0.10);
-        assert_eq!(config.tanimoto_ranking.margin, 0.05);
+        assert_eq!(config.tanimoto_ranking.latent_temperature, 0.10);
+        assert_eq!(config.tanimoto_ranking.metric_temperature, 0.10);
         assert_eq!(config.tanimoto_ranking.min_gap, 0.05);
         assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 4);
         assert_eq!(config.tanimoto_ranking.pairs_per_batch, 0);
         assert_eq!(config.latent_noise_std, 0.02);
+    }
+
+    #[test]
+    fn tanimoto_ranking_config_accepts_old_margin_key() {
+        let config: TanimotoRankingConfig = serde_json::from_str(
+            r#"{
+                "margin": 0.25,
+                "min_gap": 0.05,
+                "candidates_per_anchor": 4,
+                "pairs_per_batch": 0
+            }"#,
+        )
+        .expect("old margin key should deserialize as latent temperature");
+
+        assert_eq!(config.latent_temperature, 0.25);
+        assert_eq!(config.metric_temperature, 0.10);
     }
 
     #[test]

@@ -254,7 +254,8 @@ struct Args {
     metric_every: usize,
     descriptor_weight: f64,
     tanimoto_ranking_weight: f64,
-    tanimoto_ranking_margin: f64,
+    tanimoto_ranking_latent_temperature: f64,
+    tanimoto_ranking_metric_temperature: f64,
     tanimoto_ranking_min_gap: f64,
     tanimoto_ranking_candidates: usize,
     tanimoto_ranking_pairs_per_batch: usize,
@@ -400,7 +401,8 @@ struct BatchIterationContext<'a, B: Backend> {
 #[derive(Debug, Clone, Copy, Default)]
 struct TanimotoRankingRuntimeConfig {
     weight: f64,
-    margin: f64,
+    latent_temperature: f64,
+    metric_temperature: f64,
     min_gap: f64,
     candidates_per_anchor: usize,
     pairs_per_batch: usize,
@@ -578,7 +580,8 @@ where
         config.auxiliary_weights.tanimoto_ranking = args.tanimoto_ranking_weight;
         config.latent_noise_std = args.latent_noise_std;
         config.tanimoto_ranking = TanimotoRankingConfig {
-            margin: args.tanimoto_ranking_margin,
+            latent_temperature: args.tanimoto_ranking_latent_temperature,
+            metric_temperature: args.tanimoto_ranking_metric_temperature,
             min_gap: args.tanimoto_ranking_min_gap,
             candidates_per_anchor: args.tanimoto_ranking_candidates,
             pairs_per_batch: args.tanimoto_ranking_pairs_per_batch,
@@ -625,7 +628,7 @@ where
         args.loader_profile_every
     };
     println!(
-        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_margin={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={}",
+        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_latent_temperature={} tanimoto_ranking_metric_temperature={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={}",
         manifest_path.display(),
         shards.len(),
         args.checkpoint_dir.display(),
@@ -641,7 +644,8 @@ where
         model_config.latent_noise_std,
         model_config.auxiliary_weights.descriptors,
         tanimoto_ranking.weight,
-        tanimoto_ranking.margin,
+        tanimoto_ranking.latent_temperature,
+        tanimoto_ranking.metric_temperature,
         tanimoto_ranking.min_gap,
         tanimoto_ranking.candidates_per_anchor,
         tanimoto_ranking.pairs_per_batch
@@ -787,7 +791,8 @@ impl TanimotoRankingRuntimeConfig {
     fn from_model_config(config: &MoleculeAutoencoderConfig) -> Self {
         Self {
             weight: config.auxiliary_weights.tanimoto_ranking,
-            margin: config.tanimoto_ranking.margin,
+            latent_temperature: config.tanimoto_ranking.latent_temperature,
+            metric_temperature: config.tanimoto_ranking.metric_temperature,
             min_gap: config.tanimoto_ranking.min_gap,
             candidates_per_anchor: config.tanimoto_ranking.candidates_per_anchor,
             pairs_per_batch: config.tanimoto_ranking.pairs_per_batch,
@@ -1692,9 +1697,9 @@ where
         loss: scalar_data(&data[0], "loss")?,
         reconstruction: scalar_data(&data[1], "reconstruction loss")?,
         descriptors: scalar_data(&data[2], "descriptor loss")?,
-        tanimoto_ranking: scalar_data(&data[3], "Tanimoto-ranking loss")?,
-        tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto-ranking accuracy")?,
-        tanimoto_ranking_pairs: scalar_data(&data[5], "Tanimoto-ranking pairs")?,
+        tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
+        tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
+        tanimoto_ranking_pairs: scalar_data(&data[5], "Tanimoto geometry pairs")?,
     })
 }
 
@@ -1732,9 +1737,9 @@ where
             loss: scalar_data(&data[0], "loss")?,
             reconstruction: scalar_data(&data[1], "reconstruction loss")?,
             descriptors: scalar_data(&data[2], "descriptor loss")?,
-            tanimoto_ranking: scalar_data(&data[3], "Tanimoto-ranking loss")?,
-            tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto-ranking accuracy")?,
-            tanimoto_ranking_pairs: scalar_data(&data[5], "Tanimoto-ranking pairs")?,
+            tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
+            tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
+            tanimoto_ranking_pairs: scalar_data(&data[5], "Tanimoto geometry pairs")?,
         },
         scalar_data(&data[6], "count Tanimoto")?,
     ))
@@ -2107,7 +2112,7 @@ fn validate_model_config(
         && config.auxiliary_weights.tanimoto_ranking >= 0.0)
     {
         return Err(invalid_input(
-            "Tanimoto-ranking weight must be finite and non-negative",
+            "Tanimoto geometry weight must be finite and non-negative",
         ));
     }
     if !(config.latent_noise_std.is_finite() && config.latent_noise_std >= 0.0) {
@@ -2115,21 +2120,30 @@ fn validate_model_config(
             "latent noise std must be finite and non-negative",
         ));
     }
-    if !(config.tanimoto_ranking.margin.is_finite() && config.tanimoto_ranking.margin >= 0.0) {
+    if !(config.tanimoto_ranking.latent_temperature.is_finite()
+        && config.tanimoto_ranking.latent_temperature > 0.0)
+    {
         return Err(invalid_input(
-            "Tanimoto-ranking margin must be finite and non-negative",
+            "Tanimoto geometry latent temperature must be finite and positive",
+        ));
+    }
+    if !(config.tanimoto_ranking.metric_temperature.is_finite()
+        && config.tanimoto_ranking.metric_temperature > 0.0)
+    {
+        return Err(invalid_input(
+            "Tanimoto geometry metric temperature must be finite and positive",
         ));
     }
     if !(config.tanimoto_ranking.min_gap.is_finite() && config.tanimoto_ranking.min_gap >= 0.0) {
         return Err(invalid_input(
-            "Tanimoto-ranking min gap must be finite and non-negative",
+            "Tanimoto geometry min gap must be finite and non-negative",
         ));
     }
     if config.auxiliary_weights.tanimoto_ranking > 0.0
         && config.tanimoto_ranking.candidates_per_anchor < 2
     {
         return Err(invalid_input(
-            "Tanimoto-ranking candidates must be at least 2 when enabled",
+            "Tanimoto geometry candidates must be at least 2 when enabled",
         ));
     }
     Ok(())
@@ -2955,9 +2969,9 @@ impl ReporterMetric {
             Self::Loss => "Loss",
             Self::Reconstruction => "Reconstruction Loss",
             Self::Descriptors => "Descriptor Loss",
-            Self::TanimotoRanking => "Tanimoto Ranking Loss",
-            Self::TanimotoRankingAccuracy => "Tanimoto Ranking Accuracy",
-            Self::TanimotoRankingPairs => "Tanimoto Ranking Pairs",
+            Self::TanimotoRanking => "Tanimoto Geometry Loss",
+            Self::TanimotoRankingAccuracy => "Tanimoto Geometry Accuracy",
+            Self::TanimotoRankingPairs => "Tanimoto Geometry Pairs",
             Self::Tanimoto => "Count Tanimoto",
             Self::DataWaitMs => "Data Wait",
             Self::StepMs => "Step Time",
@@ -2969,9 +2983,9 @@ impl ReporterMetric {
             Self::Loss => "weighted total loss",
             Self::Reconstruction => "counted ECFP reconstruction loss",
             Self::Descriptors => "descriptor side-task loss",
-            Self::TanimotoRanking => "latent counted-Tanimoto ranking loss",
+            Self::TanimotoRanking => "latent counted-Tanimoto pairwise logistic loss",
             Self::TanimotoRankingAccuracy => "latent ordering accuracy for sampled Tanimoto pairs",
-            Self::TanimotoRankingPairs => "valid sampled Tanimoto-ranking anchors",
+            Self::TanimotoRankingPairs => "valid sampled Tanimoto geometry anchors",
             Self::Tanimoto => "counted fingerprint Tanimoto reconstruction metric",
             Self::DataWaitMs => "time spent waiting for the next queued batch",
             Self::StepMs => "batch training or validation step time",
@@ -3256,7 +3270,8 @@ impl Args {
             metric_every: DEFAULT_METRIC_EVERY,
             descriptor_weight: 0.05,
             tanimoto_ranking_weight: 0.10,
-            tanimoto_ranking_margin: 0.05,
+            tanimoto_ranking_latent_temperature: 0.10,
+            tanimoto_ranking_metric_temperature: 0.10,
             tanimoto_ranking_min_gap: 0.05,
             tanimoto_ranking_candidates: 4,
             tanimoto_ranking_pairs_per_batch: 0,
@@ -3313,8 +3328,11 @@ impl Args {
                 "--tanimoto-ranking-weight" => {
                     args.tanimoto_ranking_weight = parse_value(&mut values, &flag)?;
                 }
-                "--tanimoto-ranking-margin" => {
-                    args.tanimoto_ranking_margin = parse_value(&mut values, &flag)?;
+                "--tanimoto-ranking-margin" | "--tanimoto-ranking-latent-temperature" => {
+                    args.tanimoto_ranking_latent_temperature = parse_value(&mut values, &flag)?;
+                }
+                "--tanimoto-ranking-metric-temperature" => {
+                    args.tanimoto_ranking_metric_temperature = parse_value(&mut values, &flag)?;
                 }
                 "--tanimoto-ranking-min-gap" => {
                     args.tanimoto_ranking_min_gap = parse_value(&mut values, &flag)?;
@@ -3357,7 +3375,9 @@ impl Args {
          [--loader-workers N] [--device-prefetch-batches N] \
          [--metric-every N] [--loader-profile-every N] \
          [--descriptor-weight W] \
-         [--tanimoto-ranking-weight W] [--tanimoto-ranking-margin M] \
+         [--tanimoto-ranking-weight W] \
+         [--tanimoto-ranking-latent-temperature T] \
+         [--tanimoto-ranking-metric-temperature T] \
          [--tanimoto-ranking-min-gap G] [--tanimoto-ranking-candidates N] \
          [--tanimoto-ranking-pairs-per-batch N] \
          [--full-validation] \

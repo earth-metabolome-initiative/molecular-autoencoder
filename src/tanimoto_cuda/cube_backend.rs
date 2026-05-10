@@ -28,16 +28,16 @@ where
         assert_eq!(
             [index_rows, index_width],
             [count_rows, count_width],
-            "Tanimoto-ranking indices and counts must share a shape"
+            "Tanimoto geometry indices and counts must share a shape"
         );
         assert_eq!(
             [index_rows, index_width],
             [mask_rows, mask_width],
-            "Tanimoto-ranking indices and mask must share a shape"
+            "Tanimoto geometry indices and mask must share a shape"
         );
         assert!(
             config.batch_items <= index_rows,
-            "Tanimoto-ranking batch_items exceeds the sparse batch row count"
+            "Tanimoto geometry batch_items exceeds the sparse batch row count"
         );
 
         let index_shape = Shape::new([config.batch_items]);
