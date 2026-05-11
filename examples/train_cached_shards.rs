@@ -321,6 +321,7 @@ struct BatchLossMetrics {
     descriptors: f32,
     tanimoto_ranking: f32,
     tanimoto_ranking_accuracy: f32,
+    count_tanimoto: f32,
 }
 
 #[cfg(all(
@@ -913,12 +914,33 @@ where
                 .take()
                 .ok_or_else(|| invalid_input("training model was not available"))?;
             let step_start = Instant::now();
-            let losses = current.loss(batch);
-            let loss = losses.total();
             let next_step = state.global_step + 1;
-            let batch_metrics = should_sample_metrics(next_step, args.metric_every)
-                .then(|| loss_metrics(loss.clone(), &losses))
-                .transpose()?;
+            let sample_metrics = should_sample_metrics(next_step, args.metric_every);
+            let MoleculeAutoencoderBatch {
+                fingerprints,
+                descriptor_targets,
+                tanimoto_ranking,
+                ..
+            } = batch;
+            let fingerprints_for_metrics = sample_metrics.then(|| fingerprints.clone());
+            let output = current.forward(&fingerprints);
+            let reconstructed_for_metrics =
+                sample_metrics.then(|| output.reconstructed_log_counts.clone());
+            let losses = current.loss_from_output(
+                output,
+                fingerprints,
+                descriptor_targets,
+                tanimoto_ranking,
+            );
+            let loss = losses.total();
+            let batch_metrics = match (fingerprints_for_metrics, reconstructed_for_metrics) {
+                (Some(fingerprints), Some(reconstructed)) => {
+                    let tanimoto =
+                        batch_sparse_log_count_tanimoto(&fingerprints, reconstructed).mean();
+                    Some(loss_metrics(loss.clone(), &losses, tanimoto)?)
+                }
+                _ => None,
+            };
             if batch_metrics.is_some_and(|metrics| !metrics.loss.is_finite()) {
                 return Err(invalid_input(format!(
                     "non-finite training loss at global step {}",
@@ -1673,6 +1695,7 @@ fn should_sample_metrics(batch_index: usize, every: usize) -> bool {
 fn loss_metrics<B>(
     loss: Tensor<B, 1>,
     losses: &MoleculeLossBreakdown<B>,
+    tanimoto: Tensor<B, 1>,
 ) -> AppResult<BatchLossMetrics>
 where
     B: Backend<FloatElem = f32>,
@@ -1683,11 +1706,12 @@ where
         .register(losses.descriptors.clone())
         .register(losses.tanimoto_ranking.clone())
         .register(losses.tanimoto_ranking_accuracy.clone())
+        .register(tanimoto)
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read training metrics: {source}")))?;
-    if data.len() != 5 {
+    if data.len() != 6 {
         return Err(invalid_input(format!(
-            "training metrics transaction returned {} tensors instead of 5",
+            "training metrics transaction returned {} tensors instead of 6",
             data.len()
         )));
     }
@@ -1697,6 +1721,7 @@ where
         descriptors: scalar_data(&data[2], "descriptor loss")?,
         tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
         tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
+        count_tanimoto: scalar_data(&data[5], "count Tanimoto")?,
     })
 }
 
@@ -1728,6 +1753,7 @@ where
             data.len()
         )));
     }
+    let count_tanimoto = scalar_data(&data[5], "count Tanimoto")?;
     Ok((
         BatchLossMetrics {
             loss: scalar_data(&data[0], "loss")?,
@@ -1735,8 +1761,9 @@ where
             descriptors: scalar_data(&data[2], "descriptor loss")?,
             tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
             tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
+            count_tanimoto,
         },
-        scalar_data(&data[5], "count Tanimoto")?,
+        count_tanimoto,
     ))
 }
 
@@ -2424,12 +2451,13 @@ impl IndicatifTrainingBars {
         let step_ms = step_time.as_secs_f64() * 1000.0;
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} data_ms={data_ms:.1} step_ms={step_ms:.1}",
+                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} tanimoto={:.4} data_ms={data_ms:.1} step_ms={step_ms:.1}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.descriptors,
                 metrics.tanimoto_ranking,
                 metrics.tanimoto_ranking_accuracy,
+                metrics.count_tanimoto,
             )),
             None => bar.set_message(format!("data_ms={data_ms:.1} step_ms={step_ms:.1}")),
         }
@@ -2634,6 +2662,11 @@ impl TrainingReporter {
                 renderer.update_train(metric_state(
                     self.metric_ids.tanimoto_ranking_accuracy.clone(),
                     metrics.tanimoto_ranking_accuracy,
+                    examples,
+                ));
+                renderer.update_train(metric_state(
+                    self.metric_ids.tanimoto.clone(),
+                    metrics.count_tanimoto,
                     examples,
                 ));
             }
