@@ -24,8 +24,9 @@ CUDA model:
 The default training architecture uses a 512-d latent space with
 4096,2048,1024 encoder hidden widths and a mirrored decoder. The default
 side-loss weights are 0.05 for descriptor regression and 0.10 for latent
-Tanimoto geometry. The Tanimoto geometry loss uses gap-weighted pairwise
-logistic targets with default latent and counted-Tanimoto temperatures of 0.10.
+Tanimoto geometry. The Tanimoto geometry loss uses gap-weighted sampled
+softmax cross-entropy over counted-Tanimoto candidate sets, with a default
+latent temperature of 0.10.
 
 The command below is tuned for the current training workstation: an NVIDIA
 GeForce RTX 5090 with 32607 MiB VRAM, CUDA 12.9, and WSL CUDA libraries under
