@@ -1,0 +1,19 @@
+\documentclass[border=1pt]{standalone}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\begin{document}
+\color[HTML]{1F3342}
+\(\displaystyle
+\begin{aligned}
+p^z_{ic}
+&=\frac{\exp(\cos(\mathbf{z}_i,\mathbf{z}_c)/\tau_z)}
+{\sum_{c'\in\mathcal{C}_i}\exp(\cos(\mathbf{z}_i,\mathbf{z}_{c'})/\tau_z)}\\
+c_i^\star&=\arg\max_{c\in\mathcal{C}_i}T_c(\mathbf{x}_i,\mathbf{x}_c)\\
+w_i&=T_c(\mathbf{x}_i,\mathbf{x}_{c_i^\star})
+-\max_{c\in\mathcal{C}_i\setminus\{c_i^\star\}}T_c(\mathbf{x}_i,\mathbf{x}_c)\\
+m_i&=\mathbf{1}\!\left\{w_i>\gamma\right\}\\
+\mathcal{L}_{\mathrm{tan}}
+&=m_i w_i\left[-\log p^z_{i c_i^\star}\right]
+\end{aligned}
+\)
+\end{document}
