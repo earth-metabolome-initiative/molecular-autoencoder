@@ -146,17 +146,17 @@ const fn default_tanimoto_ranking_metric_temperature() -> f64 {
     0.10
 }
 
-/// Counted Tanimoto pairwise latent-geometry loss configuration.
+/// Counted Tanimoto sampled softmax latent-geometry loss configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TanimotoRankingConfig {
-    /// Temperature applied to latent cosine gaps in the pairwise logistic loss.
+    /// Temperature applied to latent cosine logits in the softmax ranking loss.
     #[serde(
         default = "default_tanimoto_ranking_latent_temperature",
         alias = "margin",
         alias = "tanimoto_ranking_margin"
     )]
     pub latent_temperature: f64,
-    /// Temperature applied to counted Tanimoto gaps in the pairwise logistic loss.
+    /// Deprecated compatibility field; the hard-label softmax ranking loss ignores it.
     #[serde(default = "default_tanimoto_ranking_metric_temperature")]
     pub metric_temperature: f64,
     /// Minimum counted Tanimoto gap required for an anchor to contribute.
@@ -192,7 +192,7 @@ pub struct MoleculeAutoencoderConfig {
     pub reconstruction_loss: ReconstructionLossConfig,
     /// Side-task loss weights.
     pub auxiliary_weights: AuxiliaryLossWeights,
-    /// Counted Tanimoto pairwise latent-geometry side task.
+    /// Counted Tanimoto sampled softmax latent-geometry side task.
     #[serde(default)]
     pub tanimoto_ranking: TanimotoRankingConfig,
     /// Decoder-side latent Gaussian noise as a fraction of batch latent standard deviation.
@@ -344,9 +344,9 @@ pub struct MoleculeLossBreakdown<B: Backend> {
     pub reconstruction: Tensor<B, 1>,
     /// Weighted descriptor regression loss.
     pub descriptors: Tensor<B, 1>,
-    /// Weighted latent Tanimoto pairwise logistic loss.
+    /// Weighted latent Tanimoto sampled softmax cross-entropy loss.
     pub tanimoto_ranking: Tensor<B, 1>,
-    /// Latent Tanimoto geometry ordering accuracy.
+    /// Latent Tanimoto geometry best-candidate accuracy.
     pub tanimoto_ranking_accuracy: Tensor<B, 1>,
     /// Number of valid anchors contributing to the Tanimoto geometry loss.
     pub tanimoto_ranking_pairs: Tensor<B, 1>,

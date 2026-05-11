@@ -41,7 +41,7 @@ where
             .stateful()
         {
             OpsKind::Tracked(prep) => {
-                let (partner_a, partner_b, target_delta) =
+                let (candidate_index, best_candidate_position, top2_gap) =
                     B::counted_tanimoto_similarity_ranking_kernel(
                         indices.clone(),
                         counts.primitive.clone(),
@@ -49,10 +49,14 @@ where
                         config,
                     );
 
-                (partner_a, partner_b, prep.finish((), target_delta))
+                (
+                    candidate_index,
+                    best_candidate_position,
+                    prep.finish((), top2_gap),
+                )
             }
             OpsKind::UnTracked(prep) => {
-                let (partner_a, partner_b, target_delta) =
+                let (candidate_index, best_candidate_position, top2_gap) =
                     B::counted_tanimoto_similarity_ranking_kernel(
                         indices,
                         counts.primitive,
@@ -60,7 +64,11 @@ where
                         config,
                     );
 
-                (partner_a, partner_b, prep.finish(target_delta))
+                (
+                    candidate_index,
+                    best_candidate_position,
+                    prep.finish(top2_gap),
+                )
             }
         }
     }

@@ -815,7 +815,7 @@ fn attach_tanimoto_ranking<B>(
     if !config.enabled() || batch.fingerprints.batch_size() < 3 {
         return;
     }
-    let (partner_a_index, partner_b_index, target_delta) =
+    let (candidate_index, best_candidate_position, top2_gap) =
         counted_tanimoto_similarity_ranking_kernel(
             batch.fingerprints.indices.clone(),
             batch.fingerprints.counts.clone(),
@@ -828,9 +828,9 @@ fn attach_tanimoto_ranking<B>(
             },
         );
     batch.tanimoto_ranking = TanimotoRankingBatch {
-        partner_a_index,
-        partner_b_index,
-        target_delta,
+        candidate_index,
+        best_candidate_position,
+        top2_gap,
     };
 }
 
@@ -2944,8 +2944,10 @@ impl ReporterMetric {
             Self::Loss => "weighted total loss",
             Self::Reconstruction => "counted ECFP reconstruction loss",
             Self::Descriptors => "descriptor side-task loss",
-            Self::TanimotoRanking => "latent counted-Tanimoto pairwise logistic loss",
-            Self::TanimotoRankingAccuracy => "latent ordering accuracy for sampled Tanimoto pairs",
+            Self::TanimotoRanking => "latent counted-Tanimoto softmax CE loss",
+            Self::TanimotoRankingAccuracy => {
+                "latent best-candidate accuracy for sampled Tanimoto sets"
+            }
             Self::Tanimoto => "counted fingerprint Tanimoto reconstruction metric",
         }
     }

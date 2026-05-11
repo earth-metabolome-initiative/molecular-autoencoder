@@ -6,64 +6,89 @@ pub(super) fn counted_tanimoto_similarity_ranking_forward<F: Float, I: Int>(
     indices: &Tensor<I>,
     counts: &Tensor<F>,
     mask: &Tensor<F>,
-    partner_a: &mut Tensor<I>,
-    partner_b: &mut Tensor<I>,
-    target_delta: &mut Tensor<F>,
+    candidate_index: &mut Tensor<I>,
+    best_candidate_position: &mut Tensor<I>,
+    top2_gap: &mut Tensor<F>,
     batch_items: u32,
     candidates_per_anchor: u32,
     seed: u32,
     epsilon: f32,
 ) {
-    if ABSOLUTE_POS >= partner_a.len() {
+    if ABSOLUTE_POS >= best_candidate_position.len() {
         terminate!();
     }
 
     let anchor = ABSOLUTE_POS;
     let zero = F::new(0.0_f32);
-    partner_a[anchor] = I::cast_from(0u32);
-    partner_b[anchor] = I::cast_from(0u32);
-    target_delta[anchor] = zero;
+    let one = F::new(1.0_f32);
+    best_candidate_position[anchor] = I::cast_from(0u32);
+    top2_gap[anchor] = zero;
 
     if anchor >= batch_items as usize || batch_items < 3 {
         terminate!();
     }
 
-    let candidate_count = candidates_per_anchor.max(2).min(batch_items - 1);
+    let candidate_count = candidates_per_anchor.max(2).min(batch_items - 1) as usize;
     let eps = F::cast_from(epsilon);
     let mut state = seed ^ (((anchor as u32) + 1u32) * 40503u32);
     if state == 0u32 {
         state = 0x6d2b_79f5u32;
     }
 
-    let mut best_local = anchor;
-    let mut worst_local = anchor;
-    let mut best_score = F::new(-1.0_f32);
-    let mut worst_score = F::new(2.0_f32);
+    let partner_slots = batch_items - 1;
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    let offset = state % partner_slots;
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    let mut stride = (state % partner_slots) + 1u32;
+    let mut coprime = false;
+    while !coprime {
+        let mut left = stride;
+        let mut right = partner_slots;
+        while right != 0u32 {
+            let remainder = left % right;
+            left = right;
+            right = remainder;
+        }
+        coprime = left == 1u32;
+        if !coprime {
+            stride += 1u32;
+            if stride > partner_slots {
+                stride = 1u32;
+            }
+        }
+    }
 
-    for _candidate in 0..candidate_count {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        let mut local_partner = (state % (batch_items - 1)) as usize;
+    let mut best_score = F::new(-1.0_f32);
+    let mut second_best_score = F::new(-1.0_f32);
+    let mut best_position = 0usize;
+
+    for candidate_position in 0..candidate_count {
+        let mut local_partner =
+            ((offset + (candidate_position as u32) * stride) % partner_slots) as usize;
         if local_partner >= anchor {
             local_partner += 1;
         }
+        candidate_index
+            [anchor * candidate_index.stride(0) + candidate_position * candidate_index.stride(1)] =
+            I::cast_from(local_partner as u32);
 
         let score =
             sparse_count_tanimoto_score_rows(indices, counts, mask, anchor, local_partner, eps);
         if score > best_score {
+            second_best_score = best_score;
             best_score = score;
-            best_local = local_partner;
-        }
-        if score < worst_score {
-            worst_score = score;
-            worst_local = local_partner;
+            best_position = candidate_position;
+        } else if score > second_best_score {
+            second_best_score = score;
         }
     }
 
-    partner_a[anchor] = I::cast_from(best_local as u32);
-    partner_b[anchor] = I::cast_from(worst_local as u32);
-    target_delta[anchor] = (best_score - worst_score).max(zero);
+    best_candidate_position[anchor] = I::cast_from(best_position as u32);
+    top2_gap[anchor] = (best_score - second_best_score).max(zero).min(one);
 }
 
 #[cube]

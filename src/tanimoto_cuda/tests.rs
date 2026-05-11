@@ -42,44 +42,65 @@ fn ranking_kernel_matches_cpu_counted_tanimoto_reference() {
         epsilon: 1.0e-8,
     };
 
-    let (partner_a, partner_b, target_delta) = counted_tanimoto_similarity_ranking_kernel(
-        BurnTensor::<TestBackend, 2, burn::tensor::Int>::from_data(
-            TensorData::new(rows.indices.clone(), [rows.row_count, rows.width]),
-            &device,
-        ),
-        BurnTensor::<TestBackend, 2>::from_data(
-            TensorData::new(rows.counts.clone(), [rows.row_count, rows.width]),
-            &device,
-        ),
-        BurnTensor::<TestBackend, 2>::from_data(
-            TensorData::new(rows.mask.clone(), [rows.row_count, rows.width]),
-            &device,
-        ),
-        config,
-    );
+    let (candidate_index, best_candidate_position, top2_gap) =
+        counted_tanimoto_similarity_ranking_kernel(
+            BurnTensor::<TestBackend, 2, burn::tensor::Int>::from_data(
+                TensorData::new(rows.indices.clone(), [rows.row_count, rows.width]),
+                &device,
+            ),
+            BurnTensor::<TestBackend, 2>::from_data(
+                TensorData::new(rows.counts.clone(), [rows.row_count, rows.width]),
+                &device,
+            ),
+            BurnTensor::<TestBackend, 2>::from_data(
+                TensorData::new(rows.mask.clone(), [rows.row_count, rows.width]),
+                &device,
+            ),
+            config,
+        );
 
-    let partner_a = partner_a
+    let candidate_index = candidate_index
         .into_data()
         .to_vec::<i32>()
-        .expect("partner A indices should be i32");
-    let partner_b = partner_b
+        .expect("candidate indices should be i32");
+    let best_candidate_position = best_candidate_position
         .into_data()
         .to_vec::<i32>()
-        .expect("partner B indices should be i32");
-    let target_delta = target_delta
+        .expect("best candidate positions should be i32");
+    let top2_gap = top2_gap
         .into_data()
         .to_vec::<f32>()
-        .expect("target deltas should be f32");
+        .expect("top-2 gaps should be f32");
 
+    let candidate_count = config.effective_candidates_per_anchor();
     for anchor in 0..rows.row_count {
-        let (expected_a, expected_b, expected_delta) = ranking_reference(&rows, anchor, config);
-        assert_eq!(partner_a[anchor] as usize, expected_a, "anchor {anchor}");
-        assert_eq!(partner_b[anchor] as usize, expected_b, "anchor {anchor}");
-        assert!(
-            (target_delta[anchor] - expected_delta).abs() < 1.0e-5,
-            "anchor {anchor}: cuda={} cpu={expected_delta}",
-            target_delta[anchor],
+        let expected = ranking_reference(&rows, anchor, config);
+        let start = anchor * candidate_count;
+        let actual_candidates = &candidate_index[start..start + candidate_count];
+        assert_eq!(
+            actual_candidates,
+            expected.candidate_indices.as_slice(),
+            "anchor {anchor}"
         );
+        assert_eq!(
+            best_candidate_position[anchor] as usize, expected.best_candidate_position,
+            "anchor {anchor}"
+        );
+        assert!(
+            (top2_gap[anchor] - expected.top2_gap).abs() < 1.0e-5,
+            "anchor {anchor}: cuda={} cpu={}",
+            top2_gap[anchor],
+            expected.top2_gap,
+        );
+        assert!(!actual_candidates.contains(&(anchor as i32)));
+        for (left, left_value) in actual_candidates.iter().enumerate() {
+            for right_value in actual_candidates.iter().skip(left + 1) {
+                assert_ne!(
+                    left_value, right_value,
+                    "anchor {anchor}: candidates must be unique"
+                );
+            }
+        }
     }
 }
 
@@ -96,40 +117,69 @@ fn ranking_reference(
     rows: &SparseRows,
     anchor: usize,
     config: CountedTanimotoRankingKernelConfig,
-) -> (usize, usize, f32) {
+) -> RankingReference {
     let mut state = config.seed as u32 ^ (((anchor as u32) + 1) * 40503);
     if state == 0 {
         state = 0x6d2b_79f5;
     }
-    let mut best_index = anchor;
-    let mut worst_index = anchor;
+    let partner_slots = (config.batch_items - 1) as u32;
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    let offset = state % partner_slots;
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    let mut stride = (state % partner_slots) + 1;
+    while gcd(stride, partner_slots) != 1 {
+        stride += 1;
+        if stride > partner_slots {
+            stride = 1;
+        }
+    }
+    let mut candidate_indices = Vec::new();
+    let mut best_candidate_position = 0;
     let mut best_score = f32::NEG_INFINITY;
-    let mut worst_score = f32::INFINITY;
-    let candidates = config
-        .candidates_per_anchor
-        .max(2)
-        .min(config.batch_items.saturating_sub(1));
+    let mut second_best_score = f32::NEG_INFINITY;
+    let candidates = config.effective_candidates_per_anchor();
 
-    for _ in 0..candidates {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        let mut local_partner = (state % ((config.batch_items - 1) as u32)) as usize;
+    for candidate_position in 0..candidates {
+        let mut local_partner =
+            ((offset + (candidate_position as u32) * stride) % partner_slots) as usize;
         if local_partner >= anchor {
             local_partner += 1;
         }
+        candidate_indices.push(local_partner as i32);
         let score = counted_tanimoto(rows, anchor, local_partner);
         if score > best_score {
+            second_best_score = best_score;
             best_score = score;
-            best_index = local_partner;
-        }
-        if score < worst_score {
-            worst_score = score;
-            worst_index = local_partner;
+            best_candidate_position = candidate_position;
+        } else if score > second_best_score {
+            second_best_score = score;
         }
     }
 
-    (best_index, worst_index, (best_score - worst_score).max(0.0))
+    RankingReference {
+        candidate_indices,
+        best_candidate_position,
+        top2_gap: (best_score - second_best_score).max(0.0).min(1.0),
+    }
+}
+
+struct RankingReference {
+    candidate_indices: Vec<i32>,
+    best_candidate_position: usize,
+    top2_gap: f32,
+}
+
+fn gcd(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn counted_tanimoto(rows: &SparseRows, left: usize, right: usize) -> f32 {

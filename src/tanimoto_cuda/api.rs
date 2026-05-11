@@ -26,6 +26,16 @@ pub struct CountedTanimotoRankingKernelConfig {
     pub epsilon: f64,
 }
 
+impl CountedTanimotoRankingKernelConfig {
+    /// Effective number of candidate partners scored for each anchor.
+    #[must_use]
+    pub fn effective_candidates_per_anchor(self) -> usize {
+        self.candidates_per_anchor
+            .max(2)
+            .min(self.batch_items.saturating_sub(1))
+    }
+}
+
 /// Build sampled counted Tanimoto ranking labels on the backend.
 pub fn counted_tanimoto_similarity_ranking_kernel<B: CountedTanimotoKernelBackend>(
     indices: BurnTensor<B, 2, TensorInt>,
@@ -33,21 +43,22 @@ pub fn counted_tanimoto_similarity_ranking_kernel<B: CountedTanimotoKernelBacken
     mask: BurnTensor<B, 2>,
     config: CountedTanimotoRankingKernelConfig,
 ) -> (
-    BurnTensor<B, 1, TensorInt>,
+    BurnTensor<B, 2, TensorInt>,
     BurnTensor<B, 1, TensorInt>,
     BurnTensor<B, 2>,
 ) {
-    let (partner_a, partner_b, target_delta) = B::counted_tanimoto_similarity_ranking_kernel(
-        indices.into_primitive(),
-        counts.into_primitive().tensor(),
-        mask.into_primitive().tensor(),
-        config,
-    );
+    let (candidate_index, best_candidate_position, top2_gap) =
+        B::counted_tanimoto_similarity_ranking_kernel(
+            indices.into_primitive(),
+            counts.into_primitive().tensor(),
+            mask.into_primitive().tensor(),
+            config,
+        );
 
     (
-        BurnTensor::new(partner_a),
-        BurnTensor::new(partner_b),
-        BurnTensor::<B, 1>::from_primitive(TensorPrimitive::Float(target_delta))
+        BurnTensor::new(candidate_index),
+        BurnTensor::new(best_candidate_position),
+        BurnTensor::<B, 1>::from_primitive(TensorPrimitive::Float(top2_gap))
             .reshape([config.batch_items, 1]),
     )
 }
