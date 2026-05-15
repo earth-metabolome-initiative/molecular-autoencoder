@@ -28,7 +28,7 @@ Tanimoto geometry. The Tanimoto geometry loss uses gap-weighted sampled
 softmax cross-entropy over counted-Tanimoto candidate sets, with a default
 latent temperature of 0.10.
 
-Both commands below apply conservative quality gates during preprocessing:
+The commands below apply conservative quality gates during preprocessing:
 a 50-1000 Da molecular-mass window, a 5-80 heavy-atom window, a
 neutral-ish formal-charge window, and a single-component cap that drops
 salts and mixtures. The mass ceiling is wide enough to cover small natural
@@ -39,17 +39,19 @@ records increment `manifest.skipped_count` silently; tune or drop the
 directory with `--force-preprocess` to re-filter under new bounds, or point
 the first positional argument at a fresh directory.
 
+All three commands below assume a native Linux install with the
+distribution's CUDA toolkit on `PATH` and the NVIDIA driver providing
+`libcuda.so.1` in a directory `ldconfig` already knows about (the default
+on Ubuntu / Debian / Fedora). For **WSL**, see the note at the end of
+this section.
+
 ### RTX 5090 (32 GiB VRAM)
 
 Tuned for the lead training workstation: NVIDIA GeForce RTX 5090 with
-32607 MiB VRAM, CUDA 12.9, and WSL CUDA libraries under `/usr/lib/wsl/lib`.
-Uses `RUSTFLAGS="-C target-cpu=native"` and a 32768 batch size.
+32607 MiB VRAM. Uses `RUSTFLAGS="-C target-cpu=native"` and a 32768 batch
+size.
 
 ```bash
-CUDA_PATH=/usr/local/cuda-12.9 \
-PATH=/usr/local/cuda-12.9/bin:$PATH \
-LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:/usr/lib/wsl/lib:$LD_LIBRARY_PATH \
-CUDARC_CUDA_VERSION=12090 \
 RUSTFLAGS="-C target-cpu=native" \
 cargo run --release --no-default-features --features std,cuda-fusion,train,tui,datasets \
   --bin train -- shards/pubchem-zinc20-druglike runs/cuda-ae-pubchem-zinc20-druglike-100e \
@@ -65,15 +67,12 @@ cargo run --release --no-default-features --features std,cuda-fusion,train,tui,d
 
 ### RTX 4090 (24 GiB VRAM)
 
-Same data pipeline and loss weights, batch size dropped to 16384 to fit the
-4090's 24 GiB. Worker and preprocess threads scaled to a more typical
-16-core workstation; bump them back up on Threadripper-class hosts.
+Same data pipeline and loss weights, batch size dropped to 24576 to fit
+the 4090's 24 GiB (3/4 of the 5090 batch, matching the previously-validated
+`phase0-pubchem-warmup-24576` run). Workers and preprocess threads kept at
+the Threadripper-class settings the 5090 uses.
 
 ```bash
-CUDA_PATH=/usr/local/cuda-12.9 \
-PATH=/usr/local/cuda-12.9/bin:$PATH \
-LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:/usr/lib/wsl/lib:$LD_LIBRARY_PATH \
-CUDARC_CUDA_VERSION=12090 \
 RUSTFLAGS="-C target-cpu=native" \
 cargo run --release --no-default-features --features std,cuda-fusion,train,tui,datasets \
   --bin train -- shards/pubchem-zinc20-druglike runs/cuda-ae-pubchem-zinc20-druglike-4090-100e \
@@ -82,15 +81,42 @@ cargo run --release --no-default-features --features std,cuda-fusion,train,tui,d
   --min-molecular-mass 50 --max-molecular-mass 1000 \
   --min-formal-charge -1 --max-formal-charge 1 \
   --max-connected-components 1 \
-  --rows-per-shard 10000000 --epochs 100 --batch-size 16384 --loader-workers 12 \
+  --rows-per-shard 10000000 --epochs 100 --batch-size 24576 --loader-workers 20 \
   --metric-every 50 --descriptor-weight 0.05 --tanimoto-ranking-weight 0.10 \
-  --preprocess-threads 32 --cuda-device 0
+  --preprocess-threads 64 --cuda-device 0
 ```
 
-If you OOM, halve `--batch-size` (8192 / 4096 / 2048, all still saturate
-the kernels) before touching anything else. Latency-sensitive iteration on
-the 4090 also benefits from `--max-train-batches 1000 --max-valid-batches 64`
-during architecture sweeps.
+If you OOM, halve `--batch-size` (12288 / 8192 / 4096, all still saturate
+the kernels) before touching anything else. On lower-core hosts also drop
+`--loader-workers` and `--preprocess-threads` to roughly the host core
+count. Latency-sensitive iteration on the 4090 benefits from
+`--max-train-batches 1000 --max-valid-batches 64` during architecture
+sweeps.
+
+### PubChem only (RTX 4090, ~123M records)
+
+Skips the ~1 G ZINC20 pull and trains on PubChem alone after filtering.
+Uses a distinct cache directory (`shards/pubchem-druglike`) so it doesn't
+clobber the combined cache from the commands above. Identical loss weights,
+architecture, batch size, and worker counts as the combined 4090 run.
+
+```bash
+RUSTFLAGS="-C target-cpu=native" \
+cargo run --release --no-default-features --features std,cuda-fusion,train,tui,datasets \
+  --bin train -- shards/pubchem-druglike runs/cuda-ae-pubchem-druglike-4090-100e \
+  --datasets pubchem \
+  --min-heavy-atoms 5 --max-heavy-atoms 80 \
+  --min-molecular-mass 50 --max-molecular-mass 1000 \
+  --min-formal-charge -1 --max-formal-charge 1 \
+  --max-connected-components 1 \
+  --rows-per-shard 10000000 --epochs 100 --batch-size 24576 --loader-workers 20 \
+  --metric-every 50 --descriptor-weight 0.05 --tanimoto-ranking-weight 0.10 \
+  --preprocess-threads 64 --cuda-device 0
+```
+
+PubChem alone is about 10x smaller than PubChem + ZINC20, so an epoch
+completes ~10x faster. Useful when iterating on architecture or loss
+weights before committing to the full corpus.
 
 ### Other knobs
 
@@ -101,3 +127,21 @@ during architecture sweeps.
   defaults; `--resume` reuses the existing `model-config.json`. Add
   `--resume` to continue from
   `<checkpoint-dir>/{model,optimizer}.mpk` and `<checkpoint-dir>/state.json`.
+
+### WSL setup
+
+On WSL the host driver lives under `/usr/lib/wsl/lib` rather than where
+`ldconfig` looks, and cudarc's build-time `libcuda` probe fails without
+help. Prepend this block to any of the commands above (adjust the version
+to match your installed CUDA toolkit):
+
+```bash
+export CUDA_PATH=/usr/local/cuda-12.9
+export PATH=/usr/local/cuda-12.9/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:/usr/lib/wsl/lib:$LD_LIBRARY_PATH
+export CUDARC_CUDA_VERSION=12090
+```
+
+`CUDARC_CUDA_VERSION` is the toolkit version with dots stripped and
+left-padded to five digits (`12090` for 12.9, `12040` for 12.4). On native
+Linux none of these exports are needed.
