@@ -36,16 +36,16 @@ pub fn shard_infos(
     manifest_path: &Path,
     manifest: &ShardManifest,
 ) -> AppResult<Vec<CachedShardInfo>> {
-    if manifest.shards.is_empty() {
+    if manifest.shards().is_empty() {
         return Err(invalid_input("manifest does not list any shards"));
     }
     let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     Ok(manifest
-        .shards
+        .shards()
         .iter()
         .map(|entry| CachedShardInfo {
-            path: manifest_dir.join(&entry.path),
-            row_count: entry.row_count,
+            path: manifest_dir.join(entry.path()),
+            row_count: entry.row_count(),
         })
         .collect())
 }
@@ -56,19 +56,19 @@ pub fn validate_shard_shape(
     batcher: MoleculeAutoencoderBatcher,
     path: &Path,
 ) -> AppResult<()> {
-    if shard.fingerprint_size != batcher.fingerprint_size {
+    if shard.fingerprint_size() != batcher.fingerprint_size {
         return Err(invalid_input(format!(
             "{} fingerprint width {} does not match model width {}",
             path.display(),
-            shard.fingerprint_size,
+            shard.fingerprint_size(),
             batcher.fingerprint_size
         )));
     }
-    if shard.descriptor_width != batcher.descriptor_width {
+    if shard.descriptor_width() != batcher.descriptor_width {
         return Err(invalid_input(format!(
             "{} descriptor width {} does not match model width {}",
             path.display(),
-            shard.descriptor_width,
+            shard.descriptor_width(),
             batcher.descriptor_width
         )));
     }

@@ -11,7 +11,7 @@ use smiles_parser::prelude::Smiles;
 
 use crate::{
     CountedEcfpConfig, DescriptorConfig, DescriptorTargets, Error, FingerprintTargets, Result,
-    compute_fingerprint_targets,
+    SmilesQualityFilter, compute_fingerprint_targets,
 };
 
 const SHARD_MAGIC: [u8; 8] = *b"MAESH02\0";
@@ -35,17 +35,14 @@ pub const DEFAULT_PREPROCESS_THREADS: usize = 64;
 #[cfg(feature = "datasets")]
 pub const DEFAULT_ROWS_PER_SHARD: usize = 10_000_000;
 
-/// One SMILES record from a supported dataset.
+/// One SMILES record from a supported dataset. Construct via
+/// [`MoleculeRecord::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoleculeRecord {
-    /// Stable source dataset identifier.
-    pub dataset_id: String,
-    /// Dataset-specific record identifier.
-    pub record_id: String,
-    /// Stable numeric molecule identifier used by shard metadata and splits.
-    pub stable_id: u64,
-    /// Source SMILES text.
-    pub smiles: String,
+    dataset_id: String,
+    record_id: String,
+    stable_id: u64,
+    smiles: String,
 }
 
 impl MoleculeRecord {
@@ -65,6 +62,30 @@ impl MoleculeRecord {
             stable_id,
             smiles: smiles.into(),
         }
+    }
+
+    /// Stable source dataset identifier.
+    #[must_use]
+    pub fn dataset_id(&self) -> &str {
+        &self.dataset_id
+    }
+
+    /// Dataset-specific record identifier.
+    #[must_use]
+    pub fn record_id(&self) -> &str {
+        &self.record_id
+    }
+
+    /// Stable numeric molecule identifier used by shard metadata and splits.
+    #[must_use]
+    pub const fn stable_id(&self) -> u64 {
+        self.stable_id
+    }
+
+    /// Source SMILES text.
+    #[must_use]
+    pub fn smiles(&self) -> &str {
+        &self.smiles
     }
 
     /// Converts a `smiles-parser` dataset record into a preprocessing record.
@@ -116,34 +137,143 @@ where
     })
 }
 
-/// Parallel dataset preprocessing controls.
+/// Parallel dataset preprocessing controls. Construct via
+/// [`DatasetPreprocessOptions::builder`].
 #[cfg(feature = "datasets")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatasetPreprocessOptions {
-    /// Number of records read before dispatching work to Rayon.
-    pub chunk_rows: usize,
-    /// Optional local Rayon thread count.
-    pub threads: Option<usize>,
+    chunk_rows: usize,
+    threads: Option<usize>,
 }
 
 #[cfg(feature = "datasets")]
 impl Default for DatasetPreprocessOptions {
     fn default() -> Self {
+        DatasetPreprocessOptionsBuilder::new()
+            .build()
+            .expect("default dataset preprocess options are valid")
+    }
+}
+
+#[cfg(feature = "datasets")]
+impl DatasetPreprocessOptions {
+    /// Starts a fluent builder.
+    #[must_use]
+    pub fn builder() -> DatasetPreprocessOptionsBuilder {
+        DatasetPreprocessOptionsBuilder::new()
+    }
+
+    /// Number of records read before dispatching work to Rayon.
+    #[must_use]
+    pub const fn chunk_rows(&self) -> usize {
+        self.chunk_rows
+    }
+
+    /// Optional local Rayon thread count (`None` uses the global pool).
+    #[must_use]
+    pub const fn threads(&self) -> Option<usize> {
+        self.threads
+    }
+}
+
+/// Fluent builder for [`DatasetPreprocessOptions`].
+#[cfg(feature = "datasets")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatasetPreprocessOptionsBuilder {
+    chunk_rows: usize,
+    threads: Option<usize>,
+}
+
+#[cfg(feature = "datasets")]
+impl Default for DatasetPreprocessOptionsBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "datasets")]
+impl DatasetPreprocessOptionsBuilder {
+    /// Creates a builder seeded with the v1 defaults.
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             chunk_rows: DEFAULT_PREPROCESS_CHUNK_ROWS,
             threads: Some(DEFAULT_PREPROCESS_THREADS),
         }
     }
+
+    /// Sets the per-chunk row count.
+    #[must_use]
+    pub const fn chunk_rows(mut self, value: usize) -> Self {
+        self.chunk_rows = value;
+        self
+    }
+
+    /// Sets the local Rayon thread count; `None` uses the global pool.
+    #[must_use]
+    pub const fn threads(mut self, value: Option<usize>) -> Self {
+        self.threads = value;
+        self
+    }
+
+    /// Validates and builds the immutable options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] when `chunk_rows` is zero or when
+    /// `threads` is `Some(0)`.
+    pub fn build(self) -> Result<DatasetPreprocessOptions> {
+        if self.chunk_rows == 0 {
+            return Err(Error::ConfigInvalid {
+                message: "preprocess chunk_rows must be greater than zero".to_string(),
+            });
+        }
+        if matches!(self.threads, Some(0)) {
+            return Err(Error::ConfigInvalid {
+                message: "preprocess threads must be greater than zero when set".to_string(),
+            });
+        }
+        Ok(DatasetPreprocessOptions {
+            chunk_rows: self.chunk_rows,
+            threads: self.threads,
+        })
+    }
 }
 
 /// Ordered result of one parallel dataset preprocessing chunk.
+///
+/// Constructed by [`preprocess_dataset_record_chunks`] and consumed via the
+/// [`records_seen`](Self::records_seen) / [`into_results`](Self::into_results)
+/// accessors.
 #[cfg(feature = "datasets")]
 #[derive(Debug)]
 pub struct PreprocessedDatasetChunk {
+    records_seen: usize,
+    results: Vec<Result<Option<MoleculeTargets>>>,
+}
+
+#[cfg(feature = "datasets")]
+impl PreprocessedDatasetChunk {
     /// Total records read from the source after this chunk.
-    pub records_seen: usize,
+    #[must_use]
+    pub const fn records_seen(&self) -> usize {
+        self.records_seen
+    }
+
     /// Per-record preprocessing results, preserving source order.
-    pub results: Vec<Result<MoleculeTargets>>,
+    ///
+    /// `Ok(Some(_))` is an accepted molecule, `Ok(None)` is a record skipped
+    /// by the configured [`SmilesQualityFilter`], and `Err(_)` is a parse or
+    /// fingerprint failure.
+    pub fn results(&self) -> &[Result<Option<MoleculeTargets>>] {
+        &self.results
+    }
+
+    /// Consumes the chunk, returning its results.
+    #[must_use]
+    pub fn into_results(self) -> Vec<Result<Option<MoleculeTargets>>> {
+        self.results
+    }
 }
 
 /// Reads dataset records sequentially, then preprocesses each chunk in parallel.
@@ -164,7 +294,6 @@ where
     I: IntoIterator<Item = Result<MoleculeRecord>>,
     F: FnMut(PreprocessedDatasetChunk) -> Result<()>,
 {
-    validate_preprocess_options(options)?;
     let mut records = records.into_iter();
     let mut records_seen = 0_usize;
     let pool = match options.threads {
@@ -202,25 +331,10 @@ where
 }
 
 #[cfg(feature = "datasets")]
-fn validate_preprocess_options(options: DatasetPreprocessOptions) -> Result<()> {
-    if options.chunk_rows == 0 {
-        return Err(Error::InvalidBatch(
-            "preprocess chunk size must be greater than zero".to_string(),
-        ));
-    }
-    if options.threads == Some(0) {
-        return Err(Error::InvalidBatch(
-            "preprocess threads must be greater than zero".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "datasets")]
 fn preprocess_record_chunk_parallel(
     chunk: Vec<Result<MoleculeRecord>>,
     config: &PreprocessingConfig,
-) -> Vec<Result<MoleculeTargets>> {
+) -> Vec<Result<Option<MoleculeTargets>>> {
     use rayon::prelude::*;
 
     chunk
@@ -258,28 +372,56 @@ impl DataSplit {
     }
 }
 
-/// Deterministic preprocessing configuration.
+/// Deterministic preprocessing configuration. Construct via
+/// [`PreprocessingConfig::builder`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreprocessingConfig {
-    /// Main counted ECFP configuration.
-    pub counted_ecfp: CountedEcfpConfig,
-    /// Descriptor normalization configuration.
-    pub descriptors: DescriptorConfig,
-    /// Validation split in permille units.
-    pub validation_per_mille: u16,
+    counted_ecfp: CountedEcfpConfig,
+    descriptors: DescriptorConfig,
+    validation_per_mille: u16,
+    #[serde(default)]
+    quality_filter: SmilesQualityFilter,
 }
 
 impl Default for PreprocessingConfig {
     fn default() -> Self {
-        Self {
-            counted_ecfp: CountedEcfpConfig::default(),
-            descriptors: DescriptorConfig::default(),
-            validation_per_mille: 100,
-        }
+        PreprocessingConfigBuilder::new()
+            .build()
+            .expect("default preprocessing config is valid")
     }
 }
 
 impl PreprocessingConfig {
+    /// Starts a fluent builder.
+    #[must_use]
+    pub fn builder() -> PreprocessingConfigBuilder {
+        PreprocessingConfigBuilder::new()
+    }
+
+    /// Main counted ECFP configuration.
+    #[must_use]
+    pub const fn counted_ecfp(&self) -> &CountedEcfpConfig {
+        &self.counted_ecfp
+    }
+
+    /// Descriptor normalization configuration.
+    #[must_use]
+    pub const fn descriptors(&self) -> &DescriptorConfig {
+        &self.descriptors
+    }
+
+    /// Validation split in permille units.
+    #[must_use]
+    pub const fn validation_per_mille(&self) -> u16 {
+        self.validation_per_mille
+    }
+
+    /// SMILES quality filter applied before fingerprinting.
+    #[must_use]
+    pub const fn quality_filter(&self) -> &SmilesQualityFilter {
+        &self.quality_filter
+    }
+
     /// Assigns a deterministic split from a stable molecule id.
     #[must_use]
     pub fn split_for_stable_id(&self, stable_id: u64) -> DataSplit {
@@ -292,32 +434,143 @@ impl PreprocessingConfig {
     }
 }
 
-/// Parsed, fingerprinted, descriptor-rich molecule target.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MoleculeTargets {
-    /// Stable numeric molecule identifier.
-    pub cid: u64,
-    /// Source SMILES text.
-    pub source_smiles: String,
-    /// Sparse counted ECFP target.
-    pub fingerprint: FingerprintTargets,
-    /// Descriptor targets.
-    pub descriptors: DescriptorTargets,
-    /// Deterministic data split.
-    pub split: DataSplit,
+/// Fluent builder for [`PreprocessingConfig`].
+#[derive(Debug, Clone)]
+pub struct PreprocessingConfigBuilder {
+    counted_ecfp: CountedEcfpConfig,
+    descriptors: DescriptorConfig,
+    validation_per_mille: u16,
+    quality_filter: SmilesQualityFilter,
 }
 
-/// Parses and fingerprints one dataset record.
+impl Default for PreprocessingConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PreprocessingConfigBuilder {
+    /// Creates a builder seeded with the v1 defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            counted_ecfp: CountedEcfpConfig::default(),
+            descriptors: DescriptorConfig::default(),
+            validation_per_mille: 100,
+            quality_filter: SmilesQualityFilter::default(),
+        }
+    }
+
+    /// Sets the counted ECFP configuration.
+    #[must_use]
+    pub const fn counted_ecfp(mut self, value: CountedEcfpConfig) -> Self {
+        self.counted_ecfp = value;
+        self
+    }
+
+    /// Sets the descriptor normalization configuration.
+    #[must_use]
+    pub const fn descriptors(mut self, value: DescriptorConfig) -> Self {
+        self.descriptors = value;
+        self
+    }
+
+    /// Sets the validation split as a permille fraction.
+    #[must_use]
+    pub const fn validation_per_mille(mut self, value: u16) -> Self {
+        self.validation_per_mille = value;
+        self
+    }
+
+    /// Sets the SMILES quality filter.
+    #[must_use]
+    pub const fn quality_filter(mut self, value: SmilesQualityFilter) -> Self {
+        self.quality_filter = value;
+        self
+    }
+
+    /// Validates and builds the immutable [`PreprocessingConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] when `validation_per_mille` exceeds
+    /// 1000.
+    pub fn build(self) -> Result<PreprocessingConfig> {
+        if self.validation_per_mille > 1000 {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "validation_per_mille must be in 0..=1000, got {}",
+                    self.validation_per_mille
+                ),
+            });
+        }
+        Ok(PreprocessingConfig {
+            counted_ecfp: self.counted_ecfp,
+            descriptors: self.descriptors,
+            validation_per_mille: self.validation_per_mille,
+            quality_filter: self.quality_filter,
+        })
+    }
+}
+
+/// Parsed, fingerprinted, descriptor-rich molecule target.
+///
+/// Constructed by [`preprocess_record`]; consumed via the accessor methods
+/// below.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoleculeTargets {
+    cid: u64,
+    source_smiles: String,
+    fingerprint: FingerprintTargets,
+    descriptors: DescriptorTargets,
+    split: DataSplit,
+}
+
+impl MoleculeTargets {
+    /// Stable numeric molecule identifier.
+    #[must_use]
+    pub const fn cid(&self) -> u64 {
+        self.cid
+    }
+
+    /// Source SMILES text.
+    #[must_use]
+    pub fn source_smiles(&self) -> &str {
+        &self.source_smiles
+    }
+
+    /// Sparse counted ECFP target.
+    #[must_use]
+    pub const fn fingerprint(&self) -> &FingerprintTargets {
+        &self.fingerprint
+    }
+
+    /// Molecule descriptor targets.
+    #[must_use]
+    pub const fn descriptors(&self) -> &DescriptorTargets {
+        &self.descriptors
+    }
+
+    /// Deterministic data split.
+    #[must_use]
+    pub const fn split(&self) -> DataSplit {
+        self.split
+    }
+}
+
+/// Parses and fingerprints one dataset record, applying the configured
+/// quality filter before doing fingerprint work.
 ///
 /// # Errors
 ///
 /// Returns an error when the SMILES cannot be parsed or fingerprint preparation
-/// fails.
+/// fails. Returns `Ok(None)` when the record is rejected by the quality
+/// filter; callers should treat that as a silent skip.
 pub fn preprocess_record(
     record: &MoleculeRecord,
     config: &PreprocessingConfig,
     scratch: &mut finge_rs::smiles_support::SmilesRdkitScratch,
-) -> Result<MoleculeTargets> {
+) -> Result<Option<MoleculeTargets>> {
     let smiles = record
         .smiles
         .parse::<Smiles>()
@@ -326,53 +579,75 @@ pub fn preprocess_record(
             message: format!("{}:{}: {source}", record.dataset_id, record.record_id),
         })?;
     let descriptors = DescriptorTargets::from_smiles(&smiles);
+    if !config.quality_filter.accepts(&descriptors) {
+        return Ok(None);
+    }
     let fingerprint =
         compute_fingerprint_targets(record.stable_id, &smiles, config.counted_ecfp, scratch)?;
     let split = config.split_for_stable_id(record.stable_id);
 
-    Ok(MoleculeTargets {
+    Ok(Some(MoleculeTargets {
         cid: record.stable_id,
         source_smiles: record.smiles.clone(),
         fingerprint,
         descriptors,
         split,
-    })
+    }))
 }
 
 /// One row view into a sparse molecule shard.
 #[derive(Debug, Clone, Copy)]
 pub struct MoleculeShardRow<'a> {
+    cid: u64,
+    fingerprint_indices: &'a [u16],
+    fingerprint_counts: &'a [u16],
+    descriptor_targets: &'a [f32],
+    split: DataSplit,
+}
+
+impl<'a> MoleculeShardRow<'a> {
     /// Stable numeric molecule identifier.
-    pub cid: u64,
+    #[must_use]
+    pub const fn cid(&self) -> u64 {
+        self.cid
+    }
+
     /// Sparse fingerprint indices.
-    pub fingerprint_indices: &'a [u16],
+    #[must_use]
+    pub const fn fingerprint_indices(&self) -> &'a [u16] {
+        self.fingerprint_indices
+    }
+
     /// Sparse fingerprint counts.
-    pub fingerprint_counts: &'a [u16],
+    #[must_use]
+    pub const fn fingerprint_counts(&self) -> &'a [u16] {
+        self.fingerprint_counts
+    }
+
     /// Normalized descriptor regression targets.
-    pub descriptor_targets: &'a [f32],
+    #[must_use]
+    pub const fn descriptor_targets(&self) -> &'a [f32] {
+        self.descriptor_targets
+    }
+
     /// Deterministic data split.
-    pub split: DataSplit,
+    #[must_use]
+    pub const fn split(&self) -> DataSplit {
+        self.split
+    }
 }
 
 /// Tensor-ready sparse molecule shard.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparseMoleculeShard {
-    /// Full dense fingerprint width.
-    pub fingerprint_size: usize,
-    /// Descriptor regression target width.
-    pub descriptor_width: usize,
-    /// Stable numeric molecule identifiers, one per row.
-    pub cids: Vec<u64>,
-    /// Sparse row offsets, length `row_count + 1`.
-    pub row_offsets: Vec<u64>,
-    /// Concatenated sparse fingerprint indices.
-    pub indices: Vec<u16>,
-    /// Concatenated sparse fingerprint counts.
-    pub counts: Vec<u16>,
-    /// Flattened descriptor targets with shape `[rows, descriptor_width]`.
-    pub descriptor_targets: Vec<f32>,
-    /// Deterministic split, one per row.
-    pub splits: Vec<DataSplit>,
+    fingerprint_size: usize,
+    descriptor_width: usize,
+    cids: Vec<u64>,
+    row_offsets: Vec<u64>,
+    indices: Vec<u16>,
+    counts: Vec<u16>,
+    descriptor_targets: Vec<f32>,
+    splits: Vec<DataSplit>,
 }
 
 impl SparseMoleculeShard {
@@ -389,6 +664,54 @@ impl SparseMoleculeShard {
             descriptor_targets: Vec::new(),
             splits: Vec::new(),
         }
+    }
+
+    /// Full dense fingerprint width.
+    #[must_use]
+    pub const fn fingerprint_size(&self) -> usize {
+        self.fingerprint_size
+    }
+
+    /// Descriptor regression target width.
+    #[must_use]
+    pub const fn descriptor_width(&self) -> usize {
+        self.descriptor_width
+    }
+
+    /// Stable numeric molecule identifiers, one per row.
+    #[must_use]
+    pub fn cids(&self) -> &[u64] {
+        &self.cids
+    }
+
+    /// Sparse row offsets, length `row_count + 1`.
+    #[must_use]
+    pub fn row_offsets(&self) -> &[u64] {
+        &self.row_offsets
+    }
+
+    /// Concatenated sparse fingerprint indices.
+    #[must_use]
+    pub fn indices(&self) -> &[u16] {
+        &self.indices
+    }
+
+    /// Concatenated sparse fingerprint counts.
+    #[must_use]
+    pub fn counts(&self) -> &[u16] {
+        &self.counts
+    }
+
+    /// Flattened descriptor targets with shape `[rows, descriptor_width]`.
+    #[must_use]
+    pub fn descriptor_targets(&self) -> &[f32] {
+        &self.descriptor_targets
+    }
+
+    /// Deterministic split, one per row.
+    #[must_use]
+    pub fn splits(&self) -> &[DataSplit] {
+        &self.splits
     }
 
     /// Number of rows.
@@ -416,10 +739,11 @@ impl SparseMoleculeShard {
         descriptor_targets: &[f32],
         split: DataSplit,
     ) -> Result<()> {
-        if fingerprint.fingerprint_size != self.fingerprint_size {
+        if fingerprint.fingerprint_size() != self.fingerprint_size {
             return Err(Error::InvalidBatch(format!(
                 "fingerprint width {} does not match shard width {}",
-                fingerprint.fingerprint_size, self.fingerprint_size
+                fingerprint.fingerprint_size(),
+                self.fingerprint_size
             )));
         }
         if descriptor_targets.len() != self.descriptor_width {
@@ -429,15 +753,9 @@ impl SparseMoleculeShard {
                 self.descriptor_width
             )));
         }
-        if fingerprint.indices.len() != fingerprint.counts.len() {
-            return Err(Error::InvalidBatch(
-                "fingerprint indices and counts have different lengths".to_string(),
-            ));
-        }
-
         self.cids.push(cid);
-        self.indices.extend_from_slice(&fingerprint.indices);
-        self.counts.extend_from_slice(&fingerprint.counts);
+        self.indices.extend_from_slice(fingerprint.indices());
+        self.counts.extend_from_slice(fingerprint.counts());
         self.descriptor_targets
             .extend_from_slice(descriptor_targets);
         self.splits.push(split);
@@ -788,34 +1106,46 @@ impl SparseMoleculeShard {
     }
 }
 
-/// One shard entry in a manifest.
+/// One shard entry in a manifest. Constructed internally by
+/// [`ShardManifest::push_shard`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardManifestEntry {
-    /// Shard path relative to the manifest.
-    pub path: String,
-    /// Number of rows in the shard.
-    pub row_count: usize,
-    /// Number of sparse nonzero entries.
-    pub nnz: usize,
+    path: String,
+    row_count: usize,
+    nnz: usize,
 }
 
-/// Preprocessing manifest for cached dataset shards.
+impl ShardManifestEntry {
+    /// Shard path relative to the manifest.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Number of rows in the shard.
+    #[must_use]
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Number of sparse nonzero entries.
+    #[must_use]
+    pub const fn nnz(&self) -> usize {
+        self.nnz
+    }
+}
+
+/// Preprocessing manifest for cached dataset shards. Construct via
+/// [`ShardManifest::new`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardManifest {
-    /// Manifest schema version.
-    pub manifest_version: u32,
-    /// Input source label or URL.
-    pub source: String,
-    /// Preprocessing configuration.
-    pub preprocessing: PreprocessingConfig,
-    /// Output shards.
-    pub shards: Vec<ShardManifestEntry>,
-    /// Total rows written.
-    pub row_count: usize,
-    /// Records skipped before writing.
-    pub skipped_count: usize,
-    /// Records that failed parsing or preprocessing.
-    pub error_count: usize,
+    manifest_version: u32,
+    source: String,
+    preprocessing: PreprocessingConfig,
+    shards: Vec<ShardManifestEntry>,
+    row_count: usize,
+    skipped_count: usize,
+    error_count: usize,
 }
 
 impl ShardManifest {
@@ -831,6 +1161,58 @@ impl ShardManifest {
             skipped_count: 0,
             error_count: 0,
         }
+    }
+
+    /// Manifest schema version.
+    #[must_use]
+    pub const fn manifest_version(&self) -> u32 {
+        self.manifest_version
+    }
+
+    /// Input source label or URL.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Preprocessing configuration that produced these shards.
+    #[must_use]
+    pub const fn preprocessing(&self) -> &PreprocessingConfig {
+        &self.preprocessing
+    }
+
+    /// Output shard entries, ordered as written.
+    #[must_use]
+    pub fn shards(&self) -> &[ShardManifestEntry] {
+        &self.shards
+    }
+
+    /// Total rows written.
+    #[must_use]
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Records skipped before writing.
+    #[must_use]
+    pub const fn skipped_count(&self) -> usize {
+        self.skipped_count
+    }
+
+    /// Records that failed parsing or preprocessing.
+    #[must_use]
+    pub const fn error_count(&self) -> usize {
+        self.error_count
+    }
+
+    /// Increments the skipped-record counter.
+    pub const fn record_skipped(&mut self) {
+        self.skipped_count += 1;
+    }
+
+    /// Increments the error counter.
+    pub const fn record_error(&mut self) {
+        self.error_count += 1;
     }
 
     /// Appends one shard entry and updates totals.
@@ -1140,11 +1522,7 @@ mod tests {
     };
 
     fn test_fingerprint() -> FingerprintTargets {
-        FingerprintTargets {
-            indices: vec![3, 9],
-            counts: vec![1, 4],
-            fingerprint_size: 4096,
-        }
+        FingerprintTargets::new(vec![3, 9], vec![1, 4], 4096).expect("valid test fingerprint")
     }
 
     fn test_shard() -> SparseMoleculeShard {
@@ -1265,10 +1643,11 @@ mod tests {
         let records_seen = preprocess_dataset_record_chunks(
             records,
             &config,
-            DatasetPreprocessOptions {
-                chunk_rows: 2,
-                threads: Some(2),
-            },
+            DatasetPreprocessOptions::builder()
+                .chunk_rows(2)
+                .threads(Some(2))
+                .build()
+                .expect("valid preprocess options"),
             |chunk| {
                 chunks.push(chunk);
                 Ok(())
@@ -1286,7 +1665,15 @@ mod tests {
             .flat_map(|chunk| chunk.results)
             .collect::<Vec<_>>();
         assert_eq!(results.len(), 4);
-        assert_eq!(results[0].as_ref().expect("ethanol").cid, 702);
+        assert_eq!(
+            results[0]
+                .as_ref()
+                .expect("ethanol ok")
+                .as_ref()
+                .expect("ethanol kept")
+                .cid,
+            702
+        );
         assert!(matches!(
             &results[1],
             Err(Error::SmilesParse {
@@ -1294,46 +1681,69 @@ mod tests {
                 message
             }) if !message.is_empty()
         ));
-        assert_eq!(results[2].as_ref().expect("water").cid, 704);
+        assert_eq!(
+            results[2]
+                .as_ref()
+                .expect("water ok")
+                .as_ref()
+                .expect("water kept")
+                .cid,
+            704
+        );
         assert!(matches!(
             &results[3],
             Err(Error::DatasetRecord { message }) if message == "bad record"
         ));
     }
 
+    #[test]
+    fn preprocess_record_skips_records_rejected_by_quality_filter() {
+        let config = PreprocessingConfig {
+            quality_filter: crate::SmilesQualityFilter::builder()
+                .min_heavy_atoms(100)
+                .build()
+                .expect("valid filter"),
+            ..PreprocessingConfig::default()
+        };
+        let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
+        let record = MoleculeRecord::new("pubchem-smiles", "702", "CCO");
+
+        let outcome = preprocess_record(&record, &config, &mut scratch).expect("preprocess ok");
+
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn preprocessing_config_builder_rejects_validation_per_mille_over_thousand() {
+        let error = PreprocessingConfig::builder()
+            .validation_per_mille(1001)
+            .build()
+            .expect_err("validation_per_mille > 1000");
+        assert!(matches!(
+            error,
+            Error::ConfigInvalid { message } if message.contains("validation_per_mille")
+        ));
+    }
+
     #[cfg(feature = "datasets")]
     #[test]
-    fn parallel_preprocessing_rejects_invalid_options() {
-        let config = PreprocessingConfig::default();
-
-        let zero_chunk_error = preprocess_dataset_record_chunks(
-            std::iter::empty::<Result<MoleculeRecord>>(),
-            &config,
-            DatasetPreprocessOptions {
-                chunk_rows: 0,
-                threads: None,
-            },
-            |_| Ok(()),
-        )
-        .expect_err("zero chunk size should be rejected");
+    fn dataset_preprocess_options_builder_rejects_zero_chunk_or_threads() {
+        let zero_chunk_error = DatasetPreprocessOptions::builder()
+            .chunk_rows(0)
+            .build()
+            .expect_err("zero chunk size should be rejected");
         assert!(matches!(
             zero_chunk_error,
-            Error::InvalidBatch(message) if message.contains("chunk size")
+            Error::ConfigInvalid { message } if message.contains("chunk_rows")
         ));
 
-        let zero_threads_error = preprocess_dataset_record_chunks(
-            std::iter::empty::<Result<MoleculeRecord>>(),
-            &config,
-            DatasetPreprocessOptions {
-                chunk_rows: 1,
-                threads: Some(0),
-            },
-            |_| Ok(()),
-        )
-        .expect_err("zero thread count should be rejected");
+        let zero_threads_error = DatasetPreprocessOptions::builder()
+            .threads(Some(0))
+            .build()
+            .expect_err("zero thread count should be rejected");
         assert!(matches!(
             zero_threads_error,
-            Error::InvalidBatch(message) if message.contains("threads")
+            Error::ConfigInvalid { message } if message.contains("threads")
         ));
     }
 
@@ -1342,8 +1752,8 @@ mod tests {
     fn dataset_preprocessing_defaults_to_sixty_four_threads() {
         let options = DatasetPreprocessOptions::default();
 
-        assert_eq!(options.chunk_rows, DEFAULT_PREPROCESS_CHUNK_ROWS);
-        assert_eq!(options.threads, Some(DEFAULT_PREPROCESS_THREADS));
+        assert_eq!(options.chunk_rows(), DEFAULT_PREPROCESS_CHUNK_ROWS);
+        assert_eq!(options.threads(), Some(DEFAULT_PREPROCESS_THREADS));
     }
 
     #[test]
@@ -1368,11 +1778,9 @@ mod tests {
         let path = dir.path().join("shard.maeshard");
         let mut shard = SparseMoleculeShard::new(4096, REGRESSION_TARGET_WIDTH);
         for row in 0_u16..4 {
-            let fingerprint = FingerprintTargets {
-                indices: vec![row + 1, row + 11],
-                counts: vec![row + 2, row + 3],
-                fingerprint_size: 4096,
-            };
+            let fingerprint =
+                FingerprintTargets::new(vec![row + 1, row + 11], vec![row + 2, row + 3], 4096)
+                    .expect("valid fingerprint");
             shard
                 .push(
                     1000 + u64::from(row),
@@ -1410,10 +1818,8 @@ mod tests {
     #[test]
     fn sparse_shard_rejects_invalid_push_inputs() {
         let mut shard = SparseMoleculeShard::new(4096, REGRESSION_TARGET_WIDTH);
-        let wrong_width = FingerprintTargets {
-            fingerprint_size: 2048,
-            ..test_fingerprint()
-        };
+        let wrong_width =
+            FingerprintTargets::new(vec![3, 9], vec![1, 4], 2048).expect("valid fingerprint");
         let error = shard
             .push(
                 702,
@@ -1437,22 +1843,23 @@ mod tests {
         assert!(
             matches!(error, Error::InvalidBatch(message) if message.contains("descriptor width"))
         );
+    }
 
-        let mismatched_sparse = FingerprintTargets {
-            counts: vec![1],
-            ..test_fingerprint()
-        };
-        let error = shard
-            .push(
-                702,
-                &mismatched_sparse,
-                &[0.0; REGRESSION_TARGET_WIDTH],
-                DataSplit::Train,
-            )
-            .expect_err("sparse length mismatch");
-        assert!(
-            matches!(error, Error::InvalidBatch(message) if message.contains("different lengths"))
-        );
+    #[test]
+    fn fingerprint_targets_constructor_rejects_invalid_inputs() {
+        let length_mismatch =
+            FingerprintTargets::new(vec![3, 9], vec![1], 4096).expect_err("length mismatch");
+        assert!(matches!(
+            length_mismatch,
+            Error::InvalidBatch(message) if message.contains("different lengths")
+        ));
+
+        let index_overflow =
+            FingerprintTargets::new(vec![4096], vec![1], 4096).expect_err("index >= width");
+        assert!(matches!(
+            index_overflow,
+            Error::InvalidBatch(message) if message.contains("exceeds configured width")
+        ));
     }
 
     #[test]

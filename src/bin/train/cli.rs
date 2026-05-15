@@ -1,8 +1,9 @@
 //! Command-line argument parsing for the `train` bin.
 
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 
-use molecular_autoencoder::MoleculeAutoencoderConfig;
+use clap::{Parser, ValueEnum};
+use molecular_autoencoder::{MoleculeAutoencoderConfig, SmilesQualityFilter};
 
 use crate::{AppResult, invalid_input};
 
@@ -21,434 +22,562 @@ pub const ZINC20_FIRST_CHUNK: u8 = 1;
 /// Largest valid ZINC20 chunk index.
 pub const ZINC20_LAST_CHUNK: u8 = 20;
 
-/// Datasets selected for ingestion.
+/// Supported source datasets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DatasetKind {
+    /// PubChem SMILES dataset (~123M records).
+    Pubchem,
+    /// ZINC20 SMILES dataset (~1G records over 20 chunks).
+    Zinc20,
+}
+
+/// Inclusive ZINC20 chunk range, parsed from `FIRST-LAST` or `FIRST..=LAST`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Zinc20ChunkRange {
+    /// First chunk (inclusive).
+    pub first: u8,
+    /// Last chunk (inclusive).
+    pub last: u8,
+}
+
+impl std::str::FromStr for Zinc20ChunkRange {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        let (first, last) = if let Some((first, last)) = value.split_once("..=") {
+            (first, last)
+        } else if let Some((first, last)) = value.split_once('-') {
+            (first, last)
+        } else {
+            (value, value)
+        };
+        let first_chunk = first
+            .parse::<u8>()
+            .map_err(|source| format!("invalid ZINC20 first chunk `{first}`: {source}"))?;
+        let last_chunk = last
+            .parse::<u8>()
+            .map_err(|source| format!("invalid ZINC20 last chunk `{last}`: {source}"))?;
+        if first_chunk < ZINC20_FIRST_CHUNK
+            || last_chunk > ZINC20_LAST_CHUNK
+            || first_chunk > last_chunk
+        {
+            return Err(format!(
+                "ZINC20 chunks must be an inclusive range within {ZINC20_FIRST_CHUNK}..={ZINC20_LAST_CHUNK}"
+            ));
+        }
+        Ok(Self {
+            first: first_chunk,
+            last: last_chunk,
+        })
+    }
+}
+
+/// Datasets selected for ingestion, after deduplication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceSelection {
     /// Only PubChem records.
     PubChem,
     /// Only ZINC20 records over an inclusive chunk range.
-    Zinc20 { first_chunk: u8, last_chunk: u8 },
+    Zinc20(Zinc20ChunkRange),
     /// Both PubChem and a ZINC20 chunk range.
-    PubChemAndZinc20 { first_chunk: u8, last_chunk: u8 },
+    PubChemAndZinc20(Zinc20ChunkRange),
 }
 
 impl SourceSelection {
-    /// Overrides the ZINC20 chunk range if this selection ingests ZINC20.
-    pub fn with_zinc20_chunks(self, first_chunk: u8, last_chunk: u8) -> AppResult<Self> {
-        match self {
-            Self::PubChem => Err(invalid_input(
-                "--zinc20-chunks is only valid when --datasets includes `zinc20`",
-            )),
-            Self::Zinc20 { .. } => Ok(Self::Zinc20 {
-                first_chunk,
-                last_chunk,
-            }),
-            Self::PubChemAndZinc20 { .. } => Ok(Self::PubChemAndZinc20 {
-                first_chunk,
-                last_chunk,
-            }),
+    /// Builds the source selection from clap-parsed flags.
+    pub fn from_flags(
+        datasets: &[DatasetKind],
+        zinc20_chunks: Option<Zinc20ChunkRange>,
+    ) -> AppResult<Option<Self>> {
+        let mut want_pubchem = false;
+        let mut want_zinc20 = false;
+        for kind in datasets {
+            match kind {
+                DatasetKind::Pubchem => {
+                    if want_pubchem {
+                        return Err(invalid_input("--datasets lists `pubchem` more than once"));
+                    }
+                    want_pubchem = true;
+                }
+                DatasetKind::Zinc20 => {
+                    if want_zinc20 {
+                        return Err(invalid_input("--datasets lists `zinc20` more than once"));
+                    }
+                    want_zinc20 = true;
+                }
+            }
         }
+        if !want_zinc20 && zinc20_chunks.is_some() {
+            return Err(invalid_input(
+                "--zinc20-chunks requires --datasets to include `zinc20`",
+            ));
+        }
+        let chunks = zinc20_chunks.unwrap_or(Zinc20ChunkRange {
+            first: ZINC20_FIRST_CHUNK,
+            last: ZINC20_LAST_CHUNK,
+        });
+        Ok(match (want_pubchem, want_zinc20) {
+            (false, false) => None,
+            (true, false) => Some(Self::PubChem),
+            (false, true) => Some(Self::Zinc20(chunks)),
+            (true, true) => Some(Self::PubChemAndZinc20(chunks)),
+        })
     }
 
     /// Returns the manifest source label that identifies this selection.
     pub fn manifest_source(self) -> String {
         match self {
             Self::PubChem => "pubchem-smiles".to_string(),
-            Self::Zinc20 {
-                first_chunk,
-                last_chunk,
-            } => format!("zinc20-smiles chunks {first_chunk}..={last_chunk}"),
-            Self::PubChemAndZinc20 {
-                first_chunk,
-                last_chunk,
-            } => format!("pubchem-smiles + zinc20-smiles chunks {first_chunk}..={last_chunk}"),
+            Self::Zinc20(range) => {
+                format!("zinc20-smiles chunks {}..={}", range.first, range.last)
+            }
+            Self::PubChemAndZinc20(range) => format!(
+                "pubchem-smiles + zinc20-smiles chunks {}..={}",
+                range.first, range.last
+            ),
         }
     }
 }
 
 /// Fully-parsed training CLI configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parser)]
+#[command(
+    name = "train",
+    version,
+    about = "Train the molecular autoencoder on cached SMILES shards",
+    disable_help_subcommand = true
+)]
 pub struct Args {
-    pub manifest_path: PathBuf,
-    pub cache_dir: Option<PathBuf>,
-    pub source_selection: Option<SourceSelection>,
+    /// Cached shards directory, or path to an existing manifest.json file.
+    pub shards: PathBuf,
+
+    /// Directory for model, optimizer, and state checkpoints.
     pub checkpoint_dir: PathBuf,
+
+    /// Datasets to ingest into the cache (comma-separated). Omit to train
+    /// from an existing manifest without re-preprocessing.
+    #[arg(long, value_delimiter = ',', value_enum)]
+    pub datasets: Vec<DatasetKind>,
+
+    /// Inclusive ZINC20 chunk range (e.g. `1-5` or `1..=5`).
+    #[arg(long, value_name = "FIRST-LAST")]
+    pub zinc20_chunks: Option<Zinc20ChunkRange>,
+
+    /// Rows written per cached shard.
+    #[arg(long, default_value_t = DEFAULT_ROWS_PER_SHARD)]
     pub rows_per_shard: usize,
+
+    /// Training epochs.
+    #[arg(long, default_value_t = 10)]
     pub epochs: usize,
+
+    /// Mini-batch size.
+    #[arg(long, default_value_t = 4096)]
     pub batch_size: usize,
+
+    /// Adam learning rate.
+    #[arg(long, default_value_t = 1.0e-3)]
     pub learning_rate: f64,
+
+    /// Latent embedding width.
+    #[arg(long, default_value_t = 512)]
     pub latent_width: usize,
+
+    /// Decoder-side latent denoising noise as fraction of batch latent std.
+    #[arg(long, default_value_t = 0.02)]
     pub latent_noise_std: f64,
+
+    /// Encoder hidden widths, comma-separated.
+    #[arg(long, value_delimiter = ',', default_values_t = [4096_usize, 2048, 1024])]
     pub hidden_widths: Vec<usize>,
+
+    /// Checkpoint every N epochs (0 disables).
+    #[arg(long, default_value_t = 1)]
     pub checkpoint_every: usize,
+
+    /// Validate every N epochs (0 disables).
+    #[arg(long, default_value_t = 1)]
     pub validate_every: usize,
+
+    /// Cap training batches per epoch.
+    #[arg(long)]
     pub max_train_batches: Option<usize>,
-    pub max_valid_batches: Option<usize>,
+
+    /// Cap validation batches per pass.
+    #[arg(long, default_value_t = 64)]
+    pub max_valid_batches: usize,
+
+    /// Disable the validation batch cap entirely.
+    #[arg(long)]
+    pub full_validation: bool,
+
+    /// Host-side dataloader worker threads (0 forces the sync path).
+    #[arg(long, default_value_t = DEFAULT_LOADER_WORKERS)]
     pub loader_workers: usize,
+
+    /// Device-side prefetch depth (forced to 0 on CUDA).
+    #[arg(long, default_value_t = DEFAULT_DEVICE_PREFETCH_BATCHES)]
     pub device_prefetch_batches: usize,
+
+    /// Periodic loader-profile flush interval (0 disables).
+    #[arg(long, default_value_t = 0)]
     pub loader_profile_every: usize,
+
+    /// Stride for expensive batch-level metrics (must be > 0).
+    #[arg(long, default_value_t = DEFAULT_METRIC_EVERY, value_parser = positive_usize)]
     pub metric_every: usize,
+
+    /// Descriptor regression loss weight.
+    #[arg(long, default_value_t = 0.05)]
     pub descriptor_weight: f64,
+
+    /// Latent Tanimoto geometry loss weight.
+    #[arg(long, default_value_t = 0.10)]
     pub tanimoto_ranking_weight: f64,
+
+    /// Latent cosine-logit temperature (alias: --tanimoto-ranking-margin).
+    #[arg(
+        long,
+        alias = "tanimoto-ranking-margin",
+        default_value_t = 0.10
+    )]
     pub tanimoto_ranking_latent_temperature: f64,
+
+    /// Compatibility metric temperature (unused by the softmax loss).
+    #[arg(long, default_value_t = 0.10)]
     pub tanimoto_ranking_metric_temperature: f64,
+
+    /// Minimum counted-Tanimoto gap an anchor must clear to contribute.
+    #[arg(long, default_value_t = 0.05)]
     pub tanimoto_ranking_min_gap: f64,
+
+    /// Random candidate partners sampled per anchor (must be >= 2).
+    #[arg(long, default_value_t = 4, value_parser = positive_usize)]
     pub tanimoto_ranking_candidates: usize,
+
+    /// Max anchors used by the geometry loss (0 uses all rows).
+    #[arg(long, default_value_t = 0)]
     pub tanimoto_ranking_pairs_per_batch: usize,
+
+    /// Resume from the checkpoint directory.
+    #[arg(long)]
     pub resume: bool,
+
+    /// Force a fresh preprocessing pass even when a cached manifest exists.
+    #[arg(long)]
     pub force_preprocess: bool,
+
+    /// Rayon worker threads used during preprocessing (must be > 0).
+    #[arg(long, default_value_t = DEFAULT_PREPROCESS_THREADS, value_parser = positive_usize)]
     pub preprocess_threads: usize,
+
+    /// CUDA device ordinal (ignored on the ndarray backend).
+    #[arg(long, default_value_t = 0)]
     pub cuda_device: usize,
+
+    /// Minimum heavy-atom count quality bound.
+    #[arg(long)]
+    pub min_heavy_atoms: Option<u32>,
+
+    /// Maximum heavy-atom count quality bound.
+    #[arg(long)]
+    pub max_heavy_atoms: Option<u32>,
+
+    /// Minimum molecular mass (Da).
+    #[arg(long)]
+    pub min_molecular_mass: Option<f32>,
+
+    /// Maximum molecular mass (Da).
+    #[arg(long)]
+    pub max_molecular_mass: Option<f32>,
+
+    /// Minimum total formal charge.
+    #[arg(long, allow_negative_numbers = true)]
+    pub min_formal_charge: Option<i32>,
+
+    /// Maximum total formal charge.
+    #[arg(long, allow_negative_numbers = true)]
+    pub max_formal_charge: Option<i32>,
+
+    /// Maximum number of disconnected components (set 1 to drop salts/mixtures).
+    #[arg(long)]
+    pub max_connected_components: Option<u32>,
 }
 
 impl Args {
-    /// Parses the process command line.
-    pub fn parse() -> AppResult<Self> {
-        let raw: Vec<String> = env::args().skip(1).collect();
-        if raw.iter().any(|arg| arg == "--help" || arg == "-h") {
-            return Err(invalid_input(Self::usage()));
-        }
-        let mut values = raw.into_iter();
-        let shards_dir = next_value(&mut values, "<shards-dir-or-manifest>")?;
-        let checkpoint_dir = PathBuf::from(next_value(&mut values, "<checkpoint-dir>")?);
-
-        let shards_path = PathBuf::from(&shards_dir);
+    /// Resolves the manifest path and source selection from the raw flags.
+    pub fn manifest_paths(&self) -> AppResult<ResolvedPaths> {
+        let shards_path = self.shards.clone();
         let (manifest_path, cache_dir) = if shards_path.is_dir() || !shards_path.exists() {
             (shards_path.join("manifest.json"), Some(shards_path))
         } else {
             (shards_path, None)
         };
-
-        let mut args = Self {
+        let source_selection = SourceSelection::from_flags(&self.datasets, self.zinc20_chunks)?;
+        Ok(ResolvedPaths {
             manifest_path,
             cache_dir,
-            source_selection: None,
-            checkpoint_dir,
-            rows_per_shard: DEFAULT_ROWS_PER_SHARD,
-            epochs: 10,
-            batch_size: 4096,
-            learning_rate: 1.0e-3,
-            latent_width: 512,
-            latent_noise_std: 0.02,
-            hidden_widths: vec![4096, 2048, 1024],
-            checkpoint_every: 1,
-            validate_every: 1,
-            max_train_batches: None,
-            max_valid_batches: Some(64),
-            loader_workers: DEFAULT_LOADER_WORKERS,
-            device_prefetch_batches: DEFAULT_DEVICE_PREFETCH_BATCHES,
-            loader_profile_every: 0,
-            metric_every: DEFAULT_METRIC_EVERY,
-            descriptor_weight: 0.05,
-            tanimoto_ranking_weight: 0.10,
-            tanimoto_ranking_latent_temperature: 0.10,
-            tanimoto_ranking_metric_temperature: 0.10,
-            tanimoto_ranking_min_gap: 0.05,
-            tanimoto_ranking_candidates: 4,
-            tanimoto_ranking_pairs_per_batch: 0,
-            resume: false,
-            force_preprocess: false,
-            preprocess_threads: DEFAULT_PREPROCESS_THREADS,
-            cuda_device: 0,
-        };
-
-        let mut zinc20_chunks: Option<(u8, u8)> = None;
-
-        while let Some(flag) = values.next() {
-            match flag.as_str() {
-                "--datasets" => {
-                    let value = next_value(&mut values, &flag)?;
-                    args.source_selection = Some(parse_datasets_csv(&value)?);
-                }
-                "--epochs" => args.epochs = parse_value(&mut values, &flag)?,
-                "--batch-size" => args.batch_size = parse_value(&mut values, &flag)?,
-                "--learning-rate" => args.learning_rate = parse_value(&mut values, &flag)?,
-                "--latent-width" => args.latent_width = parse_value(&mut values, &flag)?,
-                "--latent-noise-std" => {
-                    args.latent_noise_std = parse_value(&mut values, &flag)?;
-                }
-                "--hidden-widths" => {
-                    let value = next_value(&mut values, &flag)?;
-                    args.hidden_widths = parse_hidden_widths(&value)?;
-                }
-                "--rows-per-shard" => args.rows_per_shard = parse_value(&mut values, &flag)?,
-                "--zinc20-chunks" => {
-                    let value = next_value(&mut values, &flag)?;
-                    zinc20_chunks = Some(parse_zinc20_chunks(&value)?);
-                }
-                "--checkpoint-every" => args.checkpoint_every = parse_value(&mut values, &flag)?,
-                "--validate-every" => args.validate_every = parse_value(&mut values, &flag)?,
-                "--max-train-batches" => {
-                    args.max_train_batches = Some(parse_value(&mut values, &flag)?);
-                }
-                "--max-valid-batches" => {
-                    args.max_valid_batches = Some(parse_value(&mut values, &flag)?);
-                }
-                "--loader-workers" => args.loader_workers = parse_value(&mut values, &flag)?,
-                "--device-prefetch-batches" => {
-                    args.device_prefetch_batches = parse_value(&mut values, &flag)?;
-                }
-                "--loader-profile-every" => {
-                    args.loader_profile_every = parse_value(&mut values, &flag)?;
-                }
-                "--metric-every" => args.metric_every = parse_positive_value(&mut values, &flag)?,
-                "--descriptor-weight" => {
-                    args.descriptor_weight = parse_value(&mut values, &flag)?;
-                }
-                "--tanimoto-ranking-weight" => {
-                    args.tanimoto_ranking_weight = parse_value(&mut values, &flag)?;
-                }
-                "--tanimoto-ranking-margin" | "--tanimoto-ranking-latent-temperature" => {
-                    args.tanimoto_ranking_latent_temperature = parse_value(&mut values, &flag)?;
-                }
-                "--tanimoto-ranking-metric-temperature" => {
-                    args.tanimoto_ranking_metric_temperature = parse_value(&mut values, &flag)?;
-                }
-                "--tanimoto-ranking-min-gap" => {
-                    args.tanimoto_ranking_min_gap = parse_value(&mut values, &flag)?;
-                }
-                "--tanimoto-ranking-candidates" => {
-                    args.tanimoto_ranking_candidates = parse_positive_value(&mut values, &flag)?;
-                }
-                "--tanimoto-ranking-pairs-per-batch" => {
-                    args.tanimoto_ranking_pairs_per_batch = parse_value(&mut values, &flag)?;
-                }
-                "--full-validation" => args.max_valid_batches = None,
-                "--resume" => args.resume = true,
-                "--force-preprocess" => args.force_preprocess = true,
-                "--preprocess-threads" => {
-                    args.preprocess_threads = parse_positive_value(&mut values, &flag)?;
-                }
-                "--cuda-device" => args.cuda_device = parse_value(&mut values, &flag)?,
-                "--help" | "-h" => return Err(invalid_input(Self::usage())),
-                unknown => {
-                    return Err(invalid_input(format!(
-                        "unknown argument `{unknown}`\n{}",
-                        Self::usage()
-                    )));
-                }
-            }
-        }
-
-        if let Some((first_chunk, last_chunk)) = zinc20_chunks {
-            let Some(selection) = args.source_selection else {
-                return Err(invalid_input(
-                    "--zinc20-chunks requires --datasets to include `zinc20`",
-                ));
-            };
-            args.source_selection = Some(selection.with_zinc20_chunks(first_chunk, last_chunk)?);
-        }
-
-        Ok(args)
-    }
-
-    /// Returns the usage string used by `--help` and on error.
-    pub fn usage() -> String {
-        "usage: train <shards-dir|manifest.json> <checkpoint-dir> \
-         [--datasets pubchem,zinc20] [--zinc20-chunks FIRST-LAST] \
-         [--epochs N] [--batch-size N] [--learning-rate LR] [--latent-width N] \
-         [--latent-noise-std STD] \
-         [--hidden-widths 4096,2048,1024] [--checkpoint-every N] \
-         [--validate-every N] [--max-train-batches N] [--max-valid-batches N] \
-         [--loader-workers N] [--device-prefetch-batches N] \
-         [--metric-every N] [--loader-profile-every N] \
-         [--descriptor-weight W] \
-         [--tanimoto-ranking-weight W] \
-         [--tanimoto-ranking-latent-temperature T] \
-         [--tanimoto-ranking-metric-temperature T] \
-         [--tanimoto-ranking-min-gap G] [--tanimoto-ranking-candidates N] \
-         [--tanimoto-ranking-pairs-per-batch N] \
-         [--full-validation] \
-         [--rows-per-shard N] [--preprocess-threads N] [--force-preprocess] \
-         [--resume] [--cuda-device N]"
-            .to_string()
-    }
-
-    /// Builds a [`MoleculeAutoencoderConfig`] from the CLI components.
-    pub fn to_model_config(&self, fingerprint_size: usize) -> MoleculeAutoencoderConfig {
-        MoleculeAutoencoderConfig::from_components(
-            fingerprint_size,
-            self.latent_width,
-            self.hidden_widths.clone(),
-            self.descriptor_weight,
-            self.tanimoto_ranking_weight,
-            self.latent_noise_std,
-            self.tanimoto_ranking_latent_temperature,
-            self.tanimoto_ranking_metric_temperature,
-            self.tanimoto_ranking_min_gap,
-            self.tanimoto_ranking_candidates,
-            self.tanimoto_ranking_pairs_per_batch,
-        )
-    }
-}
-
-fn parse_datasets_csv(value: &str) -> AppResult<SourceSelection> {
-    let mut want_pubchem = false;
-    let mut want_zinc20 = false;
-    for raw in value.split(',') {
-        let token = raw.trim();
-        if token.is_empty() {
-            continue;
-        }
-        match token.to_ascii_lowercase().as_str() {
-            "pubchem" | "pubchem-smiles" => {
-                if want_pubchem {
-                    return Err(invalid_input("--datasets lists `pubchem` more than once"));
-                }
-                want_pubchem = true;
-            }
-            "zinc20" | "zinc20-smiles" => {
-                if want_zinc20 {
-                    return Err(invalid_input("--datasets lists `zinc20` more than once"));
-                }
-                want_zinc20 = true;
-            }
-            other => {
-                return Err(invalid_input(format!(
-                    "unknown dataset `{other}` in --datasets; valid values are `pubchem` and `zinc20`"
-                )));
-            }
-        }
-    }
-
-    match (want_pubchem, want_zinc20) {
-        (true, true) => Ok(SourceSelection::PubChemAndZinc20 {
-            first_chunk: ZINC20_FIRST_CHUNK,
-            last_chunk: ZINC20_LAST_CHUNK,
-        }),
-        (true, false) => Ok(SourceSelection::PubChem),
-        (false, true) => Ok(SourceSelection::Zinc20 {
-            first_chunk: ZINC20_FIRST_CHUNK,
-            last_chunk: ZINC20_LAST_CHUNK,
-        }),
-        (false, false) => Err(invalid_input(
-            "--datasets must list at least one of `pubchem` or `zinc20`",
-        )),
-    }
-}
-
-fn next_value(values: &mut impl Iterator<Item = String>, flag: &str) -> AppResult<String> {
-    values
-        .next()
-        .ok_or_else(|| invalid_input(format!("missing value for `{flag}`")))
-}
-
-fn parse_value<T>(values: &mut impl Iterator<Item = String>, flag: &str) -> AppResult<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let value = next_value(values, flag)?;
-    value
-        .parse::<T>()
-        .map_err(|source| invalid_input(format!("invalid value for `{flag}`: {source}")))
-}
-
-fn parse_positive_value(values: &mut impl Iterator<Item = String>, flag: &str) -> AppResult<usize> {
-    let value = parse_value::<usize>(values, flag)?;
-    if value == 0 {
-        return Err(invalid_input(format!("`{flag}` must be greater than zero")));
-    }
-    Ok(value)
-}
-
-fn parse_zinc20_chunks(value: &str) -> AppResult<(u8, u8)> {
-    let value = value.trim();
-    let (first, last) = if let Some((first, last)) = value.split_once("..=") {
-        (first, last)
-    } else if let Some((first, last)) = value.split_once('-') {
-        (first, last)
-    } else {
-        (value, value)
-    };
-    let first_chunk = first.parse::<u8>().map_err(|source| {
-        invalid_input(format!("invalid ZINC20 first chunk `{first}`: {source}"))
-    })?;
-    let last_chunk = last
-        .parse::<u8>()
-        .map_err(|source| invalid_input(format!("invalid ZINC20 last chunk `{last}`: {source}")))?;
-    if first_chunk < ZINC20_FIRST_CHUNK
-        || last_chunk > ZINC20_LAST_CHUNK
-        || first_chunk > last_chunk
-    {
-        return Err(invalid_input(format!(
-            "ZINC20 chunks must be an inclusive range within {ZINC20_FIRST_CHUNK}..={ZINC20_LAST_CHUNK}"
-        )));
-    }
-    Ok((first_chunk, last_chunk))
-}
-
-fn parse_hidden_widths(value: &str) -> AppResult<Vec<usize>> {
-    let widths = value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            part.parse::<usize>()
-                .map_err(|source| invalid_input(format!("invalid hidden width `{part}`: {source}")))
+            source_selection,
         })
-        .collect::<AppResult<Vec<_>>>()?;
+    }
 
-    if widths.is_empty() {
-        Err(invalid_input("at least one hidden width is required"))
+    /// Returns `None` when `--full-validation` is set; otherwise the cap.
+    pub fn max_valid_batches(&self) -> Option<usize> {
+        if self.full_validation {
+            None
+        } else {
+            Some(self.max_valid_batches)
+        }
+    }
+
+    /// Builds and validates a [`MoleculeAutoencoderConfig`] from the CLI
+    /// components via [`MoleculeAutoencoderConfig::builder`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same `ConfigInvalid` payload the builder emits when any
+    /// invariant fails (negative weights, non-finite temperatures, etc.).
+    pub fn to_model_config(&self, fingerprint_size: usize) -> AppResult<MoleculeAutoencoderConfig> {
+        MoleculeAutoencoderConfig::builder()
+            .fingerprint_size(fingerprint_size)
+            .latent_width(self.latent_width)
+            .hidden_widths(self.hidden_widths.clone())
+            .descriptor_weight(self.descriptor_weight)
+            .tanimoto_ranking_weight(self.tanimoto_ranking_weight)
+            .latent_noise_std(self.latent_noise_std)
+            .tanimoto_ranking_latent_temperature(self.tanimoto_ranking_latent_temperature)
+            .tanimoto_ranking_metric_temperature(self.tanimoto_ranking_metric_temperature)
+            .tanimoto_ranking_min_gap(self.tanimoto_ranking_min_gap)
+            .tanimoto_ranking_candidates(self.tanimoto_ranking_candidates)
+            .tanimoto_ranking_pairs_per_batch(self.tanimoto_ranking_pairs_per_batch)
+            .build()
+            .map_err(Into::into)
+    }
+
+    /// Builds an immutable [`SmilesQualityFilter`] from the CLI bounds,
+    /// validating any inverted ranges at build time.
+    pub fn quality_filter(&self) -> AppResult<SmilesQualityFilter> {
+        let mut builder = SmilesQualityFilter::builder();
+        if let Some(value) = self.min_heavy_atoms {
+            builder = builder.min_heavy_atoms(value);
+        }
+        if let Some(value) = self.max_heavy_atoms {
+            builder = builder.max_heavy_atoms(value);
+        }
+        if let Some(value) = self.min_molecular_mass {
+            builder = builder.min_molecular_mass(value);
+        }
+        if let Some(value) = self.max_molecular_mass {
+            builder = builder.max_molecular_mass(value);
+        }
+        if let Some(value) = self.min_formal_charge {
+            builder = builder.min_formal_charge(value);
+        }
+        if let Some(value) = self.max_formal_charge {
+            builder = builder.max_formal_charge(value);
+        }
+        if let Some(value) = self.max_connected_components {
+            builder = builder.max_connected_components(value);
+        }
+        builder.build().map_err(Into::into)
+    }
+}
+
+/// Manifest path and dataset selection resolved from CLI inputs.
+#[derive(Debug, Clone)]
+pub struct ResolvedPaths {
+    pub manifest_path: PathBuf,
+    pub cache_dir: Option<PathBuf>,
+    pub source_selection: Option<SourceSelection>,
+}
+
+fn positive_usize(value: &str) -> Result<usize, String> {
+    let parsed: usize = value.parse().map_err(|err: std::num::ParseIntError| err.to_string())?;
+    if parsed == 0 {
+        Err("must be greater than zero".to_string())
     } else {
-        Ok(widths)
+        Ok(parsed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
-    fn datasets_csv_accepts_both_orderings() {
+    fn command_definition_is_valid() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn zinc20_chunks_parses_dash_and_inclusive_forms() {
         assert_eq!(
-            parse_datasets_csv("pubchem").expect("pubchem only"),
-            SourceSelection::PubChem
+            "1-5".parse::<Zinc20ChunkRange>().expect("dash form"),
+            Zinc20ChunkRange { first: 1, last: 5 }
         );
         assert_eq!(
-            parse_datasets_csv("zinc20").expect("zinc20 only"),
-            SourceSelection::Zinc20 {
-                first_chunk: ZINC20_FIRST_CHUNK,
-                last_chunk: ZINC20_LAST_CHUNK,
-            }
+            "2..=4".parse::<Zinc20ChunkRange>().expect("inclusive form"),
+            Zinc20ChunkRange { first: 2, last: 4 }
         );
-        let both = parse_datasets_csv("zinc20, pubchem").expect("both datasets");
         assert_eq!(
-            both,
-            SourceSelection::PubChemAndZinc20 {
-                first_chunk: ZINC20_FIRST_CHUNK,
-                last_chunk: ZINC20_LAST_CHUNK,
-            }
+            "7".parse::<Zinc20ChunkRange>().expect("single chunk"),
+            Zinc20ChunkRange { first: 7, last: 7 }
         );
     }
 
     #[test]
-    fn datasets_csv_rejects_duplicates_and_unknown() {
-        assert!(parse_datasets_csv("pubchem,pubchem").is_err());
-        assert!(parse_datasets_csv("zinc20,zinc20").is_err());
-        assert!(parse_datasets_csv("chembl").is_err());
-        assert!(parse_datasets_csv("").is_err());
+    fn zinc20_chunks_rejects_out_of_range_and_inverted() {
+        assert!("0-5".parse::<Zinc20ChunkRange>().is_err());
+        assert!("1-21".parse::<Zinc20ChunkRange>().is_err());
+        assert!("5-3".parse::<Zinc20ChunkRange>().is_err());
     }
 
     #[test]
-    fn zinc20_chunks_apply_only_when_zinc20_is_selected() {
-        let pubchem_only = SourceSelection::PubChem;
-        assert!(pubchem_only.with_zinc20_chunks(2, 4).is_err());
-
-        let zinc20 = SourceSelection::Zinc20 {
-            first_chunk: 1,
-            last_chunk: 20,
-        };
-        let updated = zinc20
-            .with_zinc20_chunks(2, 5)
-            .expect("zinc20 selection accepts chunks");
+    fn source_selection_dedups_and_validates_zinc_chunk_dependency() {
         assert_eq!(
-            updated,
-            SourceSelection::Zinc20 {
-                first_chunk: 2,
-                last_chunk: 5
-            }
+            SourceSelection::from_flags(&[DatasetKind::Pubchem], None).expect("pubchem"),
+            Some(SourceSelection::PubChem)
+        );
+        assert_eq!(
+            SourceSelection::from_flags(&[DatasetKind::Zinc20, DatasetKind::Pubchem], None)
+                .expect("both"),
+            Some(SourceSelection::PubChemAndZinc20(Zinc20ChunkRange {
+                first: ZINC20_FIRST_CHUNK,
+                last: ZINC20_LAST_CHUNK,
+            }))
+        );
+        assert!(
+            SourceSelection::from_flags(&[DatasetKind::Pubchem, DatasetKind::Pubchem], None)
+                .is_err()
+        );
+        assert!(
+            SourceSelection::from_flags(
+                &[DatasetKind::Pubchem],
+                Some(Zinc20ChunkRange { first: 1, last: 5 })
+            )
+            .is_err()
+        );
+        assert_eq!(
+            SourceSelection::from_flags(&[], None).expect("no datasets"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_minimal_positional_arguments() {
+        let args = Args::try_parse_from(["train", "shards", "runs"]).expect("minimal parse");
+        assert_eq!(args.shards, PathBuf::from("shards"));
+        assert_eq!(args.checkpoint_dir, PathBuf::from("runs"));
+        assert!(args.datasets.is_empty());
+        assert_eq!(args.batch_size, 4096);
+        assert_eq!(args.hidden_widths, vec![4096, 2048, 1024]);
+        assert!(!args.full_validation);
+        assert_eq!(args.max_valid_batches(), Some(64));
+    }
+
+    #[test]
+    fn parse_full_validation_clears_max_cap() {
+        let args = Args::try_parse_from(["train", "s", "c", "--full-validation"]).expect("parse");
+        assert_eq!(args.max_valid_batches(), None);
+    }
+
+    #[test]
+    fn parse_quality_filter_through_builder_validates() {
+        let args = Args::try_parse_from([
+            "train",
+            "s",
+            "c",
+            "--min-heavy-atoms",
+            "5",
+            "--max-heavy-atoms",
+            "50",
+            "--min-formal-charge",
+            "-1",
+            "--max-formal-charge",
+            "1",
+            "--max-connected-components",
+            "1",
+        ])
+        .expect("parse filter flags");
+        let filter = args.quality_filter().expect("valid filter");
+        assert_eq!(filter.min_heavy_atoms(), Some(5));
+        assert_eq!(filter.max_heavy_atoms(), Some(50));
+        assert_eq!(filter.min_formal_charge(), Some(-1));
+        assert_eq!(filter.max_formal_charge(), Some(1));
+        assert_eq!(filter.max_connected_components(), Some(1));
+        assert!(filter.is_active());
+    }
+
+    #[test]
+    fn parse_quality_filter_rejects_inverted_range() {
+        let args = Args::try_parse_from([
+            "train",
+            "s",
+            "c",
+            "--min-heavy-atoms",
+            "50",
+            "--max-heavy-atoms",
+            "5",
+        ])
+        .expect("parse");
+        assert!(args.quality_filter().is_err());
+    }
+
+    #[test]
+    fn to_model_config_threads_overrides_through_builder() {
+        let args = Args::try_parse_from([
+            "train",
+            "s",
+            "c",
+            "--latent-width",
+            "16",
+            "--hidden-widths",
+            "32,24",
+            "--descriptor-weight",
+            "0.07",
+            "--tanimoto-ranking-weight",
+            "0.13",
+            "--tanimoto-ranking-candidates",
+            "5",
+        ])
+        .expect("parse");
+        let config = args.to_model_config(64).expect("builder accepts overrides");
+
+        assert_eq!(config.encoder().input_width(), 64);
+        assert_eq!(config.encoder().latent_width(), 16);
+        assert_eq!(config.encoder().hidden_widths(), &[32, 24]);
+        assert_eq!(config.auxiliary_weights().descriptors(), 0.07);
+        assert_eq!(config.auxiliary_weights().tanimoto_ranking(), 0.13);
+        assert_eq!(config.tanimoto_ranking().candidates_per_anchor(), 5);
+    }
+
+    #[test]
+    fn to_model_config_propagates_builder_validation_errors() {
+        // candidates_per_anchor=1 is parseable but invalid when the geometry
+        // loss is active; the builder must surface the validation error.
+        let args = Args::try_parse_from([
+            "train",
+            "s",
+            "c",
+            "--tanimoto-ranking-weight",
+            "0.5",
+            "--tanimoto-ranking-candidates",
+            "1",
+        ])
+        .expect("parse");
+        let error = args.to_model_config(64).expect_err("builder must reject");
+        assert!(error.to_string().contains("candidates_per_anchor"));
+    }
+
+    #[test]
+    fn parse_datasets_csv_through_clap() {
+        let args = Args::try_parse_from(["train", "s", "c", "--datasets", "pubchem,zinc20"])
+            .expect("parse datasets");
+        assert_eq!(
+            args.datasets,
+            vec![DatasetKind::Pubchem, DatasetKind::Zinc20]
         );
     }
 }

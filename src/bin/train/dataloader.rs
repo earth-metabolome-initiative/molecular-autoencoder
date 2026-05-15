@@ -221,7 +221,7 @@ where
             let row = shard
                 .row(row_index)
                 .ok_or_else(|| invalid_input("shard row disappeared during iteration"))?;
-            if row.split != split {
+            if row.split() != split {
                 continue;
             }
             pending.push(sample_from_row(row));
@@ -466,7 +466,7 @@ fn build_cached_loader_batch(
         let row = shard
             .row(row_index)
             .ok_or_else(|| "shard row disappeared during dataloader batching".to_string())?;
-        if row.split == plan.split {
+        if row.split() == plan.split {
             pending.push(sample_from_row(row));
         }
     }
@@ -509,9 +509,9 @@ fn source_rows_per_batch(
 
 fn sample_from_row(row: MoleculeShardRow<'_>) -> MoleculeAutoencoderSample {
     MoleculeAutoencoderSample {
-        cid: row.cid,
-        fingerprint_indices: row.fingerprint_indices.to_vec(),
-        fingerprint_counts: row.fingerprint_counts.to_vec(),
-        descriptor_targets: row.descriptor_targets.to_vec(),
+        cid: row.cid(),
+        fingerprint_indices: row.fingerprint_indices().to_vec(),
+        fingerprint_counts: row.fingerprint_counts().to_vec(),
+        descriptor_targets: row.descriptor_targets().to_vec(),
     }
 }

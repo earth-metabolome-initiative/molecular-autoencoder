@@ -19,5 +19,5 @@ mod tests;
 
 pub use api::{
     CountedTanimotoKernelBackend, CountedTanimotoRankingKernelConfig,
-    counted_tanimoto_similarity_ranking_kernel,
+    CountedTanimotoRankingKernelConfigBuilder, counted_tanimoto_similarity_ranking_kernel,
 };

@@ -8,7 +8,7 @@ use std::{
 use indicatif::{ProgressBar, ProgressStyle};
 use molecular_autoencoder::{
     DEFAULT_PREPROCESS_CHUNK_ROWS, DatasetPreprocessOptions, MoleculeRecord, PreprocessingConfig,
-    SHARD_MANIFEST_VERSION, ShardManifest, SparseMoleculeShard,
+    SHARD_MANIFEST_VERSION, ShardManifest, SmilesQualityFilter, SparseMoleculeShard,
     features::REGRESSION_TARGET_WIDTH, molecule_records_from_smiles_dataset,
     preprocess_dataset_record_chunks,
 };
@@ -19,46 +19,47 @@ use smiles_parser::prelude::{
 
 use crate::{
     AppResult,
-    cli::{Args, SourceSelection},
+    cli::{Args, ResolvedPaths, SourceSelection},
     invalid_input,
 };
 
 /// Resolves the manifest path the training loop should read, building cached
 /// shards from scratch when the cache is missing, stale, or `--force-preprocess`
 /// is set.
-pub fn prepare_manifest(args: &Args) -> AppResult<PathBuf> {
-    let Some(cache_dir) = &args.cache_dir else {
-        return Ok(args.manifest_path.clone());
+pub fn prepare_manifest(args: &Args, paths: &ResolvedPaths) -> AppResult<PathBuf> {
+    let Some(cache_dir) = paths.cache_dir.as_ref() else {
+        return Ok(paths.manifest_path.clone());
     };
-    let Some(source_selection) = args.source_selection else {
-        return Ok(args.manifest_path.clone());
+    let Some(source_selection) = paths.source_selection else {
+        return Ok(paths.manifest_path.clone());
     };
     let manifest_path = cache_dir.join("manifest.json");
     let expected_source = source_selection.manifest_source();
 
     if manifest_path.exists() && !args.force_preprocess {
         let manifest = ShardManifest::read_from_path(&manifest_path)?;
-        if manifest.manifest_version == SHARD_MANIFEST_VERSION && manifest.source == expected_source
+        if manifest.manifest_version() == SHARD_MANIFEST_VERSION
+            && manifest.source() == expected_source
         {
             println!(
                 "using_cached_manifest={} source={}",
                 manifest_path.display(),
-                manifest.source
+                manifest.source()
             );
             return Ok(manifest_path);
         }
-        if manifest.manifest_version == SHARD_MANIFEST_VERSION {
+        if manifest.manifest_version() == SHARD_MANIFEST_VERSION {
             println!(
                 "ignoring_cached_manifest={} reason=source_mismatch found={} expected={}",
                 manifest_path.display(),
-                manifest.source,
+                manifest.source(),
                 expected_source
             );
         } else {
             println!(
                 "ignoring_cached_manifest={} reason=manifest_version_mismatch found={} expected={}",
                 manifest_path.display(),
-                manifest.manifest_version,
+                manifest.manifest_version(),
                 SHARD_MANIFEST_VERSION
             );
         }
@@ -69,6 +70,7 @@ pub fn prepare_manifest(args: &Args) -> AppResult<PathBuf> {
         args.rows_per_shard,
         args.preprocess_threads,
         source_selection,
+        args.quality_filter()?,
     )?;
     Ok(manifest_path)
 }
@@ -78,6 +80,7 @@ fn preprocess_cache(
     rows_per_shard: usize,
     preprocess_threads: usize,
     source_selection: SourceSelection,
+    quality_filter: SmilesQualityFilter,
 ) -> AppResult<()> {
     if rows_per_shard == 0 {
         return Err(invalid_input("rows per shard must be greater than zero"));
@@ -85,9 +88,13 @@ fn preprocess_cache(
 
     std::fs::create_dir_all(cache_dir)?;
     let source_cache_dir = cache_dir.join("source");
-    let config = PreprocessingConfig::default();
+    let config = PreprocessingConfig::builder()
+        .quality_filter(quality_filter)
+        .build()
+        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
     let mut manifest = ShardManifest::new(source_selection.manifest_source(), config.clone());
-    let mut shard = SparseMoleculeShard::new(config.counted_ecfp.size, REGRESSION_TARGET_WIDTH);
+    let mut shard =
+        SparseMoleculeShard::new(config.counted_ecfp().size(), REGRESSION_TARGET_WIDTH);
     let mut shard_index = 0_usize;
     let mut records_seen_total = 0_usize;
     let start = Instant::now();
@@ -122,16 +129,12 @@ fn preprocess_cache(
         };
         match source_selection {
             SourceSelection::PubChem => context.preprocess_pubchem_source()?,
-            SourceSelection::Zinc20 {
-                first_chunk,
-                last_chunk,
-            } => context.preprocess_zinc20_source(first_chunk, last_chunk)?,
-            SourceSelection::PubChemAndZinc20 {
-                first_chunk,
-                last_chunk,
-            } => {
+            SourceSelection::Zinc20(range) => {
+                context.preprocess_zinc20_source(range.first, range.last)?;
+            }
+            SourceSelection::PubChemAndZinc20(range) => {
                 context.preprocess_pubchem_source()?;
-                context.preprocess_zinc20_source(first_chunk, last_chunk)?;
+                context.preprocess_zinc20_source(range.first, range.last)?;
             }
         }
     }
@@ -200,15 +203,18 @@ impl PreprocessContext<'_> {
         let source_records_seen = preprocess_dataset_record_chunks(
             records,
             self.config,
-            DatasetPreprocessOptions {
-                chunk_rows: DEFAULT_PREPROCESS_CHUNK_ROWS,
-                threads: Some(self.preprocess_threads),
-            },
+            DatasetPreprocessOptions::builder()
+                .chunk_rows(DEFAULT_PREPROCESS_CHUNK_ROWS)
+                .threads(Some(self.preprocess_threads))
+                .build()
+                .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?,
             |chunk| {
-                for result in chunk.results {
+                let records_seen = chunk.records_seen();
+                for result in chunk.into_results() {
                     match result {
-                        Ok(targets) => {
-                            self.shard.push_targets(&targets, self.config.descriptors)?;
+                        Ok(Some(targets)) => {
+                            self.shard
+                                .push_targets(&targets, *self.config.descriptors())?;
                             if self.shard.len() >= self.rows_per_shard {
                                 write_preprocessed_shard(
                                     self.cache_dir,
@@ -218,21 +224,24 @@ impl PreprocessContext<'_> {
                                 )?;
                                 self.progress.shard_written(self.manifest, 0);
                                 *self.shard = SparseMoleculeShard::new(
-                                    self.config.counted_ecfp.size,
+                                    self.config.counted_ecfp().size(),
                                     REGRESSION_TARGET_WIDTH,
                                 );
                                 *self.shard_index += 1;
                             }
                         }
+                        Ok(None) => {
+                            self.manifest.record_skipped();
+                        }
                         Err(error) => {
-                            self.manifest.error_count += 1;
+                            self.manifest.record_error();
                             eprintln!("{error}");
                         }
                     }
                 }
                 self.progress.record(
                     dataset_label,
-                    *self.records_seen_total + chunk.records_seen,
+                    *self.records_seen_total + records_seen,
                     self.manifest,
                     self.shard.len(),
                 );
@@ -287,11 +296,12 @@ impl PreprocessProgress {
     ) {
         if records_seen == 1 || records_seen.is_multiple_of(1024) {
             self.bar.set_message(format!(
-                "preprocessing {dataset_label} records={} rows={} errors={} shards={} current_shard_rows={}",
+                "preprocessing {dataset_label} records={} rows={} skipped={} errors={} shards={} current_shard_rows={}",
                 records_seen,
-                manifest.row_count + current_shard_rows,
-                manifest.error_count,
-                manifest.shards.len(),
+                manifest.row_count() + current_shard_rows,
+                manifest.skipped_count(),
+                manifest.error_count(),
+                manifest.shards().len(),
                 current_shard_rows
             ));
         }
@@ -300,20 +310,21 @@ impl PreprocessProgress {
     fn shard_written(&self, manifest: &ShardManifest, current_shard_rows: usize) {
         self.bar.set_message(format!(
             "wrote shard={} rows={} errors={} next_shard_rows={}",
-            manifest.shards.len(),
-            manifest.row_count,
-            manifest.error_count,
+            manifest.shards().len(),
+            manifest.row_count(),
+            manifest.error_count(),
             current_shard_rows
         ));
     }
 
     fn finish(self, records_seen: usize, manifest: &ShardManifest, elapsed: Duration) {
         self.bar.finish_with_message(format!(
-            "preprocess_done records_seen={} rows={} errors={} shards={} elapsed_sec={:.2}",
+            "preprocess_done records_seen={} rows={} skipped={} errors={} shards={} elapsed_sec={:.2}",
             records_seen,
-            manifest.row_count,
-            manifest.error_count,
-            manifest.shards.len(),
+            manifest.row_count(),
+            manifest.skipped_count(),
+            manifest.error_count(),
+            manifest.shards().len(),
             elapsed.as_secs_f64()
         ));
     }

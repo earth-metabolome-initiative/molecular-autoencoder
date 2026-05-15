@@ -28,7 +28,7 @@ std = [
     "thiserror/std",
 ]
 ndarray = ["burn/ndarray"]
-train = ["burn/train", "ndarray", "dep:indicatif"]
+train = ["burn/train", "ndarray", "dep:indicatif", "dep:clap"]
 tui = ["train", "burn/tui"]
 cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl"]
 cuda-fusion = ["cuda", "burn/fusion", "burn/autotune", "dep:burn-fusion", "dep:burn-ir"]
@@ -41,6 +41,7 @@ burn = { version = "=0.21.0", default-features = false }
 burn-cubecl = { version = "=0.21.0", default-features = false, optional = true }
 burn-fusion = { version = "=0.21.0", default-features = false, optional = true }
 burn-ir = { version = "=0.21.0", default-features = false, optional = true }
+clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"], optional = true }
 cubecl = { version = "=0.10.0", default-features = false, optional = true }
 elements_rs = "0.2.7"
 finge-rs = { git = "https://github.com/earth-metabolome-initiative/finge-rs", default-features = false, features = ["smiles-support"] }

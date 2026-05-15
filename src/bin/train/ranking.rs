@@ -44,20 +44,25 @@ pub fn attach_tanimoto_ranking<B>(
 ) where
     B: TanimotoMetricBackend,
 {
-    if config.weight <= 0.0 || batch.fingerprints.batch_size() < 3 {
+    if config.weight() <= 0.0 || batch.fingerprints.batch_size() < 3 {
         return;
     }
+    // `MoleculeAutoencoderConfig::validate` already enforces
+    // `candidates_per_anchor >= 2` whenever the geometry loss weight is
+    // positive, so the kernel builder cannot fail here.
+    let kernel_config = CountedTanimotoRankingKernelConfig::builder()
+        .batch_items(batch.fingerprints.batch_size())
+        .candidates_per_anchor(config.candidates_per_anchor())
+        .seed(seed)
+        .epsilon(1.0e-8)
+        .build()
+        .expect("Tanimoto kernel config is valid");
     let (candidate_index, best_candidate_position, top2_gap) =
         counted_tanimoto_similarity_ranking_kernel(
             batch.fingerprints.indices.clone(),
             batch.fingerprints.counts.clone(),
             batch.fingerprints.mask.clone(),
-            CountedTanimotoRankingKernelConfig {
-                batch_items: batch.fingerprints.batch_size(),
-                candidates_per_anchor: config.candidates_per_anchor,
-                seed,
-                epsilon: 1.0e-8,
-            },
+            kernel_config,
         );
     batch.tanimoto_ranking = TanimotoRankingBatch {
         candidate_index,

@@ -19,118 +19,6 @@ use crate::{
 #[cfg(feature = "std")]
 use crate::{Error, Result};
 
-/// Encoder model configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EncoderConfig {
-    /// Input feature width.
-    pub input_width: usize,
-    /// Hidden layer widths.
-    pub hidden_widths: Vec<usize>,
-    /// Latent embedding width.
-    pub latent_width: usize,
-}
-
-impl EncoderConfig {
-    /// Creates an initialized encoder.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `hidden_widths` is empty. The sparse input projection needs
-    /// at least one hidden width.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Encoder<B> {
-        assert!(
-            !self.hidden_widths.is_empty(),
-            "encoder hidden widths must not be empty for sparse input"
-        );
-        let first_width = self.hidden_widths[0];
-        let mut input_width = first_width;
-        let mut layers = Vec::with_capacity(self.hidden_widths.len().saturating_sub(1));
-        for &hidden_width in self.hidden_widths.iter().skip(1) {
-            layers.push(LinearConfig::new(input_width, hidden_width).init(device));
-            input_width = hidden_width;
-        }
-
-        Encoder {
-            input: SparseInputLinear {
-                linear: LinearConfig::new(self.input_width, first_width).init(device),
-            },
-            layers,
-            latent: LinearConfig::new(input_width, self.latent_width).init(device),
-            activation: Relu::new(),
-        }
-    }
-}
-
-/// Decoder model configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DecoderConfig {
-    /// Latent embedding width.
-    pub latent_width: usize,
-    /// Hidden layer widths.
-    pub hidden_widths: Vec<usize>,
-    /// Output reconstruction width.
-    pub output_width: usize,
-}
-
-impl DecoderConfig {
-    /// Creates an initialized decoder.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Decoder<B> {
-        let mut input_width = self.latent_width;
-        let mut layers = Vec::with_capacity(self.hidden_widths.len());
-        for &hidden_width in &self.hidden_widths {
-            layers.push(LinearConfig::new(input_width, hidden_width).init(device));
-            input_width = hidden_width;
-        }
-
-        Decoder {
-            layers,
-            output: LinearConfig::new(input_width, self.output_width).init(device),
-            activation: Relu::new(),
-        }
-    }
-}
-
-/// Counted ECFP reconstruction loss configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct ReconstructionLossConfig {
-    /// Huber transition point in log-count space.
-    pub beta: f64,
-    /// Weight for zero-count bins.
-    pub zero_weight: f64,
-    /// Weight for nonzero-count bins.
-    pub nonzero_weight: f64,
-}
-
-impl Default for ReconstructionLossConfig {
-    fn default() -> Self {
-        Self {
-            beta: 1.0,
-            zero_weight: 0.05,
-            nonzero_weight: 1.0,
-        }
-    }
-}
-
-/// Auxiliary side-task weights.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct AuxiliaryLossWeights {
-    /// Weight for scalar descriptor regression.
-    #[serde(default = "default_descriptor_weight")]
-    pub descriptors: f64,
-    /// Weight for preserving counted-fingerprint Tanimoto ordering in latent space.
-    #[serde(default = "default_tanimoto_ranking_weight")]
-    pub tanimoto_ranking: f64,
-}
-
-impl Default for AuxiliaryLossWeights {
-    fn default() -> Self {
-        Self {
-            descriptors: default_descriptor_weight(),
-            tanimoto_ranking: default_tanimoto_ranking_weight(),
-        }
-    }
-}
-
 const fn default_descriptor_weight() -> f64 {
     0.05
 }
@@ -151,29 +39,589 @@ const fn default_tanimoto_ranking_metric_temperature() -> f64 {
     0.10
 }
 
+/// Encoder model configuration. Construct via [`EncoderConfig::builder`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncoderConfig {
+    input_width: usize,
+    hidden_widths: Vec<usize>,
+    latent_width: usize,
+}
+
+impl EncoderConfig {
+    /// Starts a fluent builder.
+    #[must_use]
+    pub fn builder() -> EncoderConfigBuilder {
+        EncoderConfigBuilder::new()
+    }
+
+    /// Input feature width.
+    #[must_use]
+    pub const fn input_width(&self) -> usize {
+        self.input_width
+    }
+
+    /// Hidden layer widths.
+    #[must_use]
+    pub fn hidden_widths(&self) -> &[usize] {
+        &self.hidden_widths
+    }
+
+    /// Latent embedding width.
+    #[must_use]
+    pub const fn latent_width(&self) -> usize {
+        self.latent_width
+    }
+
+    /// Creates an initialized encoder.
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Encoder<B> {
+        let first_width = self.hidden_widths[0];
+        let mut input_width = first_width;
+        let mut layers = Vec::with_capacity(self.hidden_widths.len().saturating_sub(1));
+        for &hidden_width in self.hidden_widths.iter().skip(1) {
+            layers.push(LinearConfig::new(input_width, hidden_width).init(device));
+            input_width = hidden_width;
+        }
+
+        Encoder {
+            input: SparseInputLinear {
+                linear: LinearConfig::new(self.input_width, first_width).init(device),
+            },
+            layers,
+            latent: LinearConfig::new(input_width, self.latent_width).init(device),
+            activation: Relu::new(),
+        }
+    }
+}
+
+/// Fluent builder for [`EncoderConfig`].
+#[derive(Debug, Clone)]
+pub struct EncoderConfigBuilder {
+    input_width: Option<usize>,
+    hidden_widths: Option<Vec<usize>>,
+    latent_width: Option<usize>,
+}
+
+impl Default for EncoderConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EncoderConfigBuilder {
+    /// Creates an empty builder; all fields must be set before `build`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            input_width: None,
+            hidden_widths: None,
+            latent_width: None,
+        }
+    }
+
+    /// Sets the input feature width.
+    #[must_use]
+    pub const fn input_width(mut self, value: usize) -> Self {
+        self.input_width = Some(value);
+        self
+    }
+
+    /// Sets the hidden layer widths.
+    #[must_use]
+    pub fn hidden_widths(mut self, value: Vec<usize>) -> Self {
+        self.hidden_widths = Some(value);
+        self
+    }
+
+    /// Sets the latent embedding width.
+    #[must_use]
+    pub const fn latent_width(mut self, value: usize) -> Self {
+        self.latent_width = Some(value);
+        self
+    }
+
+    /// Validates and builds the immutable [`EncoderConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] when any required field is missing,
+    /// when the latent or input width is zero, or when `hidden_widths` is
+    /// empty / contains zeros.
+    pub fn build(self) -> Result<EncoderConfig> {
+        let input_width = self.input_width.ok_or_else(|| Error::ConfigInvalid {
+            message: "encoder input_width must be set".to_string(),
+        })?;
+        let hidden_widths = self.hidden_widths.ok_or_else(|| Error::ConfigInvalid {
+            message: "encoder hidden_widths must be set".to_string(),
+        })?;
+        let latent_width = self.latent_width.ok_or_else(|| Error::ConfigInvalid {
+            message: "encoder latent_width must be set".to_string(),
+        })?;
+        if input_width == 0 {
+            return Err(Error::ConfigInvalid {
+                message: "encoder input_width must be greater than zero".to_string(),
+            });
+        }
+        if latent_width == 0 {
+            return Err(Error::ConfigInvalid {
+                message: "encoder latent_width must be greater than zero".to_string(),
+            });
+        }
+        if hidden_widths.is_empty() {
+            return Err(Error::ConfigInvalid {
+                message: "encoder hidden_widths must not be empty".to_string(),
+            });
+        }
+        if hidden_widths.contains(&0) {
+            return Err(Error::ConfigInvalid {
+                message: "encoder hidden widths must all be greater than zero".to_string(),
+            });
+        }
+        Ok(EncoderConfig {
+            input_width,
+            hidden_widths,
+            latent_width,
+        })
+    }
+}
+
+/// Decoder model configuration. Construct via [`DecoderConfig::builder`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecoderConfig {
+    latent_width: usize,
+    hidden_widths: Vec<usize>,
+    output_width: usize,
+}
+
+impl DecoderConfig {
+    /// Starts a fluent builder.
+    #[must_use]
+    pub fn builder() -> DecoderConfigBuilder {
+        DecoderConfigBuilder::new()
+    }
+
+    /// Latent embedding width.
+    #[must_use]
+    pub const fn latent_width(&self) -> usize {
+        self.latent_width
+    }
+
+    /// Hidden layer widths.
+    #[must_use]
+    pub fn hidden_widths(&self) -> &[usize] {
+        &self.hidden_widths
+    }
+
+    /// Output reconstruction width.
+    #[must_use]
+    pub const fn output_width(&self) -> usize {
+        self.output_width
+    }
+
+    /// Creates an initialized decoder.
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Decoder<B> {
+        let mut input_width = self.latent_width;
+        let mut layers = Vec::with_capacity(self.hidden_widths.len());
+        for &hidden_width in &self.hidden_widths {
+            layers.push(LinearConfig::new(input_width, hidden_width).init(device));
+            input_width = hidden_width;
+        }
+
+        Decoder {
+            layers,
+            output: LinearConfig::new(input_width, self.output_width).init(device),
+            activation: Relu::new(),
+        }
+    }
+}
+
+/// Fluent builder for [`DecoderConfig`].
+#[derive(Debug, Clone)]
+pub struct DecoderConfigBuilder {
+    latent_width: Option<usize>,
+    hidden_widths: Option<Vec<usize>>,
+    output_width: Option<usize>,
+}
+
+impl Default for DecoderConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecoderConfigBuilder {
+    /// Creates an empty builder; all required fields must be set before
+    /// `build`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            latent_width: None,
+            hidden_widths: None,
+            output_width: None,
+        }
+    }
+
+    /// Sets the latent embedding width.
+    #[must_use]
+    pub const fn latent_width(mut self, value: usize) -> Self {
+        self.latent_width = Some(value);
+        self
+    }
+
+    /// Sets the hidden layer widths (may be empty).
+    #[must_use]
+    pub fn hidden_widths(mut self, value: Vec<usize>) -> Self {
+        self.hidden_widths = Some(value);
+        self
+    }
+
+    /// Sets the output reconstruction width.
+    #[must_use]
+    pub const fn output_width(mut self, value: usize) -> Self {
+        self.output_width = Some(value);
+        self
+    }
+
+    /// Validates and builds the immutable [`DecoderConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] when `latent_width` or `output_width`
+    /// is missing or zero, or when any hidden width is zero.
+    pub fn build(self) -> Result<DecoderConfig> {
+        let latent_width = self.latent_width.ok_or_else(|| Error::ConfigInvalid {
+            message: "decoder latent_width must be set".to_string(),
+        })?;
+        let output_width = self.output_width.ok_or_else(|| Error::ConfigInvalid {
+            message: "decoder output_width must be set".to_string(),
+        })?;
+        let hidden_widths = self.hidden_widths.unwrap_or_default();
+        if latent_width == 0 {
+            return Err(Error::ConfigInvalid {
+                message: "decoder latent_width must be greater than zero".to_string(),
+            });
+        }
+        if output_width == 0 {
+            return Err(Error::ConfigInvalid {
+                message: "decoder output_width must be greater than zero".to_string(),
+            });
+        }
+        if hidden_widths.contains(&0) {
+            return Err(Error::ConfigInvalid {
+                message: "decoder hidden widths must all be greater than zero".to_string(),
+            });
+        }
+        Ok(DecoderConfig {
+            latent_width,
+            hidden_widths,
+            output_width,
+        })
+    }
+}
+
+/// Counted ECFP reconstruction loss configuration. Construct via
+/// [`ReconstructionLossConfig::builder`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ReconstructionLossConfig {
+    beta: f64,
+    zero_weight: f64,
+    nonzero_weight: f64,
+}
+
+impl Default for ReconstructionLossConfig {
+    fn default() -> Self {
+        ReconstructionLossConfigBuilder::new()
+            .build()
+            .expect("default reconstruction loss config is valid")
+    }
+}
+
+impl ReconstructionLossConfig {
+    /// Starts a fluent builder.
+    #[must_use]
+    pub fn builder() -> ReconstructionLossConfigBuilder {
+        ReconstructionLossConfigBuilder::new()
+    }
+
+    /// Huber transition point in log-count space.
+    #[must_use]
+    pub const fn beta(&self) -> f64 {
+        self.beta
+    }
+
+    /// Weight for zero-count bins.
+    #[must_use]
+    pub const fn zero_weight(&self) -> f64 {
+        self.zero_weight
+    }
+
+    /// Weight for nonzero-count bins.
+    #[must_use]
+    pub const fn nonzero_weight(&self) -> f64 {
+        self.nonzero_weight
+    }
+}
+
+/// Fluent builder for [`ReconstructionLossConfig`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReconstructionLossConfigBuilder {
+    beta: f64,
+    zero_weight: f64,
+    nonzero_weight: f64,
+}
+
+impl Default for ReconstructionLossConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReconstructionLossConfigBuilder {
+    /// Creates a builder seeded with the v1 defaults.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            beta: 1.0,
+            zero_weight: 0.05,
+            nonzero_weight: 1.0,
+        }
+    }
+
+    /// Sets the Huber transition point.
+    #[must_use]
+    pub const fn beta(mut self, value: f64) -> Self {
+        self.beta = value;
+        self
+    }
+
+    /// Sets the zero-count bin weight.
+    #[must_use]
+    pub const fn zero_weight(mut self, value: f64) -> Self {
+        self.zero_weight = value;
+        self
+    }
+
+    /// Sets the nonzero-count bin weight.
+    #[must_use]
+    pub const fn nonzero_weight(mut self, value: f64) -> Self {
+        self.nonzero_weight = value;
+        self
+    }
+
+    /// Validates and builds the immutable [`ReconstructionLossConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] when `beta` is non-finite or
+    /// non-positive, or when either weight is negative or non-finite.
+    pub fn build(self) -> Result<ReconstructionLossConfig> {
+        if !self.beta.is_finite() || self.beta <= 0.0 {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "reconstruction loss beta must be positive and finite, got {}",
+                    self.beta
+                ),
+            });
+        }
+        for (label, value) in [
+            ("zero_weight", self.zero_weight),
+            ("nonzero_weight", self.nonzero_weight),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(Error::ConfigInvalid {
+                    message: format!("{label} must be finite and non-negative, got {value}"),
+                });
+            }
+        }
+        Ok(ReconstructionLossConfig {
+            beta: self.beta,
+            zero_weight: self.zero_weight,
+            nonzero_weight: self.nonzero_weight,
+        })
+    }
+}
+
+/// Auxiliary side-task weights. Construct via [`AuxiliaryLossWeights::builder`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AuxiliaryLossWeights {
+    #[serde(default = "default_descriptor_weight")]
+    descriptors: f64,
+    #[serde(default = "default_tanimoto_ranking_weight")]
+    tanimoto_ranking: f64,
+}
+
+impl Default for AuxiliaryLossWeights {
+    fn default() -> Self {
+        AuxiliaryLossWeightsBuilder::new()
+            .build()
+            .expect("default auxiliary loss weights are valid")
+    }
+}
+
+impl AuxiliaryLossWeights {
+    /// Starts a fluent builder.
+    #[must_use]
+    pub fn builder() -> AuxiliaryLossWeightsBuilder {
+        AuxiliaryLossWeightsBuilder::new()
+    }
+
+    /// Weight for scalar descriptor regression.
+    #[must_use]
+    pub const fn descriptors(&self) -> f64 {
+        self.descriptors
+    }
+
+    /// Weight for preserving counted-fingerprint Tanimoto ordering in latent
+    /// space.
+    #[must_use]
+    pub const fn tanimoto_ranking(&self) -> f64 {
+        self.tanimoto_ranking
+    }
+}
+
+/// Fluent builder for [`AuxiliaryLossWeights`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AuxiliaryLossWeightsBuilder {
+    descriptors: f64,
+    tanimoto_ranking: f64,
+}
+
+impl Default for AuxiliaryLossWeightsBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AuxiliaryLossWeightsBuilder {
+    /// Creates a builder seeded with the v1 defaults.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            descriptors: default_descriptor_weight(),
+            tanimoto_ranking: default_tanimoto_ranking_weight(),
+        }
+    }
+
+    /// Sets the descriptor regression loss weight.
+    #[must_use]
+    pub const fn descriptors(mut self, value: f64) -> Self {
+        self.descriptors = value;
+        self
+    }
+
+    /// Sets the latent Tanimoto geometry loss weight.
+    #[must_use]
+    pub const fn tanimoto_ranking(mut self, value: f64) -> Self {
+        self.tanimoto_ranking = value;
+        self
+    }
+
+    /// Validates and builds the immutable [`AuxiliaryLossWeights`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] when either weight is negative or
+    /// non-finite.
+    pub fn build(self) -> Result<AuxiliaryLossWeights> {
+        for (label, value) in [
+            ("descriptors", self.descriptors),
+            ("tanimoto_ranking", self.tanimoto_ranking),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(Error::ConfigInvalid {
+                    message: format!("{label} weight must be finite and non-negative, got {value}"),
+                });
+            }
+        }
+        Ok(AuxiliaryLossWeights {
+            descriptors: self.descriptors,
+            tanimoto_ranking: self.tanimoto_ranking,
+        })
+    }
+}
+
 /// Counted Tanimoto sampled softmax latent-geometry loss configuration.
+/// Construct via [`TanimotoRankingConfig::builder`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TanimotoRankingConfig {
-    /// Temperature applied to latent cosine logits in the softmax ranking loss.
     #[serde(
         default = "default_tanimoto_ranking_latent_temperature",
         alias = "margin",
         alias = "tanimoto_ranking_margin"
     )]
-    pub latent_temperature: f64,
-    /// Deprecated compatibility field; the hard-label softmax ranking loss ignores it.
+    latent_temperature: f64,
     #[serde(default = "default_tanimoto_ranking_metric_temperature")]
-    pub metric_temperature: f64,
-    /// Minimum counted Tanimoto gap required for an anchor to contribute.
-    pub min_gap: f64,
-    /// Random candidate partners sampled for each anchor by the GPU metric kernel.
-    pub candidates_per_anchor: usize,
-    /// Maximum anchors used by the latent geometry loss; `0` means all rows.
-    pub pairs_per_batch: usize,
+    metric_temperature: f64,
+    min_gap: f64,
+    candidates_per_anchor: usize,
+    pairs_per_batch: usize,
 }
 
 impl Default for TanimotoRankingConfig {
     fn default() -> Self {
+        TanimotoRankingConfigBuilder::new()
+            .build()
+            .expect("default Tanimoto ranking config is valid")
+    }
+}
+
+impl TanimotoRankingConfig {
+    /// Starts a fluent builder.
+    #[must_use]
+    pub fn builder() -> TanimotoRankingConfigBuilder {
+        TanimotoRankingConfigBuilder::new()
+    }
+
+    /// Temperature applied to latent cosine logits.
+    #[must_use]
+    pub const fn latent_temperature(&self) -> f64 {
+        self.latent_temperature
+    }
+
+    /// Deprecated compatibility temperature retained for diagnostics.
+    #[must_use]
+    pub const fn metric_temperature(&self) -> f64 {
+        self.metric_temperature
+    }
+
+    /// Minimum counted Tanimoto gap required for an anchor to contribute.
+    #[must_use]
+    pub const fn min_gap(&self) -> f64 {
+        self.min_gap
+    }
+
+    /// Random candidate partners sampled per anchor by the GPU kernel.
+    #[must_use]
+    pub const fn candidates_per_anchor(&self) -> usize {
+        self.candidates_per_anchor
+    }
+
+    /// Maximum anchors used by the latent geometry loss; `0` means all rows.
+    #[must_use]
+    pub const fn pairs_per_batch(&self) -> usize {
+        self.pairs_per_batch
+    }
+}
+
+/// Fluent builder for [`TanimotoRankingConfig`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TanimotoRankingConfigBuilder {
+    latent_temperature: f64,
+    metric_temperature: f64,
+    min_gap: f64,
+    candidates_per_anchor: usize,
+    pairs_per_batch: usize,
+}
+
+impl Default for TanimotoRankingConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TanimotoRankingConfigBuilder {
+    /// Creates a builder seeded with the v1 defaults.
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             latent_temperature: default_tanimoto_ranking_latent_temperature(),
             metric_temperature: default_tanimoto_ranking_metric_temperature(),
@@ -181,6 +629,81 @@ impl Default for TanimotoRankingConfig {
             candidates_per_anchor: 4,
             pairs_per_batch: 0,
         }
+    }
+
+    /// Sets the latent cosine-logit temperature.
+    #[must_use]
+    pub const fn latent_temperature(mut self, value: f64) -> Self {
+        self.latent_temperature = value;
+        self
+    }
+
+    /// Sets the (compatibility) metric temperature.
+    #[must_use]
+    pub const fn metric_temperature(mut self, value: f64) -> Self {
+        self.metric_temperature = value;
+        self
+    }
+
+    /// Sets the minimum counted-Tanimoto gap.
+    #[must_use]
+    pub const fn min_gap(mut self, value: f64) -> Self {
+        self.min_gap = value;
+        self
+    }
+
+    /// Sets the number of random candidate partners per anchor.
+    #[must_use]
+    pub const fn candidates_per_anchor(mut self, value: usize) -> Self {
+        self.candidates_per_anchor = value;
+        self
+    }
+
+    /// Sets the maximum anchors per batch (`0` uses all rows).
+    #[must_use]
+    pub const fn pairs_per_batch(mut self, value: usize) -> Self {
+        self.pairs_per_batch = value;
+        self
+    }
+
+    /// Validates and builds the immutable [`TanimotoRankingConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] when either temperature is non-finite
+    /// or non-positive, or when `min_gap` is negative / non-finite.
+    pub fn build(self) -> Result<TanimotoRankingConfig> {
+        if !self.latent_temperature.is_finite() || self.latent_temperature <= 0.0 {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "tanimoto ranking latent temperature must be positive and finite, got {}",
+                    self.latent_temperature
+                ),
+            });
+        }
+        if !self.metric_temperature.is_finite() || self.metric_temperature <= 0.0 {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "tanimoto ranking metric temperature must be positive and finite, got {}",
+                    self.metric_temperature
+                ),
+            });
+        }
+        if !self.min_gap.is_finite() || self.min_gap < 0.0 {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "tanimoto ranking min_gap must be non-negative and finite, got {}",
+                    self.min_gap
+                ),
+            });
+        }
+        Ok(TanimotoRankingConfig {
+            latent_temperature: self.latent_temperature,
+            metric_temperature: self.metric_temperature,
+            min_gap: self.min_gap,
+            candidates_per_anchor: self.candidates_per_anchor,
+            pairs_per_batch: self.pairs_per_batch,
+        })
     }
 }
 
@@ -191,42 +714,65 @@ impl Default for TanimotoRankingConfig {
 /// loops can pass a single value around without re-reading the model config.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TanimotoRankingRuntimeConfig {
-    /// Weight applied to the Tanimoto geometry loss component.
-    pub weight: f64,
-    /// Temperature applied to latent cosine logits.
-    pub latent_temperature: f64,
-    /// Compatibility field kept for diagnostics; unused by the softmax loss.
-    pub metric_temperature: f64,
-    /// Minimum counted Tanimoto gap required for an anchor to contribute.
-    pub min_gap: f64,
-    /// Random candidate partners sampled per anchor by the GPU kernel.
-    pub candidates_per_anchor: usize,
-    /// Maximum anchors used by the latent geometry loss; `0` means all rows.
-    pub pairs_per_batch: usize,
+    weight: f64,
+    latent_temperature: f64,
+    metric_temperature: f64,
+    min_gap: f64,
+    candidates_per_anchor: usize,
+    pairs_per_batch: usize,
 }
 
-/// Full molecule autoencoder configuration.
+impl TanimotoRankingRuntimeConfig {
+    /// Weight applied to the Tanimoto geometry loss component.
+    #[must_use]
+    pub const fn weight(&self) -> f64 {
+        self.weight
+    }
+
+    /// Temperature applied to latent cosine logits.
+    #[must_use]
+    pub const fn latent_temperature(&self) -> f64 {
+        self.latent_temperature
+    }
+
+    /// Compatibility field kept for diagnostics; unused by the softmax loss.
+    #[must_use]
+    pub const fn metric_temperature(&self) -> f64 {
+        self.metric_temperature
+    }
+
+    /// Minimum counted Tanimoto gap required for an anchor to contribute.
+    #[must_use]
+    pub const fn min_gap(&self) -> f64 {
+        self.min_gap
+    }
+
+    /// Random candidate partners sampled per anchor by the GPU kernel.
+    #[must_use]
+    pub const fn candidates_per_anchor(&self) -> usize {
+        self.candidates_per_anchor
+    }
+
+    /// Maximum anchors used by the latent geometry loss; `0` means all rows.
+    #[must_use]
+    pub const fn pairs_per_batch(&self) -> usize {
+        self.pairs_per_batch
+    }
+}
+
+/// Full molecule autoencoder configuration. Construct via
+/// [`MoleculeAutoencoderConfig::builder`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoleculeAutoencoderConfig {
-    /// Encoder configuration.
-    pub encoder: EncoderConfig,
-    /// Decoder configuration.
-    pub decoder: DecoderConfig,
-    /// Descriptor regression target width.
-    pub descriptor_width: usize,
-    /// Main reconstruction loss.
-    pub reconstruction_loss: ReconstructionLossConfig,
-    /// Side-task loss weights.
-    pub auxiliary_weights: AuxiliaryLossWeights,
-    /// Counted Tanimoto sampled softmax latent-geometry side task.
+    encoder: EncoderConfig,
+    decoder: DecoderConfig,
+    descriptor_width: usize,
+    reconstruction_loss: ReconstructionLossConfig,
+    auxiliary_weights: AuxiliaryLossWeights,
     #[serde(default)]
-    pub tanimoto_ranking: TanimotoRankingConfig,
-    /// Decoder-side latent Gaussian noise as a fraction of batch latent standard deviation.
-    ///
-    /// This is applied only during training, after the encoder and before the decoder.
-    /// A value of `0.0` disables latent denoising.
+    tanimoto_ranking: TanimotoRankingConfig,
     #[serde(default = "default_latent_noise_std")]
-    pub latent_noise_std: f64,
+    latent_noise_std: f64,
 }
 
 impl MoleculeAutoencoderConfig {
@@ -260,42 +806,58 @@ impl MoleculeAutoencoderConfig {
         }
     }
 
-    /// Assembles a symmetric MLP configuration from training-CLI components.
-    ///
-    /// Mirrors the inline `if !resume { ... }` block that the training bin used
-    /// to keep next to its CLI parser.
+    /// Starts a fluent builder for an autoencoder config.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_components(
-        fingerprint_size: usize,
-        latent_width: usize,
-        hidden_widths: Vec<usize>,
-        descriptor_weight: f64,
-        tanimoto_ranking_weight: f64,
-        latent_noise_std: f64,
-        latent_temperature: f64,
-        metric_temperature: f64,
-        min_gap: f64,
-        candidates_per_anchor: usize,
-        pairs_per_batch: usize,
-    ) -> Self {
-        let mut config = Self::symmetric(fingerprint_size, latent_width, hidden_widths);
-        config.auxiliary_weights.descriptors = descriptor_weight;
-        config.auxiliary_weights.tanimoto_ranking = tanimoto_ranking_weight;
-        config.latent_noise_std = latent_noise_std;
-        config.tanimoto_ranking = TanimotoRankingConfig {
-            latent_temperature,
-            metric_temperature,
-            min_gap,
-            candidates_per_anchor,
-            pairs_per_batch,
-        };
-        config
+    pub fn builder() -> MoleculeAutoencoderConfigBuilder {
+        MoleculeAutoencoderConfigBuilder::new()
+    }
+
+    /// Encoder configuration.
+    #[must_use]
+    pub const fn encoder(&self) -> &EncoderConfig {
+        &self.encoder
+    }
+
+    /// Decoder configuration.
+    #[must_use]
+    pub const fn decoder(&self) -> &DecoderConfig {
+        &self.decoder
+    }
+
+    /// Descriptor regression target width.
+    #[must_use]
+    pub const fn descriptor_width(&self) -> usize {
+        self.descriptor_width
+    }
+
+    /// Main reconstruction loss configuration.
+    #[must_use]
+    pub const fn reconstruction_loss(&self) -> &ReconstructionLossConfig {
+        &self.reconstruction_loss
+    }
+
+    /// Side-task loss weights.
+    #[must_use]
+    pub const fn auxiliary_weights(&self) -> &AuxiliaryLossWeights {
+        &self.auxiliary_weights
+    }
+
+    /// Tanimoto sampled-softmax geometry side-task configuration.
+    #[must_use]
+    pub const fn tanimoto_ranking(&self) -> &TanimotoRankingConfig {
+        &self.tanimoto_ranking
+    }
+
+    /// Decoder-side latent Gaussian denoising noise as a fraction of batch
+    /// latent standard deviation. `0.0` disables latent denoising.
+    #[must_use]
+    pub const fn latent_noise_std(&self) -> f64 {
+        self.latent_noise_std
     }
 
     /// Returns the flat runtime view of the Tanimoto geometry side task.
     #[must_use]
-    pub fn tanimoto_ranking_runtime(&self) -> TanimotoRankingRuntimeConfig {
+    pub const fn tanimoto_ranking_runtime(&self) -> TanimotoRankingRuntimeConfig {
         TanimotoRankingRuntimeConfig {
             weight: self.auxiliary_weights.tanimoto_ranking,
             latent_temperature: self.tanimoto_ranking.latent_temperature,
@@ -366,6 +928,22 @@ impl MoleculeAutoencoderConfig {
             return bail(format!(
                 "tanimoto ranking latent temperature must be positive and finite, got {}",
                 self.tanimoto_ranking.latent_temperature
+            ));
+        }
+        if self.tanimoto_ranking.metric_temperature <= 0.0
+            || !self.tanimoto_ranking.metric_temperature.is_finite()
+        {
+            return bail(format!(
+                "tanimoto ranking metric temperature must be positive and finite, got {}",
+                self.tanimoto_ranking.metric_temperature
+            ));
+        }
+        if self.auxiliary_weights.tanimoto_ranking > 0.0
+            && self.tanimoto_ranking.candidates_per_anchor < 2
+        {
+            return bail(format!(
+                "tanimoto ranking candidates_per_anchor must be at least 2 when the geometry loss is enabled, got {}",
+                self.tanimoto_ranking.candidates_per_anchor
             ));
         }
         if self.tanimoto_ranking.min_gap < 0.0 || !self.tanimoto_ranking.min_gap.is_finite() {
@@ -439,6 +1017,172 @@ impl MoleculeAutoencoderConfig {
 impl Default for MoleculeAutoencoderConfig {
     fn default() -> Self {
         Self::v1_counted_ecfp()
+    }
+}
+
+/// Fluent builder for [`MoleculeAutoencoderConfig`].
+///
+/// Defaults match [`MoleculeAutoencoderConfig::v1_counted_ecfp`]; setters only
+/// need to be called for fields the caller wants to override.
+/// [`build`](Self::build) validates the assembled configuration via
+/// [`MoleculeAutoencoderConfig::validate`] before returning it.
+#[derive(Debug, Clone)]
+pub struct MoleculeAutoencoderConfigBuilder {
+    fingerprint_size: usize,
+    latent_width: usize,
+    hidden_widths: Vec<usize>,
+    descriptor_weight: f64,
+    tanimoto_ranking_weight: f64,
+    latent_noise_std: f64,
+    latent_temperature: f64,
+    metric_temperature: f64,
+    min_gap: f64,
+    candidates_per_anchor: usize,
+    pairs_per_batch: usize,
+}
+
+impl Default for MoleculeAutoencoderConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MoleculeAutoencoderConfigBuilder {
+    /// Creates a builder seeded with the v1 4k-ECFP / 512-latent defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            fingerprint_size: DEFAULT_ECFP_SIZE,
+            latent_width: 512,
+            hidden_widths: vec![4096, 2048, 1024],
+            descriptor_weight: default_descriptor_weight(),
+            tanimoto_ranking_weight: default_tanimoto_ranking_weight(),
+            latent_noise_std: default_latent_noise_std(),
+            latent_temperature: default_tanimoto_ranking_latent_temperature(),
+            metric_temperature: default_tanimoto_ranking_metric_temperature(),
+            min_gap: 0.05,
+            candidates_per_anchor: 4,
+            pairs_per_batch: 0,
+        }
+    }
+
+    /// Sets the counted ECFP input width.
+    #[must_use]
+    pub const fn fingerprint_size(mut self, value: usize) -> Self {
+        self.fingerprint_size = value;
+        self
+    }
+
+    /// Sets the latent embedding width.
+    #[must_use]
+    pub const fn latent_width(mut self, value: usize) -> Self {
+        self.latent_width = value;
+        self
+    }
+
+    /// Sets the encoder hidden layer widths (decoder mirrors in reverse).
+    #[must_use]
+    pub fn hidden_widths(mut self, value: Vec<usize>) -> Self {
+        self.hidden_widths = value;
+        self
+    }
+
+    /// Sets the descriptor regression loss weight.
+    #[must_use]
+    pub const fn descriptor_weight(mut self, value: f64) -> Self {
+        self.descriptor_weight = value;
+        self
+    }
+
+    /// Sets the latent Tanimoto geometry loss weight.
+    #[must_use]
+    pub const fn tanimoto_ranking_weight(mut self, value: f64) -> Self {
+        self.tanimoto_ranking_weight = value;
+        self
+    }
+
+    /// Sets the decoder-side latent noise std as a fraction of batch std.
+    #[must_use]
+    pub const fn latent_noise_std(mut self, value: f64) -> Self {
+        self.latent_noise_std = value;
+        self
+    }
+
+    /// Sets the latent cosine-logit temperature in the geometry loss.
+    #[must_use]
+    pub const fn tanimoto_ranking_latent_temperature(mut self, value: f64) -> Self {
+        self.latent_temperature = value;
+        self
+    }
+
+    /// Sets the (compatibility) metric temperature.
+    #[must_use]
+    pub const fn tanimoto_ranking_metric_temperature(mut self, value: f64) -> Self {
+        self.metric_temperature = value;
+        self
+    }
+
+    /// Sets the minimum counted-Tanimoto gap an anchor must clear.
+    #[must_use]
+    pub const fn tanimoto_ranking_min_gap(mut self, value: f64) -> Self {
+        self.min_gap = value;
+        self
+    }
+
+    /// Sets the number of candidate partners sampled per anchor.
+    #[must_use]
+    pub const fn tanimoto_ranking_candidates(mut self, value: usize) -> Self {
+        self.candidates_per_anchor = value;
+        self
+    }
+
+    /// Sets the maximum number of anchors per batch (`0` uses all rows).
+    #[must_use]
+    pub const fn tanimoto_ranking_pairs_per_batch(mut self, value: usize) -> Self {
+        self.pairs_per_batch = value;
+        self
+    }
+
+    /// Validates the configured fields and builds the immutable config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] for any failing invariant; the same
+    /// checks are reused for the JSON-loaded path via
+    /// [`MoleculeAutoencoderConfig::validate`].
+    #[cfg(feature = "std")]
+    pub fn build(self) -> Result<MoleculeAutoencoderConfig> {
+        let fingerprint_size = self.fingerprint_size;
+        let mut decoder_hidden_widths = self.hidden_widths.clone();
+        decoder_hidden_widths.reverse();
+        let config = MoleculeAutoencoderConfig {
+            encoder: EncoderConfig {
+                input_width: fingerprint_size,
+                hidden_widths: self.hidden_widths,
+                latent_width: self.latent_width,
+            },
+            decoder: DecoderConfig {
+                latent_width: self.latent_width,
+                hidden_widths: decoder_hidden_widths,
+                output_width: fingerprint_size,
+            },
+            descriptor_width: REGRESSION_TARGET_WIDTH,
+            reconstruction_loss: ReconstructionLossConfig::default(),
+            auxiliary_weights: AuxiliaryLossWeights {
+                descriptors: self.descriptor_weight,
+                tanimoto_ranking: self.tanimoto_ranking_weight,
+            },
+            tanimoto_ranking: TanimotoRankingConfig {
+                latent_temperature: self.latent_temperature,
+                metric_temperature: self.metric_temperature,
+                min_gap: self.min_gap,
+                candidates_per_anchor: self.candidates_per_anchor,
+                pairs_per_batch: self.pairs_per_batch,
+            },
+            latent_noise_std: self.latent_noise_std,
+        };
+        config.validate(fingerprint_size)?;
+        Ok(config)
     }
 }
 
@@ -543,10 +1287,8 @@ impl<B: Backend> MoleculeLossBreakdown<B> {
 /// Dense counted-fingerprint molecular autoencoder.
 #[derive(Module, Debug)]
 pub struct MoleculeAutoencoder<B: Backend> {
-    /// Encoder module.
-    pub encoder: Encoder<B>,
-    /// Decoder module.
-    pub decoder: Decoder<B>,
+    encoder: Encoder<B>,
+    decoder: Decoder<B>,
     descriptor_head: Linear<B>,
     reconstruction_beta: f64,
     zero_weight: f64,
@@ -980,20 +1722,21 @@ mod tests {
     }
 
     #[test]
-    fn from_components_matches_symmetric_with_overrides() {
-        let config = MoleculeAutoencoderConfig::from_components(
-            64,
-            16,
-            vec![32, 24],
-            0.07,
-            0.13,
-            0.03,
-            0.20,
-            0.30,
-            0.04,
-            6,
-            8,
-        );
+    fn builder_matches_symmetric_with_overrides() {
+        let config = MoleculeAutoencoderConfig::builder()
+            .fingerprint_size(64)
+            .latent_width(16)
+            .hidden_widths(vec![32, 24])
+            .descriptor_weight(0.07)
+            .tanimoto_ranking_weight(0.13)
+            .latent_noise_std(0.03)
+            .tanimoto_ranking_latent_temperature(0.20)
+            .tanimoto_ranking_metric_temperature(0.30)
+            .tanimoto_ranking_min_gap(0.04)
+            .tanimoto_ranking_candidates(6)
+            .tanimoto_ranking_pairs_per_batch(8)
+            .build()
+            .expect("valid config");
 
         assert_eq!(config.encoder.input_width, 64);
         assert_eq!(config.encoder.hidden_widths, vec![32, 24]);
@@ -1011,10 +1754,116 @@ mod tests {
     }
 
     #[test]
+    fn builder_defaults_match_v1_counted_ecfp() {
+        let from_builder = MoleculeAutoencoderConfig::builder()
+            .build()
+            .expect("default builder is valid");
+
+        assert_eq!(from_builder, MoleculeAutoencoderConfig::v1_counted_ecfp());
+    }
+
+    #[test]
+    fn reconstruction_loss_builder_rejects_zero_beta_and_negative_weights() {
+        assert!(matches!(
+            ReconstructionLossConfig::builder()
+                .beta(0.0)
+                .build()
+                .expect_err("zero beta"),
+            crate::Error::ConfigInvalid { message } if message.contains("beta")
+        ));
+        assert!(matches!(
+            ReconstructionLossConfig::builder()
+                .zero_weight(-0.1)
+                .build()
+                .expect_err("negative zero weight"),
+            crate::Error::ConfigInvalid { message } if message.contains("zero_weight")
+        ));
+    }
+
+    #[test]
+    fn auxiliary_loss_weights_builder_rejects_negative_weights() {
+        assert!(matches!(
+            AuxiliaryLossWeights::builder()
+                .descriptors(-0.5)
+                .build()
+                .expect_err("negative descriptor weight"),
+            crate::Error::ConfigInvalid { message } if message.contains("descriptors")
+        ));
+    }
+
+    #[test]
+    fn encoder_builder_requires_all_fields_and_rejects_empty_hidden_widths() {
+        let missing = EncoderConfig::builder()
+            .input_width(32)
+            .latent_width(8)
+            .build()
+            .expect_err("missing hidden_widths");
+        assert!(matches!(
+            missing,
+            crate::Error::ConfigInvalid { message } if message.contains("hidden_widths must be set")
+        ));
+
+        let empty = EncoderConfig::builder()
+            .input_width(32)
+            .latent_width(8)
+            .hidden_widths(vec![])
+            .build()
+            .expect_err("empty hidden_widths");
+        assert!(matches!(
+            empty,
+            crate::Error::ConfigInvalid { message } if message.contains("must not be empty")
+        ));
+
+        let zero_layer = EncoderConfig::builder()
+            .input_width(32)
+            .latent_width(8)
+            .hidden_widths(vec![16, 0, 4])
+            .build()
+            .expect_err("zero hidden width");
+        assert!(matches!(
+            zero_layer,
+            crate::Error::ConfigInvalid { message } if message.contains("greater than zero")
+        ));
+    }
+
+    #[test]
+    fn builder_rejects_invalid_temperature_or_weight() {
+        let bad_temperature = MoleculeAutoencoderConfig::builder()
+            .tanimoto_ranking_latent_temperature(0.0)
+            .build()
+            .expect_err("zero latent temperature must be rejected");
+        assert!(matches!(
+            bad_temperature,
+            crate::Error::ConfigInvalid { message } if message.contains("latent temperature")
+        ));
+
+        let bad_candidates = MoleculeAutoencoderConfig::builder()
+            .tanimoto_ranking_weight(0.10)
+            .tanimoto_ranking_candidates(1)
+            .build()
+            .expect_err("single candidate with positive weight must be rejected");
+        assert!(matches!(
+            bad_candidates,
+            crate::Error::ConfigInvalid { message } if message.contains("candidates_per_anchor")
+        ));
+    }
+
+    #[test]
     fn tanimoto_ranking_runtime_view_packs_weight_and_shape() {
-        let config = MoleculeAutoencoderConfig::from_components(
-            32, 8, vec![16], 0.05, 0.11, 0.02, 0.15, 0.25, 0.05, 4, 0,
-        );
+        let config = MoleculeAutoencoderConfig::builder()
+            .fingerprint_size(32)
+            .latent_width(8)
+            .hidden_widths(vec![16])
+            .descriptor_weight(0.05)
+            .tanimoto_ranking_weight(0.11)
+            .latent_noise_std(0.02)
+            .tanimoto_ranking_latent_temperature(0.15)
+            .tanimoto_ranking_metric_temperature(0.25)
+            .tanimoto_ranking_min_gap(0.05)
+            .tanimoto_ranking_candidates(4)
+            .tanimoto_ranking_pairs_per_batch(0)
+            .build()
+            .expect("valid config");
         let runtime = config.tanimoto_ranking_runtime();
 
         assert_eq!(runtime.weight, 0.11);
@@ -1084,9 +1933,20 @@ mod tests {
     fn load_and_save_json_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("model-config.json");
-        let config = MoleculeAutoencoderConfig::from_components(
-            128, 32, vec![64, 48], 0.06, 0.12, 0.01, 0.18, 0.28, 0.03, 5, 7,
-        );
+        let config = MoleculeAutoencoderConfig::builder()
+            .fingerprint_size(128)
+            .latent_width(32)
+            .hidden_widths(vec![64, 48])
+            .descriptor_weight(0.06)
+            .tanimoto_ranking_weight(0.12)
+            .latent_noise_std(0.01)
+            .tanimoto_ranking_latent_temperature(0.18)
+            .tanimoto_ranking_metric_temperature(0.28)
+            .tanimoto_ranking_min_gap(0.03)
+            .tanimoto_ranking_candidates(5)
+            .tanimoto_ranking_pairs_per_batch(7)
+            .build()
+            .expect("valid config");
 
         config.save_json(&path).expect("save");
         let loaded = MoleculeAutoencoderConfig::load_json(&path).expect("load");

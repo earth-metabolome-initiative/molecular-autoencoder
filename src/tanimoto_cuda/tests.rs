@@ -35,12 +35,13 @@ fn ranking_kernel_matches_cpu_counted_tanimoto_reference() {
         row_count: 5,
         width: 3,
     };
-    let config = CountedTanimotoRankingKernelConfig {
-        batch_items: rows.row_count,
-        candidates_per_anchor: 4,
-        seed: 12_345,
-        epsilon: 1.0e-8,
-    };
+    let config = CountedTanimotoRankingKernelConfig::builder()
+        .batch_items(rows.row_count)
+        .candidates_per_anchor(4)
+        .seed(12_345)
+        .epsilon(1.0e-8)
+        .build()
+        .expect("kernel config is valid");
 
     let (candidate_index, best_candidate_position, top2_gap) =
         counted_tanimoto_similarity_ranking_kernel(

@@ -26,24 +26,32 @@ pub use batch::{MoleculeAutoencoderHostBatch, MoleculeBatchBuildProfile};
 #[cfg(feature = "datasets")]
 pub use data::{
     DEFAULT_PREPROCESS_CHUNK_ROWS, DEFAULT_PREPROCESS_THREADS, DEFAULT_ROWS_PER_SHARD,
-    DatasetPreprocessOptions, PreprocessedDatasetChunk, molecule_records_from_smiles_dataset,
-    preprocess_dataset_record_chunks,
+    DatasetPreprocessOptions, DatasetPreprocessOptionsBuilder, PreprocessedDatasetChunk,
+    molecule_records_from_smiles_dataset, preprocess_dataset_record_chunks,
 };
 pub use data::{
     DataSplit, MoleculeRecord, MoleculeShardRow, MoleculeTargets, PreprocessingConfig,
-    SHARD_MANIFEST_VERSION, ShardManifest, SparseMoleculeShard, preprocess_record,
+    PreprocessingConfigBuilder, SHARD_MANIFEST_VERSION, ShardManifest, ShardManifestEntry,
+    SparseMoleculeShard, preprocess_record,
 };
 pub use error::{Error, Result};
-pub use features::{DescriptorConfig, DescriptorTargets};
-pub use fingerprints::{CountedEcfpConfig, FingerprintTargets, compute_fingerprint_targets};
+pub use features::{
+    DescriptorConfig, DescriptorConfigBuilder, DescriptorTargets, SmilesQualityFilter,
+    SmilesQualityFilterBuilder,
+};
+pub use fingerprints::{
+    CountedEcfpConfig, CountedEcfpConfigBuilder, FingerprintTargets, compute_fingerprint_targets,
+};
 pub use metrics::{
     CountReconstructionMetrics, batch_count_tanimoto, batch_log_count_reconstruction_tanimoto,
     batch_log_count_tanimoto, batch_sparse_log_count_tanimoto, count_tanimoto,
 };
 pub use model::{
-    AuxiliaryLossWeights, Decoder, DecoderConfig, Encoder, EncoderConfig, MoleculeAutoencoder,
-    MoleculeAutoencoderConfig, MoleculeAutoencoderOutput, MoleculeLossBreakdown,
-    ReconstructionLossConfig, TanimotoRankingConfig, TanimotoRankingRuntimeConfig,
+    AuxiliaryLossWeights, AuxiliaryLossWeightsBuilder, Decoder, DecoderConfig,
+    DecoderConfigBuilder, Encoder, EncoderConfig, EncoderConfigBuilder, MoleculeAutoencoder,
+    MoleculeAutoencoderConfig, MoleculeAutoencoderConfigBuilder, MoleculeAutoencoderOutput,
+    MoleculeLossBreakdown, ReconstructionLossConfig, ReconstructionLossConfigBuilder,
+    TanimotoRankingConfig, TanimotoRankingConfigBuilder, TanimotoRankingRuntimeConfig,
     apply_latent_noise, weighted_sparse_log_count_huber_loss,
 };
 pub use ranking::{

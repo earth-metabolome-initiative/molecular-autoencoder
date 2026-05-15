@@ -36,14 +36,14 @@ where
             "Tanimoto geometry indices and mask must share a shape"
         );
         assert!(
-            config.batch_items <= index_rows,
+            config.batch_items() <= index_rows,
             "Tanimoto geometry batch_items exceeds the sparse batch row count"
         );
 
         let candidate_count = config.effective_candidates_per_anchor();
-        let candidate_shape = Shape::new([config.batch_items, candidate_count]);
-        let index_shape = Shape::new([config.batch_items]);
-        let gap_shape = Shape::new([config.batch_items]);
+        let candidate_shape = Shape::new([config.batch_items(), candidate_count]);
+        let index_shape = Shape::new([config.batch_items()]);
+        let gap_shape = Shape::new([config.batch_items()]);
         let candidate_index = empty_device_dtype(
             counts.client.clone(),
             counts.device.clone(),
@@ -63,7 +63,7 @@ where
             counts.dtype,
         );
 
-        let total_elem = config.batch_items;
+        let total_elem = config.batch_items();
         let cube_dim = CubeDim::new(&counts.client, total_elem);
         let cube_count = calculate_cube_count_elemwise(&counts.client, total_elem, cube_dim);
 
@@ -78,10 +78,10 @@ where
             candidate_index.clone().into_tensor_arg(),
             best_candidate_position.clone().into_tensor_arg(),
             top2_gap.clone().into_tensor_arg(),
-            config.batch_items as u32,
-            config.candidates_per_anchor as u32,
-            config.seed as u32,
-            config.epsilon as f32,
+            config.batch_items() as u32,
+            config.candidates_per_anchor() as u32,
+            config.seed() as u32,
+            config.epsilon() as f32,
         );
 
         (candidate_index, best_candidate_position, top2_gap)

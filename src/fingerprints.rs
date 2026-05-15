@@ -11,25 +11,40 @@ pub const DEFAULT_ECFP_RADIUS: u8 = 2;
 /// Default folded counted ECFP width for the v1 model.
 pub const DEFAULT_ECFP_SIZE: usize = 4096;
 
-/// Counted ECFP configuration.
+/// Counted ECFP configuration. Construct via [`CountedEcfpConfig::builder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CountedEcfpConfig {
-    /// Morgan/ECFP radius.
-    pub radius: u8,
-    /// Folded fingerprint vector width.
-    pub size: usize,
+    radius: u8,
+    size: usize,
 }
 
 impl Default for CountedEcfpConfig {
     fn default() -> Self {
-        Self {
-            radius: DEFAULT_ECFP_RADIUS,
-            size: DEFAULT_ECFP_SIZE,
-        }
+        CountedEcfpConfigBuilder::new()
+            .build()
+            .expect("default counted ECFP config is valid")
     }
 }
 
 impl CountedEcfpConfig {
+    /// Starts a fluent builder.
+    #[must_use]
+    pub fn builder() -> CountedEcfpConfigBuilder {
+        CountedEcfpConfigBuilder::new()
+    }
+
+    /// Morgan/ECFP radius.
+    #[must_use]
+    pub const fn radius(&self) -> u8 {
+        self.radius
+    }
+
+    /// Folded fingerprint vector width.
+    #[must_use]
+    pub const fn size(&self) -> usize {
+        self.size
+    }
+
     /// Creates the finge-rs fingerprint implementation.
     #[must_use]
     pub const fn to_fingerprint(self) -> finge_rs::CountEcfpFingerprint {
@@ -37,18 +52,136 @@ impl CountedEcfpConfig {
     }
 }
 
-/// Sparse counted fingerprint target.
+/// Fluent builder for [`CountedEcfpConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountedEcfpConfigBuilder {
+    radius: u8,
+    size: usize,
+}
+
+impl Default for CountedEcfpConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CountedEcfpConfigBuilder {
+    /// Creates a builder seeded with the v1 defaults (radius 2, size 4096).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            radius: DEFAULT_ECFP_RADIUS,
+            size: DEFAULT_ECFP_SIZE,
+        }
+    }
+
+    /// Sets the Morgan/ECFP radius.
+    #[must_use]
+    pub const fn radius(mut self, value: u8) -> Self {
+        self.radius = value;
+        self
+    }
+
+    /// Sets the folded fingerprint vector width.
+    #[must_use]
+    pub const fn size(mut self, value: usize) -> Self {
+        self.size = value;
+        self
+    }
+
+    /// Validates the configured fields and builds the immutable config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] when `radius` is 0, when `size` is 0,
+    /// or when `size` exceeds the u16 sparse-index storage limit.
+    pub fn build(self) -> Result<CountedEcfpConfig> {
+        if self.radius == 0 {
+            return Err(Error::ConfigInvalid {
+                message: "counted ECFP radius must be greater than zero".to_string(),
+            });
+        }
+        if self.size == 0 {
+            return Err(Error::ConfigInvalid {
+                message: "counted ECFP size must be greater than zero".to_string(),
+            });
+        }
+        if self.size > usize::from(u16::MAX) + 1 {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "counted ECFP size {} exceeds u16 sparse index storage",
+                    self.size
+                ),
+            });
+        }
+        Ok(CountedEcfpConfig {
+            radius: self.radius,
+            size: self.size,
+        })
+    }
+}
+
+/// Sparse counted fingerprint target. Construct via
+/// [`FingerprintTargets::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FingerprintTargets {
-    /// Nonzero folded fingerprint indices.
-    pub indices: Vec<u16>,
-    /// Counts for each nonzero folded index.
-    pub counts: Vec<u16>,
-    /// Full dense vector width.
-    pub fingerprint_size: usize,
+    indices: Vec<u16>,
+    counts: Vec<u16>,
+    fingerprint_size: usize,
 }
 
 impl FingerprintTargets {
+    /// Creates a sparse fingerprint target from concatenated index / count
+    /// pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidBatch`] when `indices` and `counts` have
+    /// different lengths, or when any index meets or exceeds
+    /// `fingerprint_size`.
+    pub fn new(
+        indices: Vec<u16>,
+        counts: Vec<u16>,
+        fingerprint_size: usize,
+    ) -> Result<Self> {
+        if indices.len() != counts.len() {
+            return Err(Error::InvalidBatch(
+                "fingerprint indices and counts have different lengths".to_string(),
+            ));
+        }
+        if indices
+            .iter()
+            .any(|&index| usize::from(index) >= fingerprint_size)
+        {
+            return Err(Error::InvalidBatch(format!(
+                "fingerprint index exceeds configured width {fingerprint_size}"
+            )));
+        }
+        Ok(Self {
+            indices,
+            counts,
+            fingerprint_size,
+        })
+    }
+
+    /// Nonzero folded fingerprint indices.
+    #[must_use]
+    pub fn indices(&self) -> &[u16] {
+        &self.indices
+    }
+
+    /// Counts for each nonzero folded index.
+    #[must_use]
+    pub fn counts(&self) -> &[u16] {
+        &self.counts
+    }
+
+    /// Full dense vector width.
+    #[must_use]
+    pub const fn fingerprint_size(&self) -> usize {
+        self.fingerprint_size
+    }
+
     /// Number of nonzero bins.
     #[must_use]
     pub fn nnz(&self) -> usize {
@@ -90,13 +223,7 @@ pub fn compute_fingerprint_targets(
 ) -> Result<FingerprintTargets> {
     use finge_rs::Fingerprint;
 
-    if config.size > usize::from(u16::MAX) + 1 {
-        return Err(Error::InvalidBatch(format!(
-            "fingerprint width {} exceeds u16 sparse index storage",
-            config.size
-        )));
-    }
-
+    let size = config.size();
     let prepared = scratch
         .try_prepare(smiles)
         .map_err(|source| Error::FingerprintPreparation {
@@ -115,11 +242,7 @@ pub fn compute_fingerprint_targets(
         counts.push(count);
     }
 
-    Ok(FingerprintTargets {
-        indices,
-        counts,
-        fingerprint_size: config.size,
-    })
+    FingerprintTargets::new(indices, counts, size)
 }
 
 #[cfg(test)]
@@ -130,8 +253,25 @@ mod tests {
     fn counted_ecfp_default_is_4k_radius_2() {
         let config = CountedEcfpConfig::default();
 
-        assert_eq!(config.radius, 2);
-        assert_eq!(config.size, 4096);
+        assert_eq!(config.radius(), 2);
+        assert_eq!(config.size(), 4096);
+    }
+
+    #[test]
+    fn counted_ecfp_builder_rejects_zero_size_and_radius() {
+        assert!(
+            CountedEcfpConfig::builder()
+                .radius(0)
+                .build()
+                .is_err()
+        );
+        assert!(CountedEcfpConfig::builder().size(0).build().is_err());
+        assert!(
+            CountedEcfpConfig::builder()
+                .size(usize::from(u16::MAX) + 2)
+                .build()
+                .is_err()
+        );
     }
 
     #[test]
@@ -142,12 +282,12 @@ mod tests {
             compute_fingerprint_targets(702, &smiles, CountedEcfpConfig::default(), &mut scratch)
                 .expect("fingerprint target");
 
-        assert_eq!(targets.indices.len(), targets.counts.len());
-        assert_eq!(targets.fingerprint_size, 4096);
-        assert!(!targets.indices.is_empty());
+        assert_eq!(targets.indices().len(), targets.counts().len());
+        assert_eq!(targets.fingerprint_size(), 4096);
+        assert!(!targets.indices().is_empty());
         assert!(
             targets
-                .indices
+                .indices()
                 .iter()
                 .all(|&index| usize::from(index) < 4096)
         );
@@ -155,11 +295,7 @@ mod tests {
 
     #[test]
     fn sparse_targets_expand_to_dense_counts_and_log_counts() {
-        let targets = FingerprintTargets {
-            indices: vec![1, 3],
-            counts: vec![2, 4],
-            fingerprint_size: 5,
-        };
+        let targets = FingerprintTargets::new(vec![1, 3], vec![2, 4], 5).expect("valid targets");
 
         assert_eq!(targets.nnz(), 2);
         assert_eq!(targets.to_dense_counts(), vec![0.0, 2.0, 0.0, 4.0, 0.0]);
@@ -170,20 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn counted_ecfp_rejects_widths_too_large_for_sparse_storage() {
-        let smiles: Smiles = "CCO".parse().expect("valid SMILES");
-        let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
-        let error = compute_fingerprint_targets(
-            702,
-            &smiles,
-            CountedEcfpConfig {
-                radius: 2,
-                size: usize::from(u16::MAX) + 2,
-            },
-            &mut scratch,
-        )
-        .expect_err("oversized fingerprint should be rejected");
+    fn counted_ecfp_builder_rejects_oversized_widths_before_compute() {
+        let error = CountedEcfpConfig::builder()
+            .size(usize::from(u16::MAX) + 2)
+            .build()
+            .expect_err("oversized fingerprint should be rejected");
 
-        assert!(matches!(error, Error::InvalidBatch(message) if message.contains("u16")));
+        assert!(matches!(error, Error::ConfigInvalid { message } if message.contains("u16")));
     }
 }

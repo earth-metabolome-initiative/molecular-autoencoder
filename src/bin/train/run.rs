@@ -39,24 +39,27 @@ where
     let mut args = args;
     let requested_device_prefetch_batches = args.device_prefetch_batches;
     args.device_prefetch_batches = effective_device_prefetch_batches(requested_device_prefetch_batches);
+    let paths = args.manifest_paths()?;
+    let max_valid_batches = args.max_valid_batches();
 
-    let manifest_path = prepare_manifest(&args)?;
+    let manifest_path = prepare_manifest(&args, &paths)?;
     let manifest = ShardManifest::read_from_path(&manifest_path)?;
     let shards = shard_infos(&manifest_path, &manifest)?;
-    let fingerprint_size = manifest.preprocessing.counted_ecfp.size;
+    let fingerprint_size = manifest.preprocessing().counted_ecfp().size();
     let recorder = DefaultRecorder::default();
     let model_config_path = args.checkpoint_dir.join("model-config.json");
     let state_path = args.checkpoint_dir.join("state.json");
 
     std::fs::create_dir_all(&args.checkpoint_dir)?;
     let model_config = if args.resume && model_config_path.exists() {
-        MoleculeAutoencoderConfig::load_json(&model_config_path)?
+        let config = MoleculeAutoencoderConfig::load_json(&model_config_path)?;
+        config.validate(fingerprint_size)?;
+        config
     } else {
-        let config = args.to_model_config(fingerprint_size);
+        let config = args.to_model_config(fingerprint_size)?;
         config.save_json(&model_config_path)?;
         config
     };
-    model_config.validate(fingerprint_size)?;
 
     let mut model = model_config.init::<B>(&device);
     let mut optimizer = AdamConfig::new().init::<B, MoleculeAutoencoder<B>>();
@@ -77,16 +80,16 @@ where
     };
 
     let batcher = MoleculeAutoencoderBatcher::new(
-        model_config.encoder.input_width,
-        model_config.descriptor_width,
+        model_config.encoder().input_width(),
+        model_config.descriptor_width(),
     );
     let tanimoto_ranking = model_config.tanimoto_ranking_runtime();
     let mut reporter = TrainingReporter::new(
-        manifest.row_count,
-        manifest.preprocessing.validation_per_mille,
+        manifest.row_count(),
+        manifest.preprocessing().validation_per_mille(),
         args.batch_size,
         args.max_train_batches,
-        args.max_valid_batches,
+        max_valid_batches,
         args.resume.then_some(state.completed_epoch),
     );
     let loader_profile_every = if reporter.is_active() {
@@ -108,14 +111,14 @@ where
         args.metric_every,
         loader_profile_every,
         args.learning_rate,
-        model_config.latent_noise_std,
-        model_config.auxiliary_weights.descriptors,
-        tanimoto_ranking.weight,
-        tanimoto_ranking.latent_temperature,
-        tanimoto_ranking.metric_temperature,
-        tanimoto_ranking.min_gap,
-        tanimoto_ranking.candidates_per_anchor,
-        tanimoto_ranking.pairs_per_batch
+        model_config.latent_noise_std(),
+        model_config.auxiliary_weights().descriptors(),
+        tanimoto_ranking.weight(),
+        tanimoto_ranking.latent_temperature(),
+        tanimoto_ranking.metric_temperature(),
+        tanimoto_ranking.min_gap(),
+        tanimoto_ranking.candidates_per_anchor(),
+        tanimoto_ranking.pairs_per_batch()
     );
 
     for epoch in (state.completed_epoch + 1)..=args.epochs {
@@ -130,7 +133,7 @@ where
                 tanimoto_ranking,
                 args: &args,
                 loader_profile_every,
-                validation_per_mille: manifest.preprocessing.validation_per_mille,
+                validation_per_mille: manifest.preprocessing().validation_per_mille(),
                 state: &mut state,
                 reporter: &mut reporter,
                 epoch,
@@ -167,12 +170,12 @@ where
                     batcher,
                     device: &device,
                     batch_size: args.batch_size,
-                    max_batches: args.max_valid_batches,
+                    max_batches: max_valid_batches,
                     loader_workers: args.loader_workers,
                     device_prefetch_batches: args.device_prefetch_batches,
                     loader_profile_every,
                     tanimoto_ranking,
-                    validation_per_mille: manifest.preprocessing.validation_per_mille,
+                    validation_per_mille: manifest.preprocessing().validation_per_mille(),
                     reporter: &mut reporter,
                     epoch,
                     epoch_total: args.epochs,
