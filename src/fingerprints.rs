@@ -139,11 +139,7 @@ impl FingerprintTargets {
     /// Returns [`Error::InvalidBatch`] when `indices` and `counts` have
     /// different lengths, or when any index meets or exceeds
     /// `fingerprint_size`.
-    pub fn new(
-        indices: Vec<u16>,
-        counts: Vec<u16>,
-        fingerprint_size: usize,
-    ) -> Result<Self> {
+    pub fn new(indices: Vec<u16>, counts: Vec<u16>, fingerprint_size: usize) -> Result<Self> {
         if indices.len() != counts.len() {
             return Err(Error::InvalidBatch(
                 "fingerprint indices and counts have different lengths".to_string(),
@@ -259,12 +255,7 @@ mod tests {
 
     #[test]
     fn counted_ecfp_builder_rejects_zero_size_and_radius() {
-        assert!(
-            CountedEcfpConfig::builder()
-                .radius(0)
-                .build()
-                .is_err()
-        );
+        assert!(CountedEcfpConfig::builder().radius(0).build().is_err());
         assert!(CountedEcfpConfig::builder().size(0).build().is_err());
         assert!(
             CountedEcfpConfig::builder()

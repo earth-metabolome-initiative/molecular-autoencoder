@@ -50,8 +50,10 @@ impl TrainingReporter {
         let interrupter = Interrupter::new();
         let use_tui = std::io::stdout().is_terminal();
         let mut renderer = use_tui.then(|| {
-            Box::new(TuiMetricsRendererWrapper::new(interrupter.clone(), checkpoint))
-                as Box<dyn MetricsRenderer>
+            Box::new(TuiMetricsRendererWrapper::new(
+                interrupter.clone(),
+                checkpoint,
+            )) as Box<dyn MetricsRenderer>
         });
         let bars = (!use_tui).then(IndicatifTrainingBars::new);
         let metric_ids = ReporterMetricIds::new();

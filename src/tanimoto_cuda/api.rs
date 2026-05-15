@@ -127,9 +127,11 @@ impl CountedTanimotoRankingKernelConfigBuilder {
     /// set, when `epsilon` is non-finite or non-positive, or when
     /// `candidates_per_anchor` is below the kernel's minimum of 2.
     pub fn build(self) -> crate::Result<CountedTanimotoRankingKernelConfig> {
-        let batch_items = self.batch_items.ok_or_else(|| crate::Error::ConfigInvalid {
-            message: "counted Tanimoto kernel batch_items must be set".to_string(),
-        })?;
+        let batch_items = self
+            .batch_items
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: "counted Tanimoto kernel batch_items must be set".to_string(),
+            })?;
         if !self.epsilon.is_finite() || self.epsilon <= 0.0 {
             return Err(crate::Error::ConfigInvalid {
                 message: format!(

@@ -10,14 +10,14 @@ use burn::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "std")]
+use crate::{Error, Result};
 use crate::{
     batch::{MoleculeAutoencoderBatch, SparseFingerprintBatch},
     features::REGRESSION_TARGET_WIDTH,
     fingerprints::DEFAULT_ECFP_SIZE,
     ranking::weighted_tanimoto_ranking_output,
 };
-#[cfg(feature = "std")]
-use crate::{Error, Result};
 
 const fn default_descriptor_weight() -> f64 {
     0.05
@@ -913,12 +913,12 @@ impl MoleculeAutoencoderConfig {
                 self.reconstruction_loss.beta
             ));
         }
-        if self.reconstruction_loss.zero_weight < 0.0 || self.reconstruction_loss.nonzero_weight < 0.0
+        if self.reconstruction_loss.zero_weight < 0.0
+            || self.reconstruction_loss.nonzero_weight < 0.0
         {
             return bail("reconstruction loss weights must be non-negative".to_string());
         }
-        if self.auxiliary_weights.descriptors < 0.0
-            || self.auxiliary_weights.tanimoto_ranking < 0.0
+        if self.auxiliary_weights.descriptors < 0.0 || self.auxiliary_weights.tanimoto_ranking < 0.0
         {
             return bail("auxiliary loss weights must be non-negative".to_string());
         }

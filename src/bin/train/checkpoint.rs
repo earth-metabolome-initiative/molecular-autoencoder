@@ -2,12 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
+use burn::optim::Optimizer;
 use burn::{
     module::Module,
     record::{DefaultRecorder, Recorder},
     tensor::backend::AutodiffBackend,
 };
-use burn::optim::Optimizer;
 use molecular_autoencoder::{
     MoleculeAutoencoder, MoleculeAutoencoderBatcher, ShardManifest, SparseMoleculeShard,
 };

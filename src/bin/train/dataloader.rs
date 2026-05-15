@@ -94,10 +94,7 @@ enum DeviceLoaderMessage<B: Backend> {
 
 /// Iterates batches of the requested split, dispatching to the multi-threaded
 /// dataloader when `loader_workers > 0` and to the sync path otherwise.
-pub fn for_each_batch<B, F>(
-    context: BatchIterationContext<'_, B>,
-    consume: F,
-) -> AppResult<()>
+pub fn for_each_batch<B, F>(context: BatchIterationContext<'_, B>, consume: F) -> AppResult<()>
 where
     B: Backend,
     B::Device: Clone + Send + Sync,
@@ -184,10 +181,7 @@ where
     })
 }
 
-fn for_each_batch_sync<B, F>(
-    context: BatchIterationContext<'_, B>,
-    mut consume: F,
-) -> AppResult<()>
+fn for_each_batch_sync<B, F>(context: BatchIterationContext<'_, B>, mut consume: F) -> AppResult<()>
 where
     B: Backend,
     F: FnMut(MoleculeAutoencoderBatch<B>, usize, Duration) -> AppResult<BatchControl>,

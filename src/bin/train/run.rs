@@ -38,7 +38,8 @@ where
 {
     let mut args = args;
     let requested_device_prefetch_batches = args.device_prefetch_batches;
-    args.device_prefetch_batches = effective_device_prefetch_batches(requested_device_prefetch_batches);
+    args.device_prefetch_batches =
+        effective_device_prefetch_batches(requested_device_prefetch_batches);
     let paths = args.manifest_paths()?;
     let max_valid_batches = args.max_valid_batches();
 

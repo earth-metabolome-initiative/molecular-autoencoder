@@ -237,11 +237,7 @@ pub struct Args {
     pub tanimoto_ranking_weight: f64,
 
     /// Latent cosine-logit temperature (alias: --tanimoto-ranking-margin).
-    #[arg(
-        long,
-        alias = "tanimoto-ranking-margin",
-        default_value_t = 0.10
-    )]
+    #[arg(long, alias = "tanimoto-ranking-margin", default_value_t = 0.10)]
     pub tanimoto_ranking_latent_temperature: f64,
 
     /// Compatibility metric temperature (unused by the softmax loss).
@@ -393,7 +389,9 @@ pub struct ResolvedPaths {
 }
 
 fn positive_usize(value: &str) -> Result<usize, String> {
-    let parsed: usize = value.parse().map_err(|err: std::num::ParseIntError| err.to_string())?;
+    let parsed: usize = value
+        .parse()
+        .map_err(|err: std::num::ParseIntError| err.to_string())?;
     if parsed == 0 {
         Err("must be greater than zero".to_string())
     } else {

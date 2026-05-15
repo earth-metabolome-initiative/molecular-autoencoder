@@ -19,8 +19,7 @@ fn preprocessing_batching_and_model_loss_are_finite() {
     let targets = preprocess_record(&record, &config, &mut scratch)
         .expect("preprocess ok")
         .expect("not filtered");
-    let mut shard =
-        SparseMoleculeShard::new(config.counted_ecfp().size(), REGRESSION_TARGET_WIDTH);
+    let mut shard = SparseMoleculeShard::new(config.counted_ecfp().size(), REGRESSION_TARGET_WIDTH);
     shard
         .push_targets(&targets, *config.descriptors())
         .expect("push row");

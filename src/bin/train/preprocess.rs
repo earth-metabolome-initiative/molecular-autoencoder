@@ -93,8 +93,7 @@ fn preprocess_cache(
         .build()
         .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
     let mut manifest = ShardManifest::new(source_selection.manifest_source(), config.clone());
-    let mut shard =
-        SparseMoleculeShard::new(config.counted_ecfp().size(), REGRESSION_TARGET_WIDTH);
+    let mut shard = SparseMoleculeShard::new(config.counted_ecfp().size(), REGRESSION_TARGET_WIDTH);
     let mut shard_index = 0_usize;
     let mut records_seen_total = 0_usize;
     let start = Instant::now();
