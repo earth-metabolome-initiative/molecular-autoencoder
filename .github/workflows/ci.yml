@@ -41,6 +41,46 @@ jobs:
       - name: Documentation
         run: cargo doc --locked --no-default-features --features std,ndarray,train,datasets --no-deps
 
+  cuda:
+    name: CUDA type-check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.4.1"
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cuda
+
+      - name: Check cuda-fusion path
+        env:
+          CUDARC_CUDA_VERSION: "12040"
+        run: cargo check --locked --no-default-features --features std,cuda-fusion,train,tui,datasets --all-targets
+
+      - name: Check cuda-no-fusion path
+        env:
+          CUDARC_CUDA_VERSION: "12040"
+        run: cargo check --locked --no-default-features --features std,cuda-no-fusion,train,tui,datasets --all-targets
+
+      - name: Clippy cuda-fusion
+        env:
+          CUDARC_CUDA_VERSION: "12040"
+        run: cargo clippy --locked --no-default-features --features std,cuda-fusion,train,tui,datasets --all-targets -- -D warnings
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest

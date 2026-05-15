@@ -84,7 +84,9 @@ fn ranking_kernel_matches_cpu_counted_tanimoto_reference() {
             "anchor {anchor}"
         );
         assert_eq!(
-            best_candidate_position[anchor] as usize, expected.best_candidate_position,
+            usize::try_from(best_candidate_position[anchor])
+                .expect("best candidate position is non-negative"),
+            expected.best_candidate_position,
             "anchor {anchor}"
         );
         assert!(
@@ -93,7 +95,8 @@ fn ranking_kernel_matches_cpu_counted_tanimoto_reference() {
             top2_gap[anchor],
             expected.top2_gap,
         );
-        assert!(!actual_candidates.contains(&(anchor as i32)));
+        let anchor_i32 = i32::try_from(anchor).expect("anchor index fits in i32");
+        assert!(!actual_candidates.contains(&anchor_i32));
         for (left, left_value) in actual_candidates.iter().enumerate() {
             for right_value in actual_candidates.iter().skip(left + 1) {
                 assert_ne!(
@@ -119,11 +122,11 @@ fn ranking_reference(
     anchor: usize,
     config: CountedTanimotoRankingKernelConfig,
 ) -> RankingReference {
-    let mut state = config.seed as u32 ^ (((anchor as u32) + 1) * 40503);
+    let mut state = config.seed() as u32 ^ (((anchor as u32) + 1) * 40503);
     if state == 0 {
         state = 0x6d2b_79f5;
     }
-    let partner_slots = (config.batch_items - 1) as u32;
+    let partner_slots = (config.batch_items() - 1) as u32;
     state ^= state << 13;
     state ^= state >> 17;
     state ^= state << 5;
@@ -150,7 +153,7 @@ fn ranking_reference(
         if local_partner >= anchor {
             local_partner += 1;
         }
-        candidate_indices.push(local_partner as i32);
+        candidate_indices.push(i32::try_from(local_partner).expect("partner index fits in i32"));
         let score = counted_tanimoto(rows, anchor, local_partner);
         if score > best_score {
             second_best_score = best_score;
@@ -164,7 +167,7 @@ fn ranking_reference(
     RankingReference {
         candidate_indices,
         best_candidate_position,
-        top2_gap: (best_score - second_best_score).max(0.0).min(1.0),
+        top2_gap: (best_score - second_best_score).clamp(0.0, 1.0),
     }
 }
 

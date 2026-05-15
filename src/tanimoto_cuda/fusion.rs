@@ -34,16 +34,16 @@ where
             "Tanimoto geometry indices and mask must share a shape"
         );
         assert!(
-            config.batch_items <= index_rows,
+            config.batch_items() <= index_rows,
             "Tanimoto geometry batch_items exceeds the sparse batch row count"
         );
 
         let streams = OperationStreams::with_inputs([&indices, &counts, &mask]);
         let client = counts.client.clone();
         let candidate_count = config.effective_candidates_per_anchor();
-        let candidate_shape = Shape::new([config.batch_items, candidate_count]);
-        let index_shape = Shape::new([config.batch_items]);
-        let gap_shape = Shape::new([config.batch_items]);
+        let candidate_shape = Shape::new([config.batch_items(), candidate_count]);
+        let index_shape = Shape::new([config.batch_items()]);
+        let gap_shape = Shape::new([config.batch_items()]);
         let candidate_index = TensorIr::uninit(
             client.create_empty_handle(),
             candidate_shape,
