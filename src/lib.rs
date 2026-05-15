@@ -43,8 +43,8 @@ pub use metrics::{
 pub use model::{
     AuxiliaryLossWeights, Decoder, DecoderConfig, Encoder, EncoderConfig, MoleculeAutoencoder,
     MoleculeAutoencoderConfig, MoleculeAutoencoderOutput, MoleculeLossBreakdown,
-    ReconstructionLossConfig, TanimotoRankingConfig, apply_latent_noise,
-    weighted_sparse_log_count_huber_loss,
+    ReconstructionLossConfig, TanimotoRankingConfig, TanimotoRankingRuntimeConfig,
+    apply_latent_noise, weighted_sparse_log_count_huber_loss,
 };
 pub use ranking::{
     TanimotoRankingBatch, TanimotoRankingOutput, tanimoto_ranking_output,

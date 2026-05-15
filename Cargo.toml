@@ -13,6 +13,11 @@ categories = ["science"]
 name = "molecular_autoencoder"
 path = "src/lib.rs"
 
+[[bin]]
+name = "train"
+path = "src/bin/train/main.rs"
+required-features = ["std", "train", "tui", "datasets"]
+
 [features]
 default = ["std", "ndarray", "train", "tui"]
 std = [

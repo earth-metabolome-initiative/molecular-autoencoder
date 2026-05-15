@@ -61,6 +61,12 @@ pub enum Error {
     /// Invalid batch input.
     #[error("invalid batch: {0}")]
     InvalidBatch(String),
+    /// Invalid model configuration.
+    #[error("invalid model configuration: {message}")]
+    ConfigInvalid {
+        /// Human-readable configuration error.
+        message: String,
+    },
 }
 
 impl Error {

@@ -40,14 +40,16 @@ LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:/usr/lib/wsl/lib:$LD_LIBRARY_PATH \
 CUDARC_CUDA_VERSION=12090 \
 RUSTFLAGS="-C target-cpu=native" \
 cargo run --release --no-default-features --features std,cuda-fusion,train,tui,datasets \
-  --example train_cached_shards -- all shards/pubchem-zinc20 runs/cuda-ae-pubchem-zinc20-large-100e \
+  --bin train -- shards/pubchem-zinc20 runs/cuda-ae-pubchem-zinc20-large-100e \
+  --datasets pubchem,zinc20 \
   --rows-per-shard 10000000 --epochs 100 --batch-size 32768 --loader-workers 20 \
   --metric-every 50 --descriptor-weight 0.05 --tanimoto-ranking-weight 0.10 \
   --preprocess-threads 64 --cuda-device 0
 ```
 
-Use `pubchem` or `zinc20` instead of `all` to preprocess one source. For a
-partial ZINC20 pass, add `--zinc20-chunks FIRST-LAST`.
+Use `--datasets pubchem` or `--datasets zinc20` to preprocess one source. For
+a partial ZINC20 pass, add `--zinc20-chunks FIRST-LAST`. Omit `--datasets` to
+train from an existing cached manifest without re-running preprocessing.
 
 Use a fresh checkpoint directory when changing architecture or loss defaults;
 `--resume` reuses the existing `model-config.json`. Add `--resume` to continue

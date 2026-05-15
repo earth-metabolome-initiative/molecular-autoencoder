@@ -1,5 +1,8 @@
 //! Dense counted-fingerprint autoencoder model and losses.
 
+#[cfg(feature = "std")]
+use std::path::Path;
+
 use burn::{
     nn::{Linear, LinearConfig, Relu},
     prelude::*,
@@ -13,6 +16,8 @@ use crate::{
     fingerprints::DEFAULT_ECFP_SIZE,
     ranking::weighted_tanimoto_ranking_output,
 };
+#[cfg(feature = "std")]
+use crate::{Error, Result};
 
 /// Encoder model configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +184,27 @@ impl Default for TanimotoRankingConfig {
     }
 }
 
+/// Flat runtime view of the Tanimoto geometry side task.
+///
+/// Bundles the per-task weight stored in [`AuxiliaryLossWeights`] with the
+/// shape and temperature parameters in [`TanimotoRankingConfig`] so training
+/// loops can pass a single value around without re-reading the model config.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TanimotoRankingRuntimeConfig {
+    /// Weight applied to the Tanimoto geometry loss component.
+    pub weight: f64,
+    /// Temperature applied to latent cosine logits.
+    pub latent_temperature: f64,
+    /// Compatibility field kept for diagnostics; unused by the softmax loss.
+    pub metric_temperature: f64,
+    /// Minimum counted Tanimoto gap required for an anchor to contribute.
+    pub min_gap: f64,
+    /// Random candidate partners sampled per anchor by the GPU kernel.
+    pub candidates_per_anchor: usize,
+    /// Maximum anchors used by the latent geometry loss; `0` means all rows.
+    pub pairs_per_batch: usize,
+}
+
 /// Full molecule autoencoder configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoleculeAutoencoderConfig {
@@ -232,6 +258,161 @@ impl MoleculeAutoencoderConfig {
             tanimoto_ranking: TanimotoRankingConfig::default(),
             latent_noise_std: default_latent_noise_std(),
         }
+    }
+
+    /// Assembles a symmetric MLP configuration from training-CLI components.
+    ///
+    /// Mirrors the inline `if !resume { ... }` block that the training bin used
+    /// to keep next to its CLI parser.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_components(
+        fingerprint_size: usize,
+        latent_width: usize,
+        hidden_widths: Vec<usize>,
+        descriptor_weight: f64,
+        tanimoto_ranking_weight: f64,
+        latent_noise_std: f64,
+        latent_temperature: f64,
+        metric_temperature: f64,
+        min_gap: f64,
+        candidates_per_anchor: usize,
+        pairs_per_batch: usize,
+    ) -> Self {
+        let mut config = Self::symmetric(fingerprint_size, latent_width, hidden_widths);
+        config.auxiliary_weights.descriptors = descriptor_weight;
+        config.auxiliary_weights.tanimoto_ranking = tanimoto_ranking_weight;
+        config.latent_noise_std = latent_noise_std;
+        config.tanimoto_ranking = TanimotoRankingConfig {
+            latent_temperature,
+            metric_temperature,
+            min_gap,
+            candidates_per_anchor,
+            pairs_per_batch,
+        };
+        config
+    }
+
+    /// Returns the flat runtime view of the Tanimoto geometry side task.
+    #[must_use]
+    pub fn tanimoto_ranking_runtime(&self) -> TanimotoRankingRuntimeConfig {
+        TanimotoRankingRuntimeConfig {
+            weight: self.auxiliary_weights.tanimoto_ranking,
+            latent_temperature: self.tanimoto_ranking.latent_temperature,
+            metric_temperature: self.tanimoto_ranking.metric_temperature,
+            min_gap: self.tanimoto_ranking.min_gap,
+            candidates_per_anchor: self.tanimoto_ranking.candidates_per_anchor,
+            pairs_per_batch: self.tanimoto_ranking.pairs_per_batch,
+        }
+    }
+
+    /// Checks the configuration against an expected sparse-input width and
+    /// the loss-weight invariants the training pipeline depends on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigInvalid`] when the encoder or decoder shape does
+    /// not match `expected_input_width`, or when any loss weight, temperature,
+    /// gap, or noise term is outside its valid range.
+    #[cfg(feature = "std")]
+    pub fn validate(&self, expected_input_width: usize) -> Result<()> {
+        let bail = |message: String| -> Result<()> { Err(Error::ConfigInvalid { message }) };
+
+        if self.encoder.input_width != expected_input_width {
+            return bail(format!(
+                "encoder input width {} does not match expected width {expected_input_width}",
+                self.encoder.input_width
+            ));
+        }
+        if self.decoder.output_width != expected_input_width {
+            return bail(format!(
+                "decoder output width {} does not match expected width {expected_input_width}",
+                self.decoder.output_width
+            ));
+        }
+        if self.encoder.hidden_widths.is_empty() {
+            return bail("encoder hidden widths must not be empty".to_string());
+        }
+        if self.encoder.latent_width == 0 || self.decoder.latent_width == 0 {
+            return bail("latent width must be greater than zero".to_string());
+        }
+        if self.encoder.latent_width != self.decoder.latent_width {
+            return bail(format!(
+                "encoder latent width {} does not match decoder latent width {}",
+                self.encoder.latent_width, self.decoder.latent_width
+            ));
+        }
+        if self.descriptor_width == 0 {
+            return bail("descriptor width must be greater than zero".to_string());
+        }
+        if !self.reconstruction_loss.beta.is_finite() || self.reconstruction_loss.beta <= 0.0 {
+            return bail(format!(
+                "reconstruction loss beta must be positive and finite, got {}",
+                self.reconstruction_loss.beta
+            ));
+        }
+        if self.reconstruction_loss.zero_weight < 0.0 || self.reconstruction_loss.nonzero_weight < 0.0
+        {
+            return bail("reconstruction loss weights must be non-negative".to_string());
+        }
+        if self.auxiliary_weights.descriptors < 0.0
+            || self.auxiliary_weights.tanimoto_ranking < 0.0
+        {
+            return bail("auxiliary loss weights must be non-negative".to_string());
+        }
+        if self.tanimoto_ranking.latent_temperature <= 0.0
+            || !self.tanimoto_ranking.latent_temperature.is_finite()
+        {
+            return bail(format!(
+                "tanimoto ranking latent temperature must be positive and finite, got {}",
+                self.tanimoto_ranking.latent_temperature
+            ));
+        }
+        if self.tanimoto_ranking.min_gap < 0.0 || !self.tanimoto_ranking.min_gap.is_finite() {
+            return bail(format!(
+                "tanimoto ranking min_gap must be non-negative and finite, got {}",
+                self.tanimoto_ranking.min_gap
+            ));
+        }
+        if !self.latent_noise_std.is_finite() || self.latent_noise_std < 0.0 {
+            return bail(format!(
+                "latent noise std must be non-negative and finite, got {}",
+                self.latent_noise_std
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads a configuration from a JSON file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the file cannot be opened and
+    /// [`Error::Json`] when the contents are not valid JSON for this type.
+    #[cfg(feature = "std")]
+    pub fn load_json(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path).map_err(|source| Error::io(path, source))?;
+        serde_json::from_reader(file).map_err(|source| Error::Json {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    /// Writes the configuration to a JSON file, pretty-printed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the file cannot be created and
+    /// [`Error::Json`] when serialization fails.
+    #[cfg(feature = "std")]
+    pub fn save_json(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let file = std::fs::File::create(path).map_err(|source| Error::io(path, source))?;
+        serde_json::to_writer_pretty(file, self).map_err(|source| Error::Json {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 
     /// Creates an initialized autoencoder.
@@ -796,6 +977,121 @@ mod tests {
                 .zip(noisy_reconstruction)
                 .any(|(clean, noisy)| (clean - noisy).abs() > 1.0e-6)
         );
+    }
+
+    #[test]
+    fn from_components_matches_symmetric_with_overrides() {
+        let config = MoleculeAutoencoderConfig::from_components(
+            64,
+            16,
+            vec![32, 24],
+            0.07,
+            0.13,
+            0.03,
+            0.20,
+            0.30,
+            0.04,
+            6,
+            8,
+        );
+
+        assert_eq!(config.encoder.input_width, 64);
+        assert_eq!(config.encoder.hidden_widths, vec![32, 24]);
+        assert_eq!(config.encoder.latent_width, 16);
+        assert_eq!(config.decoder.hidden_widths, vec![24, 32]);
+        assert_eq!(config.decoder.output_width, 64);
+        assert_eq!(config.auxiliary_weights.descriptors, 0.07);
+        assert_eq!(config.auxiliary_weights.tanimoto_ranking, 0.13);
+        assert_eq!(config.latent_noise_std, 0.03);
+        assert_eq!(config.tanimoto_ranking.latent_temperature, 0.20);
+        assert_eq!(config.tanimoto_ranking.metric_temperature, 0.30);
+        assert_eq!(config.tanimoto_ranking.min_gap, 0.04);
+        assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 6);
+        assert_eq!(config.tanimoto_ranking.pairs_per_batch, 8);
+    }
+
+    #[test]
+    fn tanimoto_ranking_runtime_view_packs_weight_and_shape() {
+        let config = MoleculeAutoencoderConfig::from_components(
+            32, 8, vec![16], 0.05, 0.11, 0.02, 0.15, 0.25, 0.05, 4, 0,
+        );
+        let runtime = config.tanimoto_ranking_runtime();
+
+        assert_eq!(runtime.weight, 0.11);
+        assert_eq!(runtime.latent_temperature, 0.15);
+        assert_eq!(runtime.metric_temperature, 0.25);
+        assert_eq!(runtime.min_gap, 0.05);
+        assert_eq!(runtime.candidates_per_anchor, 4);
+        assert_eq!(runtime.pairs_per_batch, 0);
+    }
+
+    #[test]
+    fn validate_accepts_default_configuration() {
+        let config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+
+        config
+            .validate(config.encoder.input_width)
+            .expect("default configuration should validate");
+    }
+
+    #[test]
+    fn validate_rejects_input_width_mismatch() {
+        let config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        let error = config
+            .validate(config.encoder.input_width + 1)
+            .expect_err("mismatched width should be rejected");
+
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("encoder input width")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_negative_weights_and_temperatures() {
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.auxiliary_weights.descriptors = -0.1;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("negative weight should be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("auxiliary")
+        ));
+
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.tanimoto_ranking.latent_temperature = 0.0;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("zero temperature should be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("latent temperature")
+        ));
+
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.latent_noise_std = -0.5;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("negative noise std should be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("latent noise")
+        ));
+    }
+
+    #[test]
+    fn load_and_save_json_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model-config.json");
+        let config = MoleculeAutoencoderConfig::from_components(
+            128, 32, vec![64, 48], 0.06, 0.12, 0.01, 0.18, 0.28, 0.03, 5, 7,
+        );
+
+        config.save_json(&path).expect("save");
+        let loaded = MoleculeAutoencoderConfig::load_json(&path).expect("load");
+
+        assert_eq!(loaded, config);
     }
 
     #[test]
