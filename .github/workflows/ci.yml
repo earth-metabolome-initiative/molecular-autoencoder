@@ -43,7 +43,10 @@ jobs:
 
   cuda:
     name: CUDA type-check
-    runs-on: ubuntu-latest
+    # Pin to 22.04 (jammy). NVIDIA only began publishing ubuntu2404 (noble)
+    # CUDA packages from 12.5 onwards, so the Jimver action's 12.4.x apt path
+    # fails on `ubuntu-latest` (24.04). 22.04 carries the full 12.x history.
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout
