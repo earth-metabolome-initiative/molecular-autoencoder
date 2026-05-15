@@ -28,7 +28,7 @@ Tanimoto geometry. The Tanimoto geometry loss uses gap-weighted sampled
 softmax cross-entropy over counted-Tanimoto candidate sets, with a default
 latent temperature of 0.10.
 
-Both commands below apply conservative quality gates during preprocessing —
+Both commands below apply conservative quality gates during preprocessing:
 a 50-1000 Da molecular-mass window, a 5-80 heavy-atom window, a
 neutral-ish formal-charge window, and a single-component cap that drops
 salts and mixtures. The mass ceiling is wide enough to cover small natural
@@ -87,7 +87,7 @@ cargo run --release --no-default-features --features std,cuda-fusion,train,tui,d
   --preprocess-threads 32 --cuda-device 0
 ```
 
-If you OOM, halve `--batch-size` (8192 / 4096 / 2048 — all still saturate
+If you OOM, halve `--batch-size` (8192 / 4096 / 2048, all still saturate
 the kernels) before touching anything else. Latency-sensitive iteration on
 the 4090 also benefits from `--max-train-batches 1000 --max-valid-batches 64`
 during architecture sweeps.
