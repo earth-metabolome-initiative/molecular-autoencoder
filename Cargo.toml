@@ -18,6 +18,11 @@ name = "train"
 path = "src/bin/train/main.rs"
 required-features = ["std", "train", "tui", "datasets"]
 
+[[bin]]
+name = "embed"
+path = "src/bin/embed/main.rs"
+required-features = ["std", "ndarray", "embed", "embed-mgf", "embed-parquet"]
+
 [features]
 default = ["std", "ndarray", "train", "tui"]
 std = [
@@ -35,17 +40,24 @@ cuda-fusion = ["cuda", "burn/fusion", "burn/autotune", "dep:burn-fusion", "dep:b
 cuda-no-fusion = ["cuda", "burn/autotune"]
 fingerprints = ["finge-rs/smiles-support"]
 datasets = ["std", "dep:indicatif", "dep:rayon", "smiles-parser/datasets"]
+embed = ["std", "ndarray", "dep:csv", "dep:clap"]
+embed-mgf = ["embed", "dep:mascot-rs"]
+embed-parquet = ["embed", "dep:parquet", "dep:arrow"]
 
 [dependencies]
+arrow = { version = "55", default-features = false, optional = true }
 burn = { version = "=0.21.0", default-features = false }
 burn-cubecl = { version = "=0.21.0", default-features = false, optional = true }
 burn-fusion = { version = "=0.21.0", default-features = false, optional = true }
 burn-ir = { version = "=0.21.0", default-features = false, optional = true }
 clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"], optional = true }
+csv = { version = "1", optional = true }
 cubecl = { version = "=0.10.0", default-features = false, optional = true }
 elements_rs = "0.2.7"
 finge-rs = { git = "https://github.com/earth-metabolome-initiative/finge-rs", default-features = false, features = ["smiles-support"] }
 indicatif = { version = "0.18", optional = true }
+mascot-rs = { git = "https://github.com/LucaCappelletti94/mascot-rs", optional = true }
+parquet = { version = "55", default-features = false, features = ["arrow", "snap", "zstd"], optional = true }
 rayon = { version = "1.11", optional = true }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }

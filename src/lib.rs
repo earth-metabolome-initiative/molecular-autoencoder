@@ -6,6 +6,10 @@
 
 pub mod batch;
 pub mod data;
+#[cfg(feature = "embed")]
+pub mod embed;
+#[cfg(feature = "std")]
+pub mod encoder;
 pub mod error;
 pub mod features;
 pub mod fingerprints;
@@ -66,3 +70,12 @@ pub use ranking::{
 };
 #[cfg(feature = "train")]
 pub use training::{MoleculeAutoencoderTrainingOutput, MoleculeTrainingMetricsExt};
+
+#[cfg(feature = "std")]
+pub use encoder::{EncodingRow, MoleculeEncoder};
+
+#[cfg(feature = "embed")]
+pub use embed::{
+    EncodingRecord, EncodingSchema, EncodingSink, MoleculeInput, MoleculeSource, SinkOptions,
+    SourceOptions, sink_for_path, source_for_path,
+};

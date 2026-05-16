@@ -30,16 +30,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check
-        run: cargo check --locked --no-default-features --features std,ndarray,train,tui,datasets --all-targets
+        run: cargo check --locked --no-default-features --features std,ndarray,train,tui,datasets,embed,embed-mgf,embed-parquet --all-targets
 
       - name: Clippy
-        run: cargo clippy --locked --no-default-features --features std,ndarray,train,tui,datasets --all-targets -- -D warnings
+        run: cargo clippy --locked --no-default-features --features std,ndarray,train,tui,datasets,embed,embed-mgf,embed-parquet --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked --no-default-features --features std,ndarray,train,datasets --all-targets
+        run: cargo test --locked --no-default-features --features std,ndarray,train,datasets,embed,embed-mgf,embed-parquet --all-targets
 
       - name: Documentation
-        run: cargo doc --locked --no-default-features --features std,ndarray,train,datasets --no-deps
+        run: cargo doc --locked --no-default-features --features std,ndarray,train,datasets,embed,embed-mgf,embed-parquet --no-deps
 
   cuda:
     name: CUDA type-check
@@ -72,17 +72,17 @@ jobs:
       - name: Check cuda-fusion path
         env:
           CUDARC_CUDA_VERSION: "12040"
-        run: cargo check --locked --no-default-features --features std,cuda-fusion,train,tui,datasets --all-targets
+        run: cargo check --locked --no-default-features --features std,cuda-fusion,train,tui,datasets,embed,embed-mgf,embed-parquet --all-targets
 
       - name: Check cuda-no-fusion path
         env:
           CUDARC_CUDA_VERSION: "12040"
-        run: cargo check --locked --no-default-features --features std,cuda-no-fusion,train,tui,datasets --all-targets
+        run: cargo check --locked --no-default-features --features std,cuda-no-fusion,train,tui,datasets,embed,embed-mgf,embed-parquet --all-targets
 
       - name: Clippy cuda-fusion
         env:
           CUDARC_CUDA_VERSION: "12040"
-        run: cargo clippy --locked --no-default-features --features std,cuda-fusion,train,tui,datasets --all-targets -- -D warnings
+        run: cargo clippy --locked --no-default-features --features std,cuda-fusion,train,tui,datasets,embed,embed-mgf,embed-parquet --all-targets -- -D warnings
 
   coverage:
     name: Coverage
@@ -109,7 +109,7 @@ jobs:
       - name: Generate coverage
         run: >-
           cargo tarpaulin --engine llvm --locked --no-default-features
-          --features std,ndarray,train,datasets
+          --features std,ndarray,train,datasets,embed,embed-mgf,embed-parquet
           --all-targets --out Xml --output-dir coverage
 
       - name: Upload coverage to Codecov
