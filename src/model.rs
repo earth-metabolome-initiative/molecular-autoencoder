@@ -44,7 +44,7 @@ pub const DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE: f64 = 0.10;
 pub const DEFAULT_TANIMOTO_RANKING_MIN_GAP: f64 = 0.05;
 
 /// Default number of random candidate partners sampled per anchor.
-pub const DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR: usize = 8;
+pub const DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR: usize = 16;
 
 /// Default max anchors per batch for the ranking loss (`0` uses all rows).
 pub const DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH: usize = 0;
@@ -1558,7 +1558,7 @@ mod tests {
         assert_eq!(config.tanimoto_ranking.latent_temperature, 0.10);
         assert_eq!(config.tanimoto_ranking.metric_temperature, 0.10);
         assert_eq!(config.tanimoto_ranking.min_gap, 0.05);
-        assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 8);
+        assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 16);
         assert_eq!(config.tanimoto_ranking.pairs_per_batch, 0);
         assert_eq!(config.latent_noise_std, 0.02);
     }
