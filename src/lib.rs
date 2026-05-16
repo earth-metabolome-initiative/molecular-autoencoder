@@ -47,12 +47,18 @@ pub use metrics::{
     batch_log_count_tanimoto, batch_sparse_log_count_tanimoto, count_tanimoto,
 };
 pub use model::{
-    AuxiliaryLossWeights, AuxiliaryLossWeightsBuilder, Decoder, DecoderConfig,
-    DecoderConfigBuilder, Encoder, EncoderConfig, EncoderConfigBuilder, MoleculeAutoencoder,
-    MoleculeAutoencoderConfig, MoleculeAutoencoderConfigBuilder, MoleculeAutoencoderOutput,
-    MoleculeLossBreakdown, ReconstructionLossConfig, ReconstructionLossConfigBuilder,
-    TanimotoRankingConfig, TanimotoRankingConfigBuilder, TanimotoRankingRuntimeConfig,
-    apply_latent_noise, weighted_sparse_log_count_huber_loss,
+    AuxiliaryLossWeights, AuxiliaryLossWeightsBuilder, DEFAULT_DESCRIPTOR_WEIGHT,
+    DEFAULT_HIDDEN_WIDTHS, DEFAULT_LATENT_NOISE_STD, DEFAULT_LATENT_WIDTH,
+    DEFAULT_RECONSTRUCTION_BETA, DEFAULT_RECONSTRUCTION_NONZERO_WEIGHT,
+    DEFAULT_RECONSTRUCTION_ZERO_WEIGHT, DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
+    DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE,
+    DEFAULT_TANIMOTO_RANKING_MIN_GAP, DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
+    DEFAULT_TANIMOTO_RANKING_WEIGHT, Decoder, DecoderConfig, DecoderConfigBuilder, Encoder,
+    EncoderConfig, EncoderConfigBuilder, MoleculeAutoencoder, MoleculeAutoencoderConfig,
+    MoleculeAutoencoderConfigBuilder, MoleculeAutoencoderOutput, MoleculeLossBreakdown,
+    ReconstructionLossConfig, ReconstructionLossConfigBuilder, TanimotoRankingConfig,
+    TanimotoRankingConfigBuilder, TanimotoRankingRuntimeConfig, apply_latent_noise,
+    weighted_sparse_log_count_huber_loss,
 };
 pub use ranking::{
     TanimotoRankingBatch, TanimotoRankingOutput, tanimoto_ranking_output,

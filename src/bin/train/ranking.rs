@@ -50,11 +50,15 @@ pub fn attach_tanimoto_ranking<B>(
     // `MoleculeAutoencoderConfig::validate` already enforces
     // `candidates_per_anchor >= 2` whenever the geometry loss weight is
     // positive, so the kernel builder cannot fail here.
+    // `MoleculeAutoencoderConfig::validate` already enforces
+    // `candidates_per_anchor >= 2` whenever the geometry loss weight is
+    // positive, and `epsilon` falls back to the builder default
+    // (`DEFAULT_KERNEL_EPSILON` in `tanimoto_cuda::api`), so the kernel
+    // builder cannot fail here.
     let kernel_config = CountedTanimotoRankingKernelConfig::builder()
         .batch_items(batch.fingerprints.batch_size())
         .candidates_per_anchor(config.candidates_per_anchor())
         .seed(seed)
-        .epsilon(1.0e-8)
         .build()
         .expect("Tanimoto kernel config is valid");
     let (candidate_index, best_candidate_position, top2_gap) =

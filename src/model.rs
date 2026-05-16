@@ -19,24 +19,67 @@ use crate::{
     ranking::weighted_tanimoto_ranking_output,
 };
 
+/// Default latent embedding width for the v1 architecture.
+pub const DEFAULT_LATENT_WIDTH: usize = 512;
+
+/// Default encoder hidden widths for the v1 architecture (decoder mirrors).
+pub const DEFAULT_HIDDEN_WIDTHS: [usize; 3] = [4096, 2048, 1024];
+
+/// Default descriptor regression loss weight.
+pub const DEFAULT_DESCRIPTOR_WEIGHT: f64 = 0.05;
+
+/// Default latent Tanimoto geometry loss weight.
+pub const DEFAULT_TANIMOTO_RANKING_WEIGHT: f64 = 0.10;
+
+/// Default decoder-side latent denoising noise as a fraction of batch std.
+pub const DEFAULT_LATENT_NOISE_STD: f64 = 0.02;
+
+/// Default latent cosine-logit temperature in the ranking softmax.
+pub const DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE: f64 = 0.10;
+
+/// Default compatibility metric temperature (unused by the softmax loss).
+pub const DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE: f64 = 0.10;
+
+/// Default minimum counted-Tanimoto gap below which an anchor is dropped.
+pub const DEFAULT_TANIMOTO_RANKING_MIN_GAP: f64 = 0.05;
+
+/// Default number of random candidate partners sampled per anchor.
+pub const DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR: usize = 8;
+
+/// Default max anchors per batch for the ranking loss (`0` uses all rows).
+pub const DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH: usize = 0;
+
+/// Default Huber transition point in log-count space.
+pub const DEFAULT_RECONSTRUCTION_BETA: f64 = 1.0;
+
+/// Default weight for zero-count bins in the reconstruction loss.
+pub const DEFAULT_RECONSTRUCTION_ZERO_WEIGHT: f64 = 0.05;
+
+/// Default weight for nonzero-count bins in the reconstruction loss.
+pub const DEFAULT_RECONSTRUCTION_NONZERO_WEIGHT: f64 = 1.0;
+
+// Serde requires `#[serde(default = "fn")]` to point at a callable, not a
+// `const`, so these tiny shim fns exist solely so deserializers can default
+// missing JSON fields. Their bodies must stay in sync with the public consts
+// above; do not edit one without the other.
 const fn default_descriptor_weight() -> f64 {
-    0.05
+    DEFAULT_DESCRIPTOR_WEIGHT
 }
 
 const fn default_tanimoto_ranking_weight() -> f64 {
-    0.10
+    DEFAULT_TANIMOTO_RANKING_WEIGHT
 }
 
 const fn default_latent_noise_std() -> f64 {
-    0.02
+    DEFAULT_LATENT_NOISE_STD
 }
 
 const fn default_tanimoto_ranking_latent_temperature() -> f64 {
-    0.10
+    DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE
 }
 
 const fn default_tanimoto_ranking_metric_temperature() -> f64 {
-    0.10
+    DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE
 }
 
 /// Encoder model configuration. Construct via [`EncoderConfig::builder`].
@@ -380,9 +423,9 @@ impl ReconstructionLossConfigBuilder {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            beta: 1.0,
-            zero_weight: 0.05,
-            nonzero_weight: 1.0,
+            beta: DEFAULT_RECONSTRUCTION_BETA,
+            zero_weight: DEFAULT_RECONSTRUCTION_ZERO_WEIGHT,
+            nonzero_weight: DEFAULT_RECONSTRUCTION_NONZERO_WEIGHT,
         }
     }
 
@@ -496,8 +539,8 @@ impl AuxiliaryLossWeightsBuilder {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            descriptors: default_descriptor_weight(),
-            tanimoto_ranking: default_tanimoto_ranking_weight(),
+            descriptors: DEFAULT_DESCRIPTOR_WEIGHT,
+            tanimoto_ranking: DEFAULT_TANIMOTO_RANKING_WEIGHT,
         }
     }
 
@@ -623,11 +666,11 @@ impl TanimotoRankingConfigBuilder {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            latent_temperature: default_tanimoto_ranking_latent_temperature(),
-            metric_temperature: default_tanimoto_ranking_metric_temperature(),
-            min_gap: 0.05,
-            candidates_per_anchor: 4,
-            pairs_per_batch: 0,
+            latent_temperature: DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE,
+            metric_temperature: DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE,
+            min_gap: DEFAULT_TANIMOTO_RANKING_MIN_GAP,
+            candidates_per_anchor: DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
+            pairs_per_batch: DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
         }
     }
 
@@ -1053,16 +1096,16 @@ impl MoleculeAutoencoderConfigBuilder {
     pub fn new() -> Self {
         Self {
             fingerprint_size: DEFAULT_ECFP_SIZE,
-            latent_width: 512,
-            hidden_widths: vec![4096, 2048, 1024],
-            descriptor_weight: default_descriptor_weight(),
-            tanimoto_ranking_weight: default_tanimoto_ranking_weight(),
-            latent_noise_std: default_latent_noise_std(),
-            latent_temperature: default_tanimoto_ranking_latent_temperature(),
-            metric_temperature: default_tanimoto_ranking_metric_temperature(),
-            min_gap: 0.05,
-            candidates_per_anchor: 4,
-            pairs_per_batch: 0,
+            latent_width: DEFAULT_LATENT_WIDTH,
+            hidden_widths: DEFAULT_HIDDEN_WIDTHS.to_vec(),
+            descriptor_weight: DEFAULT_DESCRIPTOR_WEIGHT,
+            tanimoto_ranking_weight: DEFAULT_TANIMOTO_RANKING_WEIGHT,
+            latent_noise_std: DEFAULT_LATENT_NOISE_STD,
+            latent_temperature: DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE,
+            metric_temperature: DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE,
+            min_gap: DEFAULT_TANIMOTO_RANKING_MIN_GAP,
+            candidates_per_anchor: DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
+            pairs_per_batch: DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
         }
     }
 
@@ -1515,7 +1558,7 @@ mod tests {
         assert_eq!(config.tanimoto_ranking.latent_temperature, 0.10);
         assert_eq!(config.tanimoto_ranking.metric_temperature, 0.10);
         assert_eq!(config.tanimoto_ranking.min_gap, 0.05);
-        assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 4);
+        assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 8);
         assert_eq!(config.tanimoto_ranking.pairs_per_batch, 0);
         assert_eq!(config.latent_noise_std, 0.02);
     }

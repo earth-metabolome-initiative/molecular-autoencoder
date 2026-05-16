@@ -3,7 +3,13 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use molecular_autoencoder::{MoleculeAutoencoderConfig, SmilesQualityFilter};
+use molecular_autoencoder::{
+    DEFAULT_DESCRIPTOR_WEIGHT, DEFAULT_HIDDEN_WIDTHS, DEFAULT_LATENT_NOISE_STD,
+    DEFAULT_LATENT_WIDTH, DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
+    DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE,
+    DEFAULT_TANIMOTO_RANKING_MIN_GAP, DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
+    DEFAULT_TANIMOTO_RANKING_WEIGHT, MoleculeAutoencoderConfig, SmilesQualityFilter,
+};
 
 use crate::{AppResult, invalid_input};
 
@@ -181,15 +187,15 @@ pub struct Args {
     pub learning_rate: f64,
 
     /// Latent embedding width.
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = DEFAULT_LATENT_WIDTH)]
     pub latent_width: usize,
 
     /// Decoder-side latent denoising noise as fraction of batch latent std.
-    #[arg(long, default_value_t = 0.02)]
+    #[arg(long, default_value_t = DEFAULT_LATENT_NOISE_STD)]
     pub latent_noise_std: f64,
 
     /// Encoder hidden widths, comma-separated.
-    #[arg(long, value_delimiter = ',', default_values_t = [4096_usize, 2048, 1024])]
+    #[arg(long, value_delimiter = ',', default_values_t = DEFAULT_HIDDEN_WIDTHS)]
     pub hidden_widths: Vec<usize>,
 
     /// Checkpoint every N epochs (0 disables).
@@ -229,31 +235,31 @@ pub struct Args {
     pub metric_every: usize,
 
     /// Descriptor regression loss weight.
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, default_value_t = DEFAULT_DESCRIPTOR_WEIGHT)]
     pub descriptor_weight: f64,
 
     /// Latent Tanimoto geometry loss weight.
-    #[arg(long, default_value_t = 0.10)]
+    #[arg(long, default_value_t = DEFAULT_TANIMOTO_RANKING_WEIGHT)]
     pub tanimoto_ranking_weight: f64,
 
     /// Latent cosine-logit temperature (alias: --tanimoto-ranking-margin).
-    #[arg(long, alias = "tanimoto-ranking-margin", default_value_t = 0.10)]
+    #[arg(long, alias = "tanimoto-ranking-margin", default_value_t = DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE)]
     pub tanimoto_ranking_latent_temperature: f64,
 
     /// Compatibility metric temperature (unused by the softmax loss).
-    #[arg(long, default_value_t = 0.10)]
+    #[arg(long, default_value_t = DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE)]
     pub tanimoto_ranking_metric_temperature: f64,
 
     /// Minimum counted-Tanimoto gap an anchor must clear to contribute.
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, default_value_t = DEFAULT_TANIMOTO_RANKING_MIN_GAP)]
     pub tanimoto_ranking_min_gap: f64,
 
     /// Random candidate partners sampled per anchor (must be >= 2).
-    #[arg(long, default_value_t = 4, value_parser = positive_usize)]
+    #[arg(long, default_value_t = DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR, value_parser = positive_usize)]
     pub tanimoto_ranking_candidates: usize,
 
     /// Max anchors used by the geometry loss (0 uses all rows).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH)]
     pub tanimoto_ranking_pairs_per_batch: usize,
 
     /// Resume from the checkpoint directory.

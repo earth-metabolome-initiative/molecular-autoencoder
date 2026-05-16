@@ -78,6 +78,9 @@ impl Default for CountedTanimotoRankingKernelConfigBuilder {
     }
 }
 
+/// Default numerical stabilizer for the counted-Tanimoto kernel.
+pub const DEFAULT_KERNEL_EPSILON: f64 = 1.0e-8;
+
 impl CountedTanimotoRankingKernelConfigBuilder {
     /// Creates a builder with sensible defaults; `batch_items` must be set
     /// before `build`.
@@ -85,9 +88,9 @@ impl CountedTanimotoRankingKernelConfigBuilder {
     pub const fn new() -> Self {
         Self {
             batch_items: None,
-            candidates_per_anchor: 4,
+            candidates_per_anchor: crate::model::DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
             seed: 0,
-            epsilon: 1.0e-8,
+            epsilon: DEFAULT_KERNEL_EPSILON,
         }
     }
 
