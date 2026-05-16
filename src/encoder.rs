@@ -49,7 +49,7 @@ pub struct EncodingRow {
 /// **Fingerprint radius assumption:** `model-config.json` records the
 /// model architecture but not the ECFP radius used during training. This
 /// type therefore reconstructs fingerprints at the v1 default radius
-/// ([`DEFAULT_ECFP_RADIUS`](crate::fingerprints::DEFAULT_ECFP_RADIUS) = 2)
+/// ([`DEFAULT_ECFP_RADIUS`] = 2)
 /// for every checkpoint. The training bin currently has no `--ecfp-radius`
 /// flag and always uses the default, so this matches every checkpoint we
 /// produce today; if that ever changes the radius needs to move into
