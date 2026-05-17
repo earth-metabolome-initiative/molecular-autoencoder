@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use molecular_autoencoder::{
+    DEFAULT_BCE_NONZERO_WEIGHT, DEFAULT_BCE_WEIGHT, DEFAULT_BCE_ZERO_WEIGHT,
     DEFAULT_DESCRIPTOR_WEIGHT, DEFAULT_ECFP_RADIUS, DEFAULT_HIDDEN_WIDTHS,
     DEFAULT_LATENT_NOISE_STD, DEFAULT_LATENT_WIDTH, DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
     DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE,
@@ -309,6 +310,18 @@ pub struct Args {
     /// Morgan/ECFP radius for counted fingerprints (must be >= 1).
     #[arg(long, default_value_t = DEFAULT_ECFP_RADIUS, value_parser = positive_u8)]
     pub ecfp_radius: u8,
+
+    /// Auxiliary BCE-with-logits reconstruction loss weight (`0.0` disables it).
+    #[arg(long, default_value_t = DEFAULT_BCE_WEIGHT)]
+    pub bce_weight: f64,
+
+    /// Per-position weight applied to inactive bins inside the BCE term.
+    #[arg(long, default_value_t = DEFAULT_BCE_ZERO_WEIGHT)]
+    pub bce_zero_weight: f64,
+
+    /// Per-position weight applied to active bins inside the BCE term.
+    #[arg(long, default_value_t = DEFAULT_BCE_NONZERO_WEIGHT)]
+    pub bce_nonzero_weight: f64,
 }
 
 impl Args {
@@ -362,6 +375,9 @@ impl Args {
             .tanimoto_ranking_candidates(self.tanimoto_ranking_candidates)
             .tanimoto_ranking_pairs_per_batch(self.tanimoto_ranking_pairs_per_batch)
             .ecfp_radius(ecfp_radius)
+            .bce_weight(self.bce_weight)
+            .bce_zero_weight(self.bce_zero_weight)
+            .bce_nonzero_weight(self.bce_nonzero_weight)
             .build()
             .map_err(Into::into)
     }
@@ -578,6 +594,10 @@ mod tests {
         assert_eq!(config.auxiliary_weights().tanimoto_ranking(), 0.13);
         assert_eq!(config.tanimoto_ranking().candidates_per_anchor(), 5);
         assert_eq!(config.ecfp_radius(), 3);
+        assert_eq!(
+            config.reconstruction_loss().bce_weight(),
+            DEFAULT_BCE_WEIGHT
+        );
     }
 
     #[test]

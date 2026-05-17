@@ -15,6 +15,7 @@ use crate::{AppResult, dataloader::BatchLoadProfile, invalid_input};
 pub struct BatchLossMetrics {
     pub loss: f32,
     pub reconstruction: f32,
+    pub reconstruction_bce: f32,
     pub descriptors: f32,
     pub tanimoto_ranking: f32,
     pub tanimoto_ranking_accuracy: f32,
@@ -48,6 +49,7 @@ where
     let data = Transaction::default()
         .register(loss)
         .register(losses.reconstruction.clone())
+        .register(losses.reconstruction_bce.clone())
         .register(losses.descriptors.clone())
         .register(losses.tanimoto_ranking.clone())
         .register(losses.tanimoto_ranking_accuracy.clone())
@@ -55,20 +57,21 @@ where
         .register(binary_tanimoto)
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read training metrics: {source}")))?;
-    if data.len() != 7 {
+    if data.len() != 8 {
         return Err(invalid_input(format!(
-            "training metrics transaction returned {} tensors instead of 7",
+            "training metrics transaction returned {} tensors instead of 8",
             data.len()
         )));
     }
     Ok(BatchLossMetrics {
         loss: scalar_data(&data[0], "loss")?,
         reconstruction: scalar_data(&data[1], "reconstruction loss")?,
-        descriptors: scalar_data(&data[2], "descriptor loss")?,
-        tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
-        tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
-        count_tanimoto: scalar_data(&data[5], "count Tanimoto")?,
-        binary_tanimoto: scalar_data(&data[6], "binary Tanimoto")?,
+        reconstruction_bce: scalar_data(&data[2], "reconstruction BCE loss")?,
+        descriptors: scalar_data(&data[3], "descriptor loss")?,
+        tanimoto_ranking: scalar_data(&data[4], "Tanimoto geometry loss")?,
+        tanimoto_ranking_accuracy: scalar_data(&data[5], "Tanimoto geometry accuracy")?,
+        count_tanimoto: scalar_data(&data[6], "count Tanimoto")?,
+        binary_tanimoto: scalar_data(&data[7], "binary Tanimoto")?,
     })
 }
 
@@ -86,6 +89,7 @@ where
     let data = Transaction::default()
         .register(loss)
         .register(losses.reconstruction.clone())
+        .register(losses.reconstruction_bce.clone())
         .register(losses.descriptors.clone())
         .register(losses.tanimoto_ranking.clone())
         .register(losses.tanimoto_ranking_accuracy.clone())
@@ -93,21 +97,22 @@ where
         .register(binary_tanimoto)
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read validation metrics: {source}")))?;
-    if data.len() != 7 {
+    if data.len() != 8 {
         return Err(invalid_input(format!(
-            "validation metrics transaction returned {} tensors instead of 7",
+            "validation metrics transaction returned {} tensors instead of 8",
             data.len()
         )));
     }
-    let count_tanimoto = scalar_data(&data[5], "count Tanimoto")?;
-    let binary_tanimoto = scalar_data(&data[6], "binary Tanimoto")?;
+    let count_tanimoto = scalar_data(&data[6], "count Tanimoto")?;
+    let binary_tanimoto = scalar_data(&data[7], "binary Tanimoto")?;
     Ok((
         BatchLossMetrics {
             loss: scalar_data(&data[0], "loss")?,
             reconstruction: scalar_data(&data[1], "reconstruction loss")?,
-            descriptors: scalar_data(&data[2], "descriptor loss")?,
-            tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
-            tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
+            reconstruction_bce: scalar_data(&data[2], "reconstruction BCE loss")?,
+            descriptors: scalar_data(&data[3], "descriptor loss")?,
+            tanimoto_ranking: scalar_data(&data[4], "Tanimoto geometry loss")?,
+            tanimoto_ranking_accuracy: scalar_data(&data[5], "Tanimoto geometry accuracy")?,
             count_tanimoto,
             binary_tanimoto,
         },

@@ -100,7 +100,7 @@ where
         args.loader_profile_every
     };
     println!(
-        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_latent_temperature={} tanimoto_ranking_metric_temperature={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={}",
+        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_latent_temperature={} tanimoto_ranking_metric_temperature={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={} bce_weight={} bce_zero_weight={} bce_nonzero_weight={}",
         manifest_path.display(),
         shards.len(),
         args.checkpoint_dir.display(),
@@ -120,7 +120,10 @@ where
         tanimoto_ranking.metric_temperature(),
         tanimoto_ranking.min_gap(),
         tanimoto_ranking.candidates_per_anchor(),
-        tanimoto_ranking.pairs_per_batch()
+        tanimoto_ranking.pairs_per_batch(),
+        model_config.reconstruction_loss().bce_weight(),
+        model_config.reconstruction_loss().bce_zero_weight(),
+        model_config.reconstruction_loss().bce_nonzero_weight()
     );
 
     for epoch in (state.completed_epoch + 1)..=args.epochs {

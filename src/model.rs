@@ -58,6 +58,18 @@ pub const DEFAULT_RECONSTRUCTION_ZERO_WEIGHT: f64 = 0.05;
 /// Default weight for nonzero-count bins in the reconstruction loss.
 pub const DEFAULT_RECONSTRUCTION_NONZERO_WEIGHT: f64 = 1.0;
 
+/// Default weight for the bit-presence BCE auxiliary reconstruction loss.
+pub const DEFAULT_BCE_WEIGHT: f64 = 1.0;
+
+/// Default per-position weight applied to inactive bins inside the BCE term.
+///
+/// Higher than the Huber zero weight so the BCE actually drives non-target
+/// logits negative instead of letting them leak slightly above zero.
+pub const DEFAULT_BCE_ZERO_WEIGHT: f64 = 4.0;
+
+/// Default per-position weight applied to active bins inside the BCE term.
+pub const DEFAULT_BCE_NONZERO_WEIGHT: f64 = 1.0;
+
 // Serde requires `#[serde(default = "fn")]` to point at a callable, not a
 // `const`, so these tiny shim fns exist solely so deserializers can default
 // missing JSON fields. Their bodies must stay in sync with the public consts
@@ -84,6 +96,18 @@ const fn default_tanimoto_ranking_metric_temperature() -> f64 {
 
 const fn default_ecfp_radius() -> u8 {
     DEFAULT_ECFP_RADIUS
+}
+
+const fn default_bce_weight() -> f64 {
+    DEFAULT_BCE_WEIGHT
+}
+
+const fn default_bce_zero_weight() -> f64 {
+    DEFAULT_BCE_ZERO_WEIGHT
+}
+
+const fn default_bce_nonzero_weight() -> f64 {
+    DEFAULT_BCE_NONZERO_WEIGHT
 }
 
 /// Encoder model configuration. Construct via [`EncoderConfig::builder`].
@@ -372,6 +396,12 @@ pub struct ReconstructionLossConfig {
     beta: f64,
     zero_weight: f64,
     nonzero_weight: f64,
+    #[serde(default = "default_bce_weight")]
+    bce_weight: f64,
+    #[serde(default = "default_bce_zero_weight")]
+    bce_zero_weight: f64,
+    #[serde(default = "default_bce_nonzero_weight")]
+    bce_nonzero_weight: f64,
 }
 
 impl Default for ReconstructionLossConfig {
@@ -406,6 +436,25 @@ impl ReconstructionLossConfig {
     pub const fn nonzero_weight(&self) -> f64 {
         self.nonzero_weight
     }
+
+    /// Auxiliary bit-presence BCE-with-logits loss weight. Set to `0.0` to
+    /// disable the BCE term entirely.
+    #[must_use]
+    pub const fn bce_weight(&self) -> f64 {
+        self.bce_weight
+    }
+
+    /// Per-position weight applied to inactive bins inside the BCE term.
+    #[must_use]
+    pub const fn bce_zero_weight(&self) -> f64 {
+        self.bce_zero_weight
+    }
+
+    /// Per-position weight applied to active bins inside the BCE term.
+    #[must_use]
+    pub const fn bce_nonzero_weight(&self) -> f64 {
+        self.bce_nonzero_weight
+    }
 }
 
 /// Fluent builder for [`ReconstructionLossConfig`].
@@ -414,6 +463,9 @@ pub struct ReconstructionLossConfigBuilder {
     beta: f64,
     zero_weight: f64,
     nonzero_weight: f64,
+    bce_weight: f64,
+    bce_zero_weight: f64,
+    bce_nonzero_weight: f64,
 }
 
 impl Default for ReconstructionLossConfigBuilder {
@@ -430,6 +482,9 @@ impl ReconstructionLossConfigBuilder {
             beta: DEFAULT_RECONSTRUCTION_BETA,
             zero_weight: DEFAULT_RECONSTRUCTION_ZERO_WEIGHT,
             nonzero_weight: DEFAULT_RECONSTRUCTION_NONZERO_WEIGHT,
+            bce_weight: DEFAULT_BCE_WEIGHT,
+            bce_zero_weight: DEFAULT_BCE_ZERO_WEIGHT,
+            bce_nonzero_weight: DEFAULT_BCE_NONZERO_WEIGHT,
         }
     }
 
@@ -454,6 +509,27 @@ impl ReconstructionLossConfigBuilder {
         self
     }
 
+    /// Sets the BCE auxiliary loss weight (`0.0` disables the BCE term).
+    #[must_use]
+    pub const fn bce_weight(mut self, value: f64) -> Self {
+        self.bce_weight = value;
+        self
+    }
+
+    /// Sets the per-position weight applied to inactive bins inside the BCE term.
+    #[must_use]
+    pub const fn bce_zero_weight(mut self, value: f64) -> Self {
+        self.bce_zero_weight = value;
+        self
+    }
+
+    /// Sets the per-position weight applied to active bins inside the BCE term.
+    #[must_use]
+    pub const fn bce_nonzero_weight(mut self, value: f64) -> Self {
+        self.bce_nonzero_weight = value;
+        self
+    }
+
     /// Validates and builds the immutable [`ReconstructionLossConfig`].
     ///
     /// # Errors
@@ -472,6 +548,9 @@ impl ReconstructionLossConfigBuilder {
         for (label, value) in [
             ("zero_weight", self.zero_weight),
             ("nonzero_weight", self.nonzero_weight),
+            ("bce_weight", self.bce_weight),
+            ("bce_zero_weight", self.bce_zero_weight),
+            ("bce_nonzero_weight", self.bce_nonzero_weight),
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(Error::ConfigInvalid {
@@ -483,6 +562,9 @@ impl ReconstructionLossConfigBuilder {
             beta: self.beta,
             zero_weight: self.zero_weight,
             nonzero_weight: self.nonzero_weight,
+            bce_weight: self.bce_weight,
+            bce_zero_weight: self.bce_zero_weight,
+            bce_nonzero_weight: self.bce_nonzero_weight,
         })
     }
 }
@@ -1064,6 +1146,9 @@ impl MoleculeAutoencoderConfig {
             reconstruction_beta: self.reconstruction_loss.beta,
             zero_weight: self.reconstruction_loss.zero_weight,
             nonzero_weight: self.reconstruction_loss.nonzero_weight,
+            bce_weight: self.reconstruction_loss.bce_weight,
+            bce_zero_weight: self.reconstruction_loss.bce_zero_weight,
+            bce_nonzero_weight: self.reconstruction_loss.bce_nonzero_weight,
             descriptor_weight: self.auxiliary_weights.descriptors,
             tanimoto_ranking_weight: self.auxiliary_weights.tanimoto_ranking,
             tanimoto_ranking_latent_temperature: self.tanimoto_ranking.latent_temperature,
@@ -1101,6 +1186,9 @@ pub struct MoleculeAutoencoderConfigBuilder {
     candidates_per_anchor: usize,
     pairs_per_batch: usize,
     ecfp_radius: u8,
+    bce_weight: f64,
+    bce_zero_weight: f64,
+    bce_nonzero_weight: f64,
 }
 
 impl Default for MoleculeAutoencoderConfigBuilder {
@@ -1126,6 +1214,9 @@ impl MoleculeAutoencoderConfigBuilder {
             candidates_per_anchor: DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
             pairs_per_batch: DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
             ecfp_radius: DEFAULT_ECFP_RADIUS,
+            bce_weight: DEFAULT_BCE_WEIGHT,
+            bce_zero_weight: DEFAULT_BCE_ZERO_WEIGHT,
+            bce_nonzero_weight: DEFAULT_BCE_NONZERO_WEIGHT,
         }
     }
 
@@ -1213,6 +1304,27 @@ impl MoleculeAutoencoderConfigBuilder {
         self
     }
 
+    /// Sets the BCE auxiliary reconstruction loss weight (`0.0` disables it).
+    #[must_use]
+    pub const fn bce_weight(mut self, value: f64) -> Self {
+        self.bce_weight = value;
+        self
+    }
+
+    /// Sets the per-position weight applied to inactive bins inside the BCE term.
+    #[must_use]
+    pub const fn bce_zero_weight(mut self, value: f64) -> Self {
+        self.bce_zero_weight = value;
+        self
+    }
+
+    /// Sets the per-position weight applied to active bins inside the BCE term.
+    #[must_use]
+    pub const fn bce_nonzero_weight(mut self, value: f64) -> Self {
+        self.bce_nonzero_weight = value;
+        self
+    }
+
     /// Validates the configured fields and builds the immutable config.
     ///
     /// # Errors
@@ -1237,7 +1349,11 @@ impl MoleculeAutoencoderConfigBuilder {
                 output_width: fingerprint_size,
             },
             descriptor_width: REGRESSION_TARGET_WIDTH,
-            reconstruction_loss: ReconstructionLossConfig::default(),
+            reconstruction_loss: ReconstructionLossConfig::builder()
+                .bce_weight(self.bce_weight)
+                .bce_zero_weight(self.bce_zero_weight)
+                .bce_nonzero_weight(self.bce_nonzero_weight)
+                .build()?,
             auxiliary_weights: AuxiliaryLossWeights {
                 descriptors: self.descriptor_weight,
                 tanimoto_ranking: self.tanimoto_ranking_weight,
@@ -1336,8 +1452,12 @@ pub struct MoleculeAutoencoderOutput<B: Backend> {
 /// Weighted loss components.
 #[derive(Debug)]
 pub struct MoleculeLossBreakdown<B: Backend> {
-    /// Main counted ECFP reconstruction loss.
+    /// Main counted ECFP reconstruction Huber loss.
     pub reconstruction: Tensor<B, 1>,
+    /// Auxiliary bit-presence BCE-with-logits loss over the same logits as
+    /// the reconstruction term. Already multiplied by the configured
+    /// `bce_weight`; zero when the BCE term is disabled.
+    pub reconstruction_bce: Tensor<B, 1>,
     /// Weighted descriptor regression loss.
     pub descriptors: Tensor<B, 1>,
     /// Weighted latent Tanimoto sampled softmax cross-entropy loss.
@@ -1351,7 +1471,10 @@ pub struct MoleculeLossBreakdown<B: Backend> {
 impl<B: Backend> MoleculeLossBreakdown<B> {
     /// Returns the weighted total loss.
     pub fn total(&self) -> Tensor<B, 1> {
-        self.reconstruction.clone() + self.descriptors.clone() + self.tanimoto_ranking.clone()
+        self.reconstruction.clone()
+            + self.reconstruction_bce.clone()
+            + self.descriptors.clone()
+            + self.tanimoto_ranking.clone()
     }
 }
 
@@ -1364,6 +1487,9 @@ pub struct MoleculeAutoencoder<B: Backend> {
     reconstruction_beta: f64,
     zero_weight: f64,
     nonzero_weight: f64,
+    bce_weight: f64,
+    bce_zero_weight: f64,
+    bce_nonzero_weight: f64,
     descriptor_weight: f64,
     tanimoto_ranking_weight: f64,
     tanimoto_ranking_latent_temperature: f64,
@@ -1379,6 +1505,9 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             beta: self.reconstruction_beta,
             zero_weight: self.zero_weight,
             nonzero_weight: self.nonzero_weight,
+            bce_weight: self.bce_weight,
+            bce_zero_weight: self.bce_zero_weight,
+            bce_nonzero_weight: self.bce_nonzero_weight,
         }
     }
 
@@ -1441,6 +1570,16 @@ impl<B: Backend> MoleculeAutoencoder<B> {
     ) -> MoleculeLossBreakdown<B> {
         let device = output.reconstructed_log_counts.device();
         let latent = output.latent;
+        let reconstruction_bce = if self.bce_weight > 0.0 {
+            weighted_sparse_log_count_bce_loss(
+                output.reconstructed_log_counts.clone(),
+                &fingerprints,
+                self.bce_zero_weight,
+                self.bce_nonzero_weight,
+            ) * self.bce_weight
+        } else {
+            Tensor::zeros([1], &device)
+        };
         let reconstruction = weighted_sparse_log_count_huber_loss(
             output.reconstructed_log_counts,
             fingerprints,
@@ -1466,6 +1605,7 @@ impl<B: Backend> MoleculeAutoencoder<B> {
 
         MoleculeLossBreakdown {
             reconstruction,
+            reconstruction_bce,
             descriptors,
             tanimoto_ranking: tanimoto.loss,
             tanimoto_ranking_accuracy: tanimoto.accuracy,
@@ -1524,6 +1664,55 @@ pub fn weighted_log_count_huber_loss<B: Backend>(
     let weights =
         nonzero.clone() * config.nonzero_weight + (nonzero * -1.0 + 1.0) * config.zero_weight;
     (huber * weights).mean()
+}
+
+fn softplus<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
+    // Numerically stable softplus: max(x, 0) + log(1 + exp(-|x|)).
+    let neg_abs = x.clone().abs() * -1.0;
+    x.clamp_min(0.0) + (neg_abs.exp() + 1.0).log()
+}
+
+/// Per-position weighted BCE-with-logits loss against the sparse fingerprint
+/// bit-presence target.
+///
+/// Treats `predicted_log_counts` as logits directly: `sigmoid(x) > 0.5` ⇔
+/// `x > 0`, the same threshold the binary Tanimoto metric uses. The
+/// computation mirrors [`weighted_sparse_log_count_huber_loss`] — assume the
+/// target bit is zero everywhere, then correct at the sparse active indices.
+///
+/// # Panics
+///
+/// Panics when the predicted dense reconstruction shape does not match the
+/// sparse target batch size and fingerprint width.
+#[must_use]
+pub fn weighted_sparse_log_count_bce_loss<B: Backend>(
+    predicted_log_counts: Tensor<B, 2>,
+    target: &SparseFingerprintBatch<B>,
+    zero_weight: f64,
+    nonzero_weight: f64,
+) -> Tensor<B, 1> {
+    let predicted_dims = predicted_log_counts.dims();
+    assert_eq!(
+        predicted_dims[0],
+        target.batch_size(),
+        "predicted and target batches must have the same row count"
+    );
+    assert_eq!(
+        predicted_dims[1], target.fingerprint_size,
+        "predicted reconstruction width must match sparse fingerprint width"
+    );
+
+    let denominator = (predicted_dims[0] * predicted_dims[1]) as f64;
+    // BCE(logits, target=0) = softplus(logits); BCE(logits, target=1) = softplus(-logits).
+    let zero_bce = softplus(predicted_log_counts.clone());
+    let zero_total = zero_bce.sum() * zero_weight;
+    let predicted_nonzero = predicted_log_counts.gather(1, target.indices.clone());
+    let active_bce = softplus(predicted_nonzero.clone() * -1.0);
+    let zero_at_active_bce = softplus(predicted_nonzero);
+    let correction =
+        (active_bce * nonzero_weight - zero_at_active_bce * zero_weight) * target.mask.clone();
+
+    (zero_total + correction.sum()) / denominator
 }
 
 /// Weighted Huber loss over sparse `log1p(count)` reconstruction targets.
@@ -1590,6 +1779,15 @@ mod tests {
         assert_eq!(config.tanimoto_ranking.pairs_per_batch, 0);
         assert_eq!(config.latent_noise_std, 0.02);
         assert_eq!(config.ecfp_radius, DEFAULT_ECFP_RADIUS);
+        assert_eq!(config.reconstruction_loss.bce_weight, DEFAULT_BCE_WEIGHT);
+        assert_eq!(
+            config.reconstruction_loss.bce_zero_weight,
+            DEFAULT_BCE_ZERO_WEIGHT
+        );
+        assert_eq!(
+            config.reconstruction_loss.bce_nonzero_weight,
+            DEFAULT_BCE_NONZERO_WEIGHT
+        );
     }
 
     #[test]
@@ -1682,17 +1880,94 @@ mod tests {
             ),
             &device,
         );
-        let config = ReconstructionLossConfig {
-            beta: 0.7,
-            zero_weight: 0.05,
-            nonzero_weight: 1.0,
-        };
+        let config = ReconstructionLossConfig::builder()
+            .beta(0.7)
+            .zero_weight(0.05)
+            .nonzero_weight(1.0)
+            .build()
+            .expect("reconstruction config");
 
         let dense = weighted_log_count_huber_loss(predicted.clone(), dense_target, config);
         let sparse = weighted_sparse_log_count_huber_loss(predicted, batch.fingerprints, config);
 
         let delta = (dense.into_scalar() - sparse.into_scalar()).abs();
         assert!(delta < 1.0e-6, "dense and sparse loss differ by {delta}");
+    }
+
+    #[test]
+    fn sparse_bce_matches_cpu_reference_with_weighted_zeros() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(4, REGRESSION_TARGET_WIDTH);
+        let batch = batcher.batch(
+            vec![MoleculeAutoencoderSample {
+                cid: 1,
+                fingerprint_indices: vec![0, 2],
+                fingerprint_counts: vec![2, 1],
+                descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+            }],
+            &device,
+        );
+        // Logits at positions 0 (active), 1 (inactive leak), 2 (active), 3 (clean inactive).
+        let predicted = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![1.0_f32, 0.5, -0.2, -1.5], [1, 4]),
+            &device,
+        );
+        let zero_weight = 4.0;
+        let nonzero_weight = 1.0;
+        let actual = weighted_sparse_log_count_bce_loss(
+            predicted.clone(),
+            &batch.fingerprints,
+            zero_weight,
+            nonzero_weight,
+        )
+        .into_scalar();
+
+        // CPU reference: BCE(logit, target) = softplus(logit) - logit * target.
+        let logits = [1.0_f32, 0.5, -0.2, -1.5];
+        let targets = [1.0_f32, 0.0, 1.0, 0.0];
+        let per_position: Vec<f32> = logits
+            .iter()
+            .zip(targets)
+            .map(|(&logit, target)| {
+                let softplus = logit.max(0.0) + (-logit.abs()).exp().ln_1p();
+                let weight = if target > 0.0 {
+                    nonzero_weight as f32
+                } else {
+                    zero_weight as f32
+                };
+                (softplus - logit * target) * weight
+            })
+            .collect();
+        let expected = per_position.iter().sum::<f32>() / per_position.len() as f32;
+        assert!(
+            (actual - expected).abs() < 1.0e-5,
+            "sparse BCE {actual} differed from reference {expected}"
+        );
+    }
+
+    #[test]
+    fn sparse_bce_zero_when_logits_match_target_bits() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(4, REGRESSION_TARGET_WIDTH);
+        let batch = batcher.batch(
+            vec![MoleculeAutoencoderSample {
+                cid: 1,
+                fingerprint_indices: vec![1, 3],
+                fingerprint_counts: vec![3, 1],
+                descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+            }],
+            &device,
+        );
+        // Push inactive positions strongly negative and active positions strongly positive.
+        let predicted = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![-50.0_f32, 50.0, -50.0, 50.0], [1, 4]),
+            &device,
+        );
+        let value = weighted_sparse_log_count_bce_loss(predicted, &batch.fingerprints, 4.0, 1.0)
+            .into_scalar();
+        assert!(value.abs() < 1.0e-6, "expected near-zero BCE, got {value}");
     }
 
     #[test]
@@ -1808,6 +2083,9 @@ mod tests {
             .tanimoto_ranking_candidates(6)
             .tanimoto_ranking_pairs_per_batch(8)
             .ecfp_radius(3)
+            .bce_weight(0.5)
+            .bce_zero_weight(3.0)
+            .bce_nonzero_weight(2.0)
             .build()
             .expect("valid config");
 
@@ -1825,6 +2103,9 @@ mod tests {
         assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 6);
         assert_eq!(config.tanimoto_ranking.pairs_per_batch, 8);
         assert_eq!(config.ecfp_radius, 3);
+        assert_eq!(config.reconstruction_loss.bce_weight, 0.5);
+        assert_eq!(config.reconstruction_loss.bce_zero_weight, 3.0);
+        assert_eq!(config.reconstruction_loss.bce_nonzero_weight, 2.0);
     }
 
     #[test]

@@ -34,6 +34,7 @@ impl<B: Backend> ItemLazy for MoleculeAutoencoderTrainingOutput<B> {
         let [
             loss,
             reconstruction,
+            reconstruction_bce,
             descriptors,
             tanimoto_ranking,
             tanimoto_accuracy,
@@ -41,6 +42,7 @@ impl<B: Backend> ItemLazy for MoleculeAutoencoderTrainingOutput<B> {
         ] = Transaction::default()
             .register(self.loss)
             .register(self.losses.reconstruction)
+            .register(self.losses.reconstruction_bce)
             .register(self.losses.descriptors)
             .register(self.losses.tanimoto_ranking)
             .register(self.losses.tanimoto_ranking_accuracy)
@@ -55,6 +57,7 @@ impl<B: Backend> ItemLazy for MoleculeAutoencoderTrainingOutput<B> {
             reconstruction: Tensor::zeros([1, 1], device),
             losses: MoleculeLossBreakdown {
                 reconstruction: Tensor::from_data(reconstruction, device),
+                reconstruction_bce: Tensor::from_data(reconstruction_bce, device),
                 descriptors: Tensor::from_data(descriptors, device),
                 tanimoto_ranking: Tensor::from_data(tanimoto_ranking, device),
                 tanimoto_ranking_accuracy: Tensor::from_data(tanimoto_accuracy, device),
@@ -164,6 +167,7 @@ mod tests {
         let reconstruction = Tensor::<B, 2>::zeros([1, 4], &device);
         let losses = MoleculeLossBreakdown {
             reconstruction: scalar::<B>(1.0, &device),
+            reconstruction_bce: scalar::<B>(0.3, &device),
             descriptors: scalar::<B>(0.2, &device),
             tanimoto_ranking: scalar::<B>(0.4, &device),
             tanimoto_ranking_accuracy: scalar::<B>(0.5, &device),
@@ -172,8 +176,8 @@ mod tests {
 
         let output = MoleculeAutoencoderTrainingOutput::new(reconstruction, losses);
 
-        assert!((output.loss.clone().into_scalar() - 1.6).abs() < 1.0e-6);
-        assert!((output.total_loss().into_scalar() - 1.6).abs() < 1.0e-6);
+        assert!((output.loss.clone().into_scalar() - 1.9).abs() < 1.0e-6);
+        assert!((output.total_loss().into_scalar() - 1.9).abs() < 1.0e-6);
     }
 
     #[test]
@@ -184,6 +188,7 @@ mod tests {
             Tensor::<B, 2>::zeros([1, 4], &device),
             MoleculeLossBreakdown {
                 reconstruction: scalar::<B>(1.0, &device),
+                reconstruction_bce: scalar::<B>(0.3, &device),
                 descriptors: scalar::<B>(0.2, &device),
                 tanimoto_ranking: scalar::<B>(0.4, &device),
                 tanimoto_ranking_accuracy: scalar::<B>(0.5, &device),
@@ -192,8 +197,9 @@ mod tests {
         )
         .sync();
 
-        assert!((output.loss.into_scalar() - 1.6).abs() < 1.0e-6);
+        assert!((output.loss.into_scalar() - 1.9).abs() < 1.0e-6);
         assert!((output.losses.reconstruction.into_scalar() - 1.0).abs() < 1.0e-6);
+        assert!((output.losses.reconstruction_bce.into_scalar() - 0.3).abs() < 1.0e-6);
         assert!((output.losses.descriptors.into_scalar() - 0.2).abs() < 1.0e-6);
         assert!((output.losses.tanimoto_ranking.into_scalar() - 0.4).abs() < 1.0e-6);
         assert!((output.losses.tanimoto_ranking_accuracy.into_scalar() - 0.5).abs() < 1.0e-6);

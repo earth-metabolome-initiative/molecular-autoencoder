@@ -127,6 +127,11 @@ impl TrainingReporter {
                     examples,
                 ));
                 renderer.update_train(metric_state(
+                    self.metric_ids.reconstruction_bce.clone(),
+                    metrics.reconstruction_bce,
+                    examples,
+                ));
+                renderer.update_train(metric_state(
                     self.metric_ids.descriptors.clone(),
                     metrics.descriptors,
                     examples,
@@ -218,6 +223,11 @@ impl TrainingReporter {
                 renderer.update_valid(metric_state(
                     self.metric_ids.reconstruction.clone(),
                     metrics.reconstruction,
+                    examples,
+                ));
+                renderer.update_valid(metric_state(
+                    self.metric_ids.reconstruction_bce.clone(),
+                    metrics.reconstruction_bce,
                     examples,
                 ));
                 renderer.update_valid(metric_state(
@@ -335,9 +345,10 @@ impl IndicatifTrainingBars {
         let step_ms = step_time.as_secs_f64() * 1000.0;
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} count_tan={:.4} bin_tan={:.4} data_ms={data_ms:.1} step_ms={step_ms:.1}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} count_tan={:.4} bin_tan={:.4} data_ms={data_ms:.1} step_ms={step_ms:.1}",
                 metrics.loss,
                 metrics.reconstruction,
+                metrics.reconstruction_bce,
                 metrics.descriptors,
                 metrics.tanimoto_ranking,
                 metrics.tanimoto_ranking_accuracy,
@@ -363,9 +374,10 @@ impl IndicatifTrainingBars {
         bar.set_position(processed as u64);
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} count_tan={count_tanimoto:.4} bin_tan={binary_tanimoto:.4}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} count_tan={count_tanimoto:.4} bin_tan={binary_tanimoto:.4}",
                 metrics.loss,
                 metrics.reconstruction,
+                metrics.reconstruction_bce,
                 metrics.descriptors,
                 metrics.tanimoto_ranking,
                 metrics.tanimoto_ranking_accuracy,
@@ -416,6 +428,7 @@ impl IndicatifTrainingBars {
 enum ReporterMetric {
     Loss,
     Reconstruction,
+    ReconstructionBce,
     Descriptors,
     TanimotoRanking,
     TanimotoRankingAccuracy,
@@ -424,9 +437,10 @@ enum ReporterMetric {
 }
 
 impl ReporterMetric {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Loss,
         Self::Reconstruction,
+        Self::ReconstructionBce,
         Self::Descriptors,
         Self::TanimotoRanking,
         Self::TanimotoRankingAccuracy,
@@ -438,6 +452,7 @@ impl ReporterMetric {
         match self {
             Self::Loss => "Loss",
             Self::Reconstruction => "Reconstruction Loss",
+            Self::ReconstructionBce => "Reconstruction BCE",
             Self::Descriptors => "Descriptor Loss",
             Self::TanimotoRanking => "Tanimoto Geometry Loss",
             Self::TanimotoRankingAccuracy => "Tanimoto Geometry Accuracy",
@@ -449,7 +464,8 @@ impl ReporterMetric {
     const fn description(self) -> &'static str {
         match self {
             Self::Loss => "weighted total loss",
-            Self::Reconstruction => "counted ECFP reconstruction loss",
+            Self::Reconstruction => "counted ECFP reconstruction Huber loss",
+            Self::ReconstructionBce => "bit-presence BCE-with-logits auxiliary loss",
             Self::Descriptors => "descriptor side-task loss",
             Self::TanimotoRanking => "latent counted-Tanimoto softmax CE loss",
             Self::TanimotoRankingAccuracy => {
@@ -484,6 +500,7 @@ impl ReporterMetric {
 struct ReporterMetricIds {
     loss: MetricId,
     reconstruction: MetricId,
+    reconstruction_bce: MetricId,
     descriptors: MetricId,
     tanimoto_ranking: MetricId,
     tanimoto_ranking_accuracy: MetricId,
@@ -496,6 +513,7 @@ impl ReporterMetricIds {
         Self {
             loss: metric_id(ReporterMetric::Loss),
             reconstruction: metric_id(ReporterMetric::Reconstruction),
+            reconstruction_bce: metric_id(ReporterMetric::ReconstructionBce),
             descriptors: metric_id(ReporterMetric::Descriptors),
             tanimoto_ranking: metric_id(ReporterMetric::TanimotoRanking),
             tanimoto_ranking_accuracy: metric_id(ReporterMetric::TanimotoRankingAccuracy),
@@ -508,6 +526,7 @@ impl ReporterMetricIds {
         match metric {
             ReporterMetric::Loss => self.loss.clone(),
             ReporterMetric::Reconstruction => self.reconstruction.clone(),
+            ReporterMetric::ReconstructionBce => self.reconstruction_bce.clone(),
             ReporterMetric::Descriptors => self.descriptors.clone(),
             ReporterMetric::TanimotoRanking => self.tanimoto_ranking.clone(),
             ReporterMetric::TanimotoRankingAccuracy => self.tanimoto_ranking_accuracy.clone(),
