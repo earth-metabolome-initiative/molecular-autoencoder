@@ -44,7 +44,8 @@ pub use features::{
     SmilesQualityFilterBuilder,
 };
 pub use fingerprints::{
-    CountedEcfpConfig, CountedEcfpConfigBuilder, FingerprintTargets, compute_fingerprint_targets,
+    CountedEcfpConfig, CountedEcfpConfigBuilder, DEFAULT_ECFP_RADIUS, DEFAULT_ECFP_SIZE,
+    FingerprintTargets, compute_fingerprint_targets,
 };
 pub use metrics::{
     CountReconstructionMetrics, batch_count_tanimoto, batch_log_count_reconstruction_tanimoto,

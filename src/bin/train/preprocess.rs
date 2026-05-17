@@ -7,9 +7,9 @@ use std::{
 
 use indicatif::{ProgressBar, ProgressStyle};
 use molecular_autoencoder::{
-    DEFAULT_PREPROCESS_CHUNK_ROWS, DatasetPreprocessOptions, MoleculeRecord, PreprocessingConfig,
-    SHARD_MANIFEST_VERSION, ShardManifest, SmilesQualityFilter, SparseMoleculeShard,
-    features::REGRESSION_TARGET_WIDTH, molecule_records_from_smiles_dataset,
+    CountedEcfpConfig, DEFAULT_PREPROCESS_CHUNK_ROWS, DatasetPreprocessOptions, MoleculeRecord,
+    PreprocessingConfig, SHARD_MANIFEST_VERSION, ShardManifest, SmilesQualityFilter,
+    SparseMoleculeShard, features::REGRESSION_TARGET_WIDTH, molecule_records_from_smiles_dataset,
     preprocess_dataset_record_chunks,
 };
 use smiles_parser::prelude::{
@@ -71,6 +71,7 @@ pub fn prepare_manifest(args: &Args, paths: &ResolvedPaths) -> AppResult<PathBuf
         args.preprocess_threads,
         source_selection,
         args.quality_filter()?,
+        args.ecfp_radius,
     )?;
     Ok(manifest_path)
 }
@@ -81,6 +82,7 @@ fn preprocess_cache(
     preprocess_threads: usize,
     source_selection: SourceSelection,
     quality_filter: SmilesQualityFilter,
+    ecfp_radius: u8,
 ) -> AppResult<()> {
     if rows_per_shard == 0 {
         return Err(invalid_input("rows per shard must be greater than zero"));
@@ -88,7 +90,12 @@ fn preprocess_cache(
 
     std::fs::create_dir_all(cache_dir)?;
     let source_cache_dir = cache_dir.join("source");
+    let counted_ecfp = CountedEcfpConfig::builder()
+        .radius(ecfp_radius)
+        .build()
+        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
     let config = PreprocessingConfig::builder()
+        .counted_ecfp(counted_ecfp)
         .quality_filter(quality_filter)
         .build()
         .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;

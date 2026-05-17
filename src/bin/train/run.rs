@@ -47,6 +47,7 @@ where
     let manifest = ShardManifest::read_from_path(&manifest_path)?;
     let shards = shard_infos(&manifest_path, &manifest)?;
     let fingerprint_size = manifest.preprocessing().counted_ecfp().size();
+    let ecfp_radius = manifest.preprocessing().counted_ecfp().radius();
     let recorder = DefaultRecorder::default();
     let model_config_path = args.checkpoint_dir.join("model-config.json");
     let state_path = args.checkpoint_dir.join("state.json");
@@ -57,7 +58,7 @@ where
         config.validate(fingerprint_size)?;
         config
     } else {
-        let config = args.to_model_config(fingerprint_size)?;
+        let config = args.to_model_config(fingerprint_size, ecfp_radius)?;
         config.save_json(&model_config_path)?;
         config
     };

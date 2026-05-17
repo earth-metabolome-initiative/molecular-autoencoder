@@ -15,7 +15,7 @@ use crate::{Error, Result};
 use crate::{
     batch::{MoleculeAutoencoderBatch, SparseFingerprintBatch},
     features::REGRESSION_TARGET_WIDTH,
-    fingerprints::DEFAULT_ECFP_SIZE,
+    fingerprints::{DEFAULT_ECFP_RADIUS, DEFAULT_ECFP_SIZE},
     ranking::weighted_tanimoto_ranking_output,
 };
 
@@ -80,6 +80,10 @@ const fn default_tanimoto_ranking_latent_temperature() -> f64 {
 
 const fn default_tanimoto_ranking_metric_temperature() -> f64 {
     DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE
+}
+
+const fn default_ecfp_radius() -> u8 {
+    DEFAULT_ECFP_RADIUS
 }
 
 /// Encoder model configuration. Construct via [`EncoderConfig::builder`].
@@ -816,6 +820,8 @@ pub struct MoleculeAutoencoderConfig {
     tanimoto_ranking: TanimotoRankingConfig,
     #[serde(default = "default_latent_noise_std")]
     latent_noise_std: f64,
+    #[serde(default = "default_ecfp_radius")]
+    ecfp_radius: u8,
 }
 
 impl MoleculeAutoencoderConfig {
@@ -846,6 +852,7 @@ impl MoleculeAutoencoderConfig {
             auxiliary_weights: AuxiliaryLossWeights::default(),
             tanimoto_ranking: TanimotoRankingConfig::default(),
             latent_noise_std: default_latent_noise_std(),
+            ecfp_radius: default_ecfp_radius(),
         }
     }
 
@@ -896,6 +903,14 @@ impl MoleculeAutoencoderConfig {
     #[must_use]
     pub const fn latent_noise_std(&self) -> f64 {
         self.latent_noise_std
+    }
+
+    /// Morgan/ECFP radius the cached fingerprints were generated with.
+    /// Inference callers need this to reconstruct fingerprints at the same
+    /// radius the model was trained against.
+    #[must_use]
+    pub const fn ecfp_radius(&self) -> u8 {
+        self.ecfp_radius
     }
 
     /// Returns the flat runtime view of the Tanimoto geometry side task.
@@ -1001,6 +1016,9 @@ impl MoleculeAutoencoderConfig {
                 self.latent_noise_std
             ));
         }
+        if self.ecfp_radius == 0 {
+            return bail("ecfp radius must be greater than zero".to_string());
+        }
         Ok(())
     }
 
@@ -1082,6 +1100,7 @@ pub struct MoleculeAutoencoderConfigBuilder {
     min_gap: f64,
     candidates_per_anchor: usize,
     pairs_per_batch: usize,
+    ecfp_radius: u8,
 }
 
 impl Default for MoleculeAutoencoderConfigBuilder {
@@ -1106,6 +1125,7 @@ impl MoleculeAutoencoderConfigBuilder {
             min_gap: DEFAULT_TANIMOTO_RANKING_MIN_GAP,
             candidates_per_anchor: DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
             pairs_per_batch: DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
+            ecfp_radius: DEFAULT_ECFP_RADIUS,
         }
     }
 
@@ -1186,6 +1206,13 @@ impl MoleculeAutoencoderConfigBuilder {
         self
     }
 
+    /// Sets the Morgan/ECFP radius the cached fingerprints were built with.
+    #[must_use]
+    pub const fn ecfp_radius(mut self, value: u8) -> Self {
+        self.ecfp_radius = value;
+        self
+    }
+
     /// Validates the configured fields and builds the immutable config.
     ///
     /// # Errors
@@ -1223,6 +1250,7 @@ impl MoleculeAutoencoderConfigBuilder {
                 pairs_per_batch: self.pairs_per_batch,
             },
             latent_noise_std: self.latent_noise_std,
+            ecfp_radius: self.ecfp_radius,
         };
         config.validate(fingerprint_size)?;
         Ok(config)
@@ -1561,6 +1589,7 @@ mod tests {
         assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 16);
         assert_eq!(config.tanimoto_ranking.pairs_per_batch, 0);
         assert_eq!(config.latent_noise_std, 0.02);
+        assert_eq!(config.ecfp_radius, DEFAULT_ECFP_RADIUS);
     }
 
     #[test]
@@ -1778,6 +1807,7 @@ mod tests {
             .tanimoto_ranking_min_gap(0.04)
             .tanimoto_ranking_candidates(6)
             .tanimoto_ranking_pairs_per_batch(8)
+            .ecfp_radius(3)
             .build()
             .expect("valid config");
 
@@ -1794,6 +1824,7 @@ mod tests {
         assert_eq!(config.tanimoto_ranking.min_gap, 0.04);
         assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 6);
         assert_eq!(config.tanimoto_ranking.pairs_per_batch, 8);
+        assert_eq!(config.ecfp_radius, 3);
     }
 
     #[test]

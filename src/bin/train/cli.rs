@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use molecular_autoencoder::{
-    DEFAULT_DESCRIPTOR_WEIGHT, DEFAULT_HIDDEN_WIDTHS, DEFAULT_LATENT_NOISE_STD,
-    DEFAULT_LATENT_WIDTH, DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
+    DEFAULT_DESCRIPTOR_WEIGHT, DEFAULT_ECFP_RADIUS, DEFAULT_HIDDEN_WIDTHS,
+    DEFAULT_LATENT_NOISE_STD, DEFAULT_LATENT_WIDTH, DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
     DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE,
     DEFAULT_TANIMOTO_RANKING_MIN_GAP, DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
     DEFAULT_TANIMOTO_RANKING_WEIGHT, MoleculeAutoencoderConfig, SmilesQualityFilter,
@@ -305,6 +305,10 @@ pub struct Args {
     /// Maximum number of disconnected components (set 1 to drop salts/mixtures).
     #[arg(long)]
     pub max_connected_components: Option<u32>,
+
+    /// Morgan/ECFP radius for counted fingerprints (must be >= 1).
+    #[arg(long, default_value_t = DEFAULT_ECFP_RADIUS, value_parser = positive_u8)]
+    pub ecfp_radius: u8,
 }
 
 impl Args {
@@ -340,7 +344,11 @@ impl Args {
     ///
     /// Returns the same `ConfigInvalid` payload the builder emits when any
     /// invariant fails (negative weights, non-finite temperatures, etc.).
-    pub fn to_model_config(&self, fingerprint_size: usize) -> AppResult<MoleculeAutoencoderConfig> {
+    pub fn to_model_config(
+        &self,
+        fingerprint_size: usize,
+        ecfp_radius: u8,
+    ) -> AppResult<MoleculeAutoencoderConfig> {
         MoleculeAutoencoderConfig::builder()
             .fingerprint_size(fingerprint_size)
             .latent_width(self.latent_width)
@@ -353,6 +361,7 @@ impl Args {
             .tanimoto_ranking_min_gap(self.tanimoto_ranking_min_gap)
             .tanimoto_ranking_candidates(self.tanimoto_ranking_candidates)
             .tanimoto_ranking_pairs_per_batch(self.tanimoto_ranking_pairs_per_batch)
+            .ecfp_radius(ecfp_radius)
             .build()
             .map_err(Into::into)
     }
@@ -396,6 +405,17 @@ pub struct ResolvedPaths {
 
 fn positive_usize(value: &str) -> Result<usize, String> {
     let parsed: usize = value
+        .parse()
+        .map_err(|err: std::num::ParseIntError| err.to_string())?;
+    if parsed == 0 {
+        Err("must be greater than zero".to_string())
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn positive_u8(value: &str) -> Result<u8, String> {
+    let parsed: u8 = value
         .parse()
         .map_err(|err: std::num::ParseIntError| err.to_string())?;
     if parsed == 0 {
@@ -547,7 +567,9 @@ mod tests {
             "5",
         ])
         .expect("parse");
-        let config = args.to_model_config(64).expect("builder accepts overrides");
+        let config = args
+            .to_model_config(64, 3)
+            .expect("builder accepts overrides");
 
         assert_eq!(config.encoder().input_width(), 64);
         assert_eq!(config.encoder().latent_width(), 16);
@@ -555,6 +577,7 @@ mod tests {
         assert_eq!(config.auxiliary_weights().descriptors(), 0.07);
         assert_eq!(config.auxiliary_weights().tanimoto_ranking(), 0.13);
         assert_eq!(config.tanimoto_ranking().candidates_per_anchor(), 5);
+        assert_eq!(config.ecfp_radius(), 3);
     }
 
     #[test]
@@ -571,7 +594,9 @@ mod tests {
             "1",
         ])
         .expect("parse");
-        let error = args.to_model_config(64).expect_err("builder must reject");
+        let error = args
+            .to_model_config(64, DEFAULT_ECFP_RADIUS)
+            .expect_err("builder must reject");
         assert!(error.to_string().contains("candidates_per_anchor"));
     }
 

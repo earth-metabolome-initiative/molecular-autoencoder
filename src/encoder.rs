@@ -19,7 +19,7 @@ use crate::{
     CountedEcfpConfig, Error, MoleculeAutoencoder, MoleculeAutoencoderBatch,
     MoleculeAutoencoderBatcher, MoleculeAutoencoderConfig, MoleculeAutoencoderSample, Result,
     batch_sparse_log_count_tanimoto, compute_fingerprint_targets,
-    features::REGRESSION_TARGET_WIDTH, fingerprints::DEFAULT_ECFP_RADIUS,
+    features::REGRESSION_TARGET_WIDTH,
 };
 
 /// One molecule's encoder output: the latent embedding plus the two
@@ -44,16 +44,10 @@ pub struct EncodingRow {
 ///
 /// Construct via [`MoleculeEncoder::from_checkpoint`]. The encoder owns a
 /// [`finge_rs::smiles_support::SmilesRdkitScratch`] for fingerprint
-/// preparation, so individual `encode` calls reuse the allocation.
-///
-/// **Fingerprint radius assumption:** `model-config.json` records the
-/// model architecture but not the ECFP radius used during training. This
-/// type therefore reconstructs fingerprints at the v1 default radius
-/// ([`DEFAULT_ECFP_RADIUS`] = 2)
-/// for every checkpoint. The training bin currently has no `--ecfp-radius`
-/// flag and always uses the default, so this matches every checkpoint we
-/// produce today; if that ever changes the radius needs to move into
-/// `MoleculeAutoencoderConfig`.
+/// preparation, so individual `encode` calls reuse the allocation. The
+/// fingerprint radius is sourced from
+/// [`MoleculeAutoencoderConfig::ecfp_radius`] so inference matches the
+/// preprocessing that produced the cached shards.
 pub struct MoleculeEncoder<B: Backend> {
     model: MoleculeAutoencoder<B>,
     config: MoleculeAutoencoderConfig,
@@ -90,7 +84,7 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
 
         let batcher = MoleculeAutoencoderBatcher::new(fingerprint_size, config.descriptor_width());
         let ecfp_config = CountedEcfpConfig::builder()
-            .radius(DEFAULT_ECFP_RADIUS)
+            .radius(config.ecfp_radius())
             .size(fingerprint_size)
             .build()?;
 
