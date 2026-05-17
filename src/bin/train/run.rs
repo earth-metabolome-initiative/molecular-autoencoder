@@ -53,12 +53,16 @@ where
     let state_path = args.checkpoint_dir.join("state.json");
 
     std::fs::create_dir_all(&args.checkpoint_dir)?;
+    let bit_frequencies = match args.bit_counts.as_deref() {
+        Some(path) => crate::bit_counts::load_bit_frequencies(path, fingerprint_size)?,
+        None => Vec::new(),
+    };
     let model_config = if args.resume && model_config_path.exists() {
         let config = MoleculeAutoencoderConfig::load_json(&model_config_path)?;
         config.validate(fingerprint_size)?;
         config
     } else {
-        let config = args.to_model_config(fingerprint_size, ecfp_radius)?;
+        let config = args.to_model_config(fingerprint_size, ecfp_radius, bit_frequencies)?;
         config.save_json(&model_config_path)?;
         config
     };
@@ -99,8 +103,9 @@ where
     } else {
         args.loader_profile_every
     };
+    let bit_freq_count = model_config.bit_frequencies().len();
     println!(
-        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_latent_temperature={} tanimoto_ranking_metric_temperature={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={} bce_weight={} bce_zero_weight={} bce_nonzero_weight={}",
+        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_latent_temperature={} tanimoto_ranking_metric_temperature={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={} bce_weight={} bce_zero_weight={} bce_nonzero_weight={} bit_frequencies={}",
         manifest_path.display(),
         shards.len(),
         args.checkpoint_dir.display(),
@@ -123,7 +128,12 @@ where
         tanimoto_ranking.pairs_per_batch(),
         model_config.reconstruction_loss().bce_weight(),
         model_config.reconstruction_loss().bce_zero_weight(),
-        model_config.reconstruction_loss().bce_nonzero_weight()
+        model_config.reconstruction_loss().bce_nonzero_weight(),
+        if bit_freq_count == 0 {
+            "uniform".to_string()
+        } else {
+            format!("per-bin[{bit_freq_count}]")
+        }
     );
 
     for epoch in (state.completed_epoch + 1)..=args.epochs {

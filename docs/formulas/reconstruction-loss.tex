@@ -10,7 +10,7 @@
 &= \frac{1}{N}\sum_{i=1}^{N}
    w_{i}^{\mathrm{H}}\, H_{\beta}(\delta_{i})
    \;+\; \lambda_{\mathrm{B}}\,\frac{1}{N}\sum_{i=1}^{N}
-   w_{i}^{\mathrm{B}}\, \rho_{i}\\
+   c_{i}^{\mathrm{B}}\,\rho_{i}\\
 \delta_{i} &=
 \begin{cases}
   \max(\widehat{z}_{i},\,0) & \text{if } y_{i} = 0\\
@@ -20,6 +20,11 @@
 \begin{cases}
   \bigl[\operatorname{softplus}( \widehat{z}_{i}) - \ln 2\bigr]_{+} & \text{if } y_{i} = 0\\
   \bigl[\operatorname{softplus}(-\widehat{z}_{i}) - \ln 2\bigr]_{+} & \text{if } y_{i} = 1
+\end{cases}\\
+c_{i}^{\mathrm{B}} &=
+\begin{cases}
+  \alpha_{0}\,\bigl[-\ln(1-p_{b(i)}+\varepsilon)\bigr] & \text{if } y_{i} = 0\\
+  \alpha_{+}\,\bigl[-\ln(p_{b(i)}+\varepsilon)\bigr] & \text{if } y_{i} = 1
 \end{cases}
 \end{aligned}
 \)
