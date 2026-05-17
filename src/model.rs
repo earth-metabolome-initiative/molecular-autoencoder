@@ -35,7 +35,14 @@ pub const DEFAULT_TANIMOTO_RANKING_WEIGHT: f64 = 0.10;
 pub const DEFAULT_LATENT_NOISE_STD: f64 = 0.02;
 
 /// Default latent cosine-logit temperature in the ranking softmax.
-pub const DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE: f64 = 0.10;
+///
+/// With cosine similarity in `[-1, 1]`, dividing by `0.05` gives a logit range
+/// of `[-20, 20]`. A typical winner-vs-runner-up cosine gap of `0.3` maps to
+/// `6` nats of softmax advantage, enough to put `> 99%` mass on the winner
+/// without collapsing the gradient on already-correct anchors. Matches the
+/// usual sampled-softmax contrastive temperature (SimCLR, Sentence-BERT,
+/// MoCo, ...) for `k ≈ 16` candidates.
+pub const DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE: f64 = 0.05;
 
 /// Default compatibility metric temperature (unused by the softmax loss).
 pub const DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE: f64 = 0.10;
@@ -1924,7 +1931,10 @@ mod tests {
         assert_eq!(config.descriptor_width, REGRESSION_TARGET_WIDTH);
         assert_eq!(config.auxiliary_weights.descriptors, 0.05);
         assert_eq!(config.auxiliary_weights.tanimoto_ranking, 0.10);
-        assert_eq!(config.tanimoto_ranking.latent_temperature, 0.10);
+        assert_eq!(
+            config.tanimoto_ranking.latent_temperature,
+            DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE
+        );
         assert_eq!(config.tanimoto_ranking.metric_temperature, 0.10);
         assert_eq!(config.tanimoto_ranking.min_gap, 0.05);
         assert_eq!(config.tanimoto_ranking.candidates_per_anchor, 16);
