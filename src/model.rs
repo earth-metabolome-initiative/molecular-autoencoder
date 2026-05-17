@@ -1653,16 +1653,23 @@ fn huber_from_delta<B: Backend>(delta: Tensor<B, 2>, beta: f64) -> Tensor<B, 2> 
 }
 
 /// Weighted Huber loss over `log1p(count)` reconstruction targets.
+///
+/// The per-bin delta is one-sided at inactive targets (where `z_i = 0`): only
+/// positive overshoot `max(ẑ_i, 0)` is penalized so the Huber does not fight
+/// the BCE term, which wants those logits firmly negative. Active bins keep
+/// the symmetric `|ẑ_i - z_i|`.
 pub fn weighted_log_count_huber_loss<B: Backend>(
     predicted_log_counts: Tensor<B, 2>,
     target_log_counts: Tensor<B, 2>,
     config: ReconstructionLossConfig,
 ) -> Tensor<B, 1> {
-    let delta = (predicted_log_counts - target_log_counts.clone()).abs();
+    let nonzero = target_log_counts.clone().greater_elem(0.0).float();
+    let one_minus_nonzero = nonzero.clone() * -1.0 + 1.0;
+    let delta_active = (predicted_log_counts.clone() - target_log_counts).abs();
+    let delta_zero = predicted_log_counts.clamp_min(0.0);
+    let delta = delta_active * nonzero.clone() + delta_zero * one_minus_nonzero.clone();
     let huber = huber_from_delta(delta, config.beta);
-    let nonzero = target_log_counts.greater_elem(0.0).float();
-    let weights =
-        nonzero.clone() * config.nonzero_weight + (nonzero * -1.0 + 1.0) * config.zero_weight;
+    let weights = nonzero * config.nonzero_weight + one_minus_nonzero * config.zero_weight;
     (huber * weights).mean()
 }
 
@@ -1717,6 +1724,11 @@ pub fn weighted_sparse_log_count_bce_loss<B: Backend>(
 
 /// Weighted Huber loss over sparse `log1p(count)` reconstruction targets.
 ///
+/// At inactive bins (`z_i = 0`) the Huber delta is one-sided: only the
+/// positive part `max(ẑ_i, 0)` contributes, so the Huber is silent when the
+/// BCE drives `ẑ_i` negative. At active bins the symmetric `|ẑ_i - z_i|` is
+/// used as before.
+///
 /// # Panics
 ///
 /// Panics when the predicted dense reconstruction shape does not match the
@@ -1738,14 +1750,14 @@ pub fn weighted_sparse_log_count_huber_loss<B: Backend>(
     );
 
     let denominator = (predicted_dims[0] * predicted_dims[1]) as f64;
-    let zero_huber = huber_from_delta(predicted_log_counts.clone().abs(), config.beta);
+    let zero_huber = huber_from_delta(predicted_log_counts.clone().clamp_min(0.0), config.beta);
     let zero_total = zero_huber.sum() * config.zero_weight;
     let predicted_nonzero = predicted_log_counts.gather(1, target.indices.clone());
     let nonzero_huber = huber_from_delta(
         (predicted_nonzero.clone() - target.log_counts).abs(),
         config.beta,
     );
-    let zero_nonzero_huber = huber_from_delta(predicted_nonzero.abs(), config.beta);
+    let zero_nonzero_huber = huber_from_delta(predicted_nonzero.clamp_min(0.0), config.beta);
     let correction = (nonzero_huber * config.nonzero_weight
         - zero_nonzero_huber * config.zero_weight)
         * target.mask;
@@ -1892,6 +1904,78 @@ mod tests {
 
         let delta = (dense.into_scalar() - sparse.into_scalar()).abs();
         assert!(delta < 1.0e-6, "dense and sparse loss differ by {delta}");
+    }
+
+    #[test]
+    fn sparse_huber_ignores_negative_predictions_at_zero_targets() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(4, REGRESSION_TARGET_WIDTH);
+        let batch = batcher.batch(
+            vec![MoleculeAutoencoderSample {
+                cid: 1,
+                fingerprint_indices: vec![1],
+                fingerprint_counts: vec![2],
+                descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+            }],
+            &device,
+        );
+        let config = ReconstructionLossConfig::builder()
+            .beta(1.0)
+            .zero_weight(1.0)
+            .nonzero_weight(0.0)
+            .build()
+            .expect("config");
+        // Active bin at index 1: predict the target exactly so it contributes nothing.
+        // Zero bins at indices 0, 2, 3: predict strongly negative — should be silent.
+        let target_log = 2.0_f32.ln_1p();
+        let predicted = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![-3.0_f32, target_log, -1.5, -0.7], [1, 4]),
+            &device,
+        );
+        let loss = weighted_sparse_log_count_huber_loss(predicted, batch.fingerprints, config)
+            .into_scalar();
+        assert!(
+            loss.abs() < 1.0e-6,
+            "expected zero loss with one-sided Huber at zero targets, got {loss}"
+        );
+    }
+
+    #[test]
+    fn sparse_huber_still_penalizes_positive_leak_at_zero_targets() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(4, REGRESSION_TARGET_WIDTH);
+        let batch = batcher.batch(
+            vec![MoleculeAutoencoderSample {
+                cid: 1,
+                fingerprint_indices: vec![1],
+                fingerprint_counts: vec![2],
+                descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+            }],
+            &device,
+        );
+        let config = ReconstructionLossConfig::builder()
+            .beta(1.0)
+            .zero_weight(1.0)
+            .nonzero_weight(0.0)
+            .build()
+            .expect("config");
+        // Active bin matches target; the three zero bins leak +0.4 each.
+        let target_log = 2.0_f32.ln_1p();
+        let predicted = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![0.4_f32, target_log, 0.4, 0.4], [1, 4]),
+            &device,
+        );
+        let loss = weighted_sparse_log_count_huber_loss(predicted, batch.fingerprints, config)
+            .into_scalar();
+        // Per-bin Huber with delta=0.4, beta=1.0: 0.5 * 0.4^2 / 1.0 = 0.08.
+        // Three zero leaks averaged across N=4: 3 * 0.08 / 4 = 0.06.
+        let expected = 3.0 * 0.08 / 4.0;
+        assert!(
+            (loss - expected).abs() < 1.0e-5,
+            "expected {expected}, got {loss}"
+        );
     }
 
     #[test]
