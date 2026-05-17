@@ -8,14 +8,18 @@
 \begin{aligned}
 \mathcal{L}_{\mathrm{recon}}
 &= \frac{1}{N}\sum_{i=1}^{N}
-   w_{i}^{\mathrm{H}}\, H_{\beta}\!\left(\delta_{i}\right)
+   w_{i}^{\mathrm{H}}\, H_{\beta}(\delta_{i})
    \;+\; \lambda_{\mathrm{B}}\,\frac{1}{N}\sum_{i=1}^{N}
-   w_{i}^{\mathrm{B}}\!\left[\operatorname{softplus}(\widehat{z}_{i})
-   - \widehat{z}_{i}\,y_{i}\right]\\
+   w_{i}^{\mathrm{B}}\, \rho_{i}\\
 \delta_{i} &=
 \begin{cases}
   \max(\widehat{z}_{i},\,0) & \text{if } y_{i} = 0\\
   \lvert \widehat{z}_{i} - z_{i}\rvert & \text{if } y_{i} = 1
+\end{cases}\\
+\rho_{i} &=
+\begin{cases}
+  \bigl[\operatorname{softplus}( \widehat{z}_{i}) - \ln 2\bigr]_{+} & \text{if } y_{i} = 0\\
+  \bigl[\operatorname{softplus}(-\widehat{z}_{i}) - \ln 2\bigr]_{+} & \text{if } y_{i} = 1
 \end{cases}
 \end{aligned}
 \)

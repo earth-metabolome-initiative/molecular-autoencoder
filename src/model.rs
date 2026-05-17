@@ -1679,12 +1679,22 @@ fn softplus<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
     x.clamp_min(0.0) + (neg_abs.exp() + 1.0).log()
 }
 
-/// Per-position weighted BCE-with-logits loss against the sparse fingerprint
-/// bit-presence target.
+/// Per-position weighted bit-presence loss against the sparse fingerprint
+/// target.
 ///
-/// Treats `predicted_log_counts` as logits directly: `sigmoid(x) > 0.5` ⇔
-/// `x > 0`, the same threshold the binary Tanimoto metric uses. The
-/// computation mirrors [`weighted_sparse_log_count_huber_loss`] — assume the
+/// Uses a continuous one-sided form of BCE-with-logits: per-bin loss is
+/// `[softplus(s_i · ẑ_i) − ln 2]_+` where `s_i = +1` at inactive bins and
+/// `s_i = −1` at active bins. This is the standard BCE softplus shape
+/// shifted down so it bottoms out at `ẑ_i = 0` and clamped at zero so the
+/// "correctly classified" side never contributes a gradient. Concretely:
+///
+/// - Inactive bins (`y_i = 0`): only positive leaks `ẑ_i > 0` pay a penalty,
+///   so the BCE does not fight the Huber once `ẑ_i ≤ 0`.
+/// - Active bins (`y_i = 1`): only negative dips `ẑ_i < 0` pay a penalty,
+///   so the BCE stops pulling once the sign is right and the Huber alone
+///   refines the magnitude toward `log1p(target_count)`.
+///
+/// Computation mirrors [`weighted_sparse_log_count_huber_loss`] — assume the
 /// target bit is zero everywhere, then correct at the sparse active indices.
 ///
 /// # Panics
@@ -1709,13 +1719,17 @@ pub fn weighted_sparse_log_count_bce_loss<B: Backend>(
         "predicted reconstruction width must match sparse fingerprint width"
     );
 
+    let log2 = std::f64::consts::LN_2;
     let denominator = (predicted_dims[0] * predicted_dims[1]) as f64;
-    // BCE(logits, target=0) = softplus(logits); BCE(logits, target=1) = softplus(-logits).
-    let zero_bce = softplus(predicted_log_counts.clone());
+    // y_i = 0: penalty grows when ẑ_i > 0 (positive leak).
+    let zero_bce = (softplus(predicted_log_counts.clone()) - log2).clamp_min(0.0);
     let zero_total = zero_bce.sum() * zero_weight;
     let predicted_nonzero = predicted_log_counts.gather(1, target.indices.clone());
-    let active_bce = softplus(predicted_nonzero.clone() * -1.0);
-    let zero_at_active_bce = softplus(predicted_nonzero);
+    // y_i = 1: penalty grows when ẑ_i < 0 (negative dip).
+    let active_bce = (softplus(predicted_nonzero.clone() * -1.0) - log2).clamp_min(0.0);
+    // Subtract the "assumed y_i = 0" contribution at the same active indices,
+    // matching the sparse correction pattern used by the Huber loss above.
+    let zero_at_active_bce = (softplus(predicted_nonzero) - log2).clamp_min(0.0);
     let correction =
         (active_bce * nonzero_weight - zero_at_active_bce * zero_weight) * target.mask.clone();
 
@@ -2007,26 +2021,93 @@ mod tests {
         )
         .into_scalar();
 
-        // CPU reference: BCE(logit, target) = softplus(logit) - logit * target.
+        // CPU reference: one-sided shifted BCE.
+        //   y_i = 0 (s = +1): penalty = max(0, softplus( logit) - ln 2)
+        //   y_i = 1 (s = -1): penalty = max(0, softplus(-logit) - ln 2)
         let logits = [1.0_f32, 0.5, -0.2, -1.5];
         let targets = [1.0_f32, 0.0, 1.0, 0.0];
+        let log2 = std::f32::consts::LN_2;
         let per_position: Vec<f32> = logits
             .iter()
             .zip(targets)
             .map(|(&logit, target)| {
-                let softplus = logit.max(0.0) + (-logit.abs()).exp().ln_1p();
+                let sign = if target > 0.0 { -1.0_f32 } else { 1.0 };
+                let signed = sign * logit;
+                let softplus = signed.max(0.0) + (-signed.abs()).exp().ln_1p();
+                let shifted = (softplus - log2).max(0.0);
                 let weight = if target > 0.0 {
                     nonzero_weight as f32
                 } else {
                     zero_weight as f32
                 };
-                (softplus - logit * target) * weight
+                shifted * weight
             })
             .collect();
         let expected = per_position.iter().sum::<f32>() / per_position.len() as f32;
         assert!(
             (actual - expected).abs() < 1.0e-5,
             "sparse BCE {actual} differed from reference {expected}"
+        );
+    }
+
+    #[test]
+    fn sparse_bce_is_silent_on_correctly_classified_bins() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(4, REGRESSION_TARGET_WIDTH);
+        let batch = batcher.batch(
+            vec![MoleculeAutoencoderSample {
+                cid: 1,
+                fingerprint_indices: vec![1, 3],
+                fingerprint_counts: vec![3, 1],
+                descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+            }],
+            &device,
+        );
+        // Active bins predict positive; inactive bins predict negative.
+        // All bins are on the "correct" side of zero so BCE should be exactly 0.
+        let predicted = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![-0.1_f32, 0.1, -0.1, 0.1], [1, 4]),
+            &device,
+        );
+        let value = weighted_sparse_log_count_bce_loss(predicted, &batch.fingerprints, 4.0, 1.0)
+            .into_scalar();
+        assert!(
+            value.abs() < 1.0e-6,
+            "expected exactly zero BCE for correctly classified bins, got {value}"
+        );
+    }
+
+    #[test]
+    fn sparse_bce_only_penalizes_wrong_direction() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(2, REGRESSION_TARGET_WIDTH);
+        let batch = batcher.batch(
+            vec![MoleculeAutoencoderSample {
+                cid: 1,
+                fingerprint_indices: vec![0],
+                fingerprint_counts: vec![1],
+                descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+            }],
+            &device,
+        );
+        // Active bin at index 0 wrongly predicts negative; inactive bin at
+        // index 1 stays well below zero. Only the active-bin violation should
+        // contribute.
+        let predicted =
+            Tensor::<B, 2>::from_data(TensorData::new(vec![-2.0_f32, -5.0], [1, 2]), &device);
+        let value = weighted_sparse_log_count_bce_loss(predicted, &batch.fingerprints, 4.0, 1.0)
+            .into_scalar();
+        // Expected: per-bin loss at position 0 only.
+        // softplus(2) ≈ 2.1269, minus ln 2 ≈ 0.6931 → 1.4338, weighted by 1.0,
+        // averaged over N=2 → ≈ 0.7169.
+        let log2 = std::f32::consts::LN_2;
+        let softplus = 2.0_f32.max(0.0) + (-2.0_f32.abs()).exp().ln_1p();
+        let expected = ((softplus - log2).max(0.0) * 1.0) / 2.0;
+        assert!(
+            (value - expected).abs() < 1.0e-5,
+            "expected {expected}, got {value}"
         );
     }
 
