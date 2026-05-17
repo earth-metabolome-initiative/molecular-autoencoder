@@ -1290,6 +1290,29 @@ impl ShardManifest {
         )
     }
 
+    /// Populates [`Self::bit_counts`] by scanning the on-disk shards relative
+    /// to `shard_dir`. Use this to retrofit manifests produced before the
+    /// preprocessing-side accumulator existed, without redoing the full
+    /// fingerprinting pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O or shard-format error if any shard file
+    /// cannot be opened or parsed.
+    pub fn backfill_bit_counts(&mut self, shard_dir: &Path) -> Result<()> {
+        let fingerprint_size = self.preprocessing.counted_ecfp().size();
+        let mut counts = vec![0_u64; fingerprint_size];
+        for entry in &self.shards {
+            let shard_path = shard_dir.join(entry.path());
+            let shard = SparseMoleculeShard::read_from_path(&shard_path)?;
+            for &index in shard.indices() {
+                counts[usize::from(index)] += 1;
+            }
+        }
+        self.bit_counts = counts;
+        Ok(())
+    }
+
     /// Writes the manifest as pretty JSON.
     ///
     /// # Errors
@@ -2074,5 +2097,41 @@ mod tests {
         let mut manifest = ShardManifest::new("legacy-fixture", config);
         manifest.bit_counts.clear();
         assert!(manifest.bit_frequencies().is_none());
+    }
+
+    #[test]
+    fn manifest_backfill_bit_counts_recovers_per_bin_totals_from_shards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = PreprocessingConfig::default();
+        let fp_size = config.counted_ecfp().size();
+        let descriptors = vec![0.0_f32; REGRESSION_TARGET_WIDTH];
+        let mut shard = SparseMoleculeShard::new(fp_size, REGRESSION_TARGET_WIDTH);
+        let fp1 = FingerprintTargets::new(vec![3, 9], vec![1, 4], fp_size).expect("fp1");
+        let fp2 = FingerprintTargets::new(vec![3, 100], vec![2, 1], fp_size).expect("fp2");
+        shard
+            .push(701, &fp1, &descriptors, DataSplit::Train)
+            .expect("push 1");
+        shard
+            .push(702, &fp2, &descriptors, DataSplit::Train)
+            .expect("push 2");
+        let shard_path = dir.path().join("shard-00000.maeshard");
+        shard.write_to_path(&shard_path).expect("write shard");
+
+        // Build a manifest as if it predates the preprocessing accumulator:
+        // it has the shard entries and row totals, but `bit_counts` is empty.
+        let mut manifest = ShardManifest::new("legacy", config);
+        manifest.push_shard("shard-00000.maeshard", &shard);
+        manifest.bit_counts.clear();
+        assert!(manifest.bit_frequencies().is_none());
+
+        manifest
+            .backfill_bit_counts(dir.path())
+            .expect("backfill from cached shard");
+        let frequencies = manifest.bit_frequencies().expect("frequencies");
+        let row_count = 2.0_f32;
+        assert!((frequencies[3] - 2.0 / row_count).abs() < 1.0e-6);
+        assert!((frequencies[9] - 1.0 / row_count).abs() < 1.0e-6);
+        assert!((frequencies[100] - 1.0 / row_count).abs() < 1.0e-6);
+        assert_eq!(frequencies[0], 0.0);
     }
 }

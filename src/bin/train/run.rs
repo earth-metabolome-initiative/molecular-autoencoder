@@ -44,7 +44,24 @@ where
     let max_valid_batches = args.max_valid_batches();
 
     let manifest_path = prepare_manifest(&args, &paths)?;
-    let manifest = ShardManifest::read_from_path(&manifest_path)?;
+    let mut manifest = ShardManifest::read_from_path(&manifest_path)?;
+    if manifest.bit_frequencies().is_none() && !manifest.shards().is_empty() {
+        let shard_dir = manifest_path.parent().map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        );
+        println!(
+            "backfilling bit_counts in {} by scanning {} cached shards (one-time)...",
+            manifest_path.display(),
+            manifest.shards().len()
+        );
+        manifest.backfill_bit_counts(&shard_dir)?;
+        manifest.write_to_path(&manifest_path)?;
+        println!(
+            "bit_counts written into {}; subsequent runs reuse them directly",
+            manifest_path.display()
+        );
+    }
     let shards = shard_infos(&manifest_path, &manifest)?;
     let fingerprint_size = manifest.preprocessing().counted_ecfp().size();
     let ecfp_radius = manifest.preprocessing().counted_ecfp().radius();
@@ -56,8 +73,8 @@ where
     let bit_frequencies = manifest.bit_frequencies().unwrap_or_default();
     if bit_frequencies.is_empty() {
         eprintln!(
-            "warning: manifest at {} has no bit-count statistics; BCE will fall back to uniform \
-             weighting. Re-preprocess (or `--force-preprocess`) to enable per-bin reweighting.",
+            "warning: manifest at {} has no shards and no bit-count statistics; BCE will fall \
+             back to uniform weighting.",
             manifest_path.display()
         );
     }
