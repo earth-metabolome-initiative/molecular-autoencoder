@@ -77,7 +77,7 @@ fn embed_pipeline_smi_to_tsv_round_trips() {
     assert_eq!(lines.len(), 1 + smiles.len(), "header + one row per smile");
     assert_eq!(
         lines[0].matches('\t').count(),
-        3 + config.encoder().latent_width() - 1
+        4 + config.encoder().latent_width() - 1
     );
     let first_row = lines[1];
     assert!(first_row.starts_with("CCO\t"));

@@ -19,6 +19,7 @@ pub struct BatchLossMetrics {
     pub tanimoto_ranking: f32,
     pub tanimoto_ranking_accuracy: f32,
     pub count_tanimoto: f32,
+    pub binary_tanimoto: f32,
 }
 
 /// Returns `"train"` or `"valid"` for the given split.
@@ -38,7 +39,8 @@ pub const fn should_sample_metrics(batch_index: usize, every: usize) -> bool {
 pub fn loss_metrics<B>(
     loss: Tensor<B, 1>,
     losses: &MoleculeLossBreakdown<B>,
-    tanimoto: Tensor<B, 1>,
+    count_tanimoto: Tensor<B, 1>,
+    binary_tanimoto: Tensor<B, 1>,
 ) -> AppResult<BatchLossMetrics>
 where
     B: Backend<FloatElem = f32>,
@@ -49,12 +51,13 @@ where
         .register(losses.descriptors.clone())
         .register(losses.tanimoto_ranking.clone())
         .register(losses.tanimoto_ranking_accuracy.clone())
-        .register(tanimoto)
+        .register(count_tanimoto)
+        .register(binary_tanimoto)
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read training metrics: {source}")))?;
-    if data.len() != 6 {
+    if data.len() != 7 {
         return Err(invalid_input(format!(
-            "training metrics transaction returned {} tensors instead of 6",
+            "training metrics transaction returned {} tensors instead of 7",
             data.len()
         )));
     }
@@ -65,15 +68,18 @@ where
         tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
         tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
         count_tanimoto: scalar_data(&data[5], "count Tanimoto")?,
+        binary_tanimoto: scalar_data(&data[6], "binary Tanimoto")?,
     })
 }
 
-/// Computes batch loss metrics plus the count-Tanimoto scalar for validation.
+/// Computes batch loss metrics plus the count- and binary-Tanimoto scalars
+/// for validation.
 pub fn validation_metrics<B>(
     loss: Tensor<B, 1>,
     losses: &MoleculeLossBreakdown<B>,
-    tanimoto: Tensor<B, 1>,
-) -> AppResult<(BatchLossMetrics, f32)>
+    count_tanimoto: Tensor<B, 1>,
+    binary_tanimoto: Tensor<B, 1>,
+) -> AppResult<(BatchLossMetrics, f32, f32)>
 where
     B: Backend<FloatElem = f32>,
 {
@@ -83,16 +89,18 @@ where
         .register(losses.descriptors.clone())
         .register(losses.tanimoto_ranking.clone())
         .register(losses.tanimoto_ranking_accuracy.clone())
-        .register(tanimoto)
+        .register(count_tanimoto)
+        .register(binary_tanimoto)
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read validation metrics: {source}")))?;
-    if data.len() != 6 {
+    if data.len() != 7 {
         return Err(invalid_input(format!(
-            "validation metrics transaction returned {} tensors instead of 6",
+            "validation metrics transaction returned {} tensors instead of 7",
             data.len()
         )));
     }
     let count_tanimoto = scalar_data(&data[5], "count Tanimoto")?;
+    let binary_tanimoto = scalar_data(&data[6], "binary Tanimoto")?;
     Ok((
         BatchLossMetrics {
             loss: scalar_data(&data[0], "loss")?,
@@ -101,8 +109,10 @@ where
             tanimoto_ranking: scalar_data(&data[3], "Tanimoto geometry loss")?,
             tanimoto_ranking_accuracy: scalar_data(&data[4], "Tanimoto geometry accuracy")?,
             count_tanimoto,
+            binary_tanimoto,
         },
         count_tanimoto,
+        binary_tanimoto,
     ))
 }
 

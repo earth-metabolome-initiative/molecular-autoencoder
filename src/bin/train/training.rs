@@ -9,7 +9,8 @@ use burn::{
 };
 use molecular_autoencoder::{
     DataSplit, MoleculeAutoencoder, MoleculeAutoencoderBatch, MoleculeAutoencoderBatcher,
-    TanimotoRankingRuntimeConfig, batch_sparse_log_count_tanimoto,
+    TanimotoRankingRuntimeConfig, batch_sparse_log_count_binary_tanimoto,
+    batch_sparse_log_count_tanimoto,
 };
 
 use crate::{
@@ -68,7 +69,8 @@ pub struct EvaluationSummary {
     pub loss_batches: usize,
     pub examples: usize,
     pub loss_sum: f64,
-    pub tanimoto_sum: f64,
+    pub count_tanimoto_sum: f64,
+    pub binary_tanimoto_sum: f64,
     pub data_time: Duration,
     pub step_time: Duration,
 }
@@ -78,7 +80,8 @@ impl EvaluationSummary {
         &mut self,
         examples: usize,
         loss: Option<f32>,
-        tanimoto: f32,
+        count_tanimoto: f32,
+        binary_tanimoto: f32,
         data_time: Duration,
         step_time: Duration,
     ) {
@@ -88,7 +91,8 @@ impl EvaluationSummary {
             self.loss_batches += 1;
             self.loss_sum += f64::from(loss);
         }
-        self.tanimoto_sum += f64::from(tanimoto);
+        self.count_tanimoto_sum += f64::from(count_tanimoto);
+        self.binary_tanimoto_sum += f64::from(binary_tanimoto);
         self.data_time += data_time;
         self.step_time += step_time;
     }
@@ -101,11 +105,19 @@ impl EvaluationSummary {
         }
     }
 
-    pub fn mean_tanimoto(self) -> f32 {
+    pub fn mean_count_tanimoto(self) -> f32 {
         if self.batches == 0 {
             0.0
         } else {
-            (self.tanimoto_sum / self.batches as f64) as f32
+            (self.count_tanimoto_sum / self.batches as f64) as f32
+        }
+    }
+
+    pub fn mean_binary_tanimoto(self) -> f32 {
+        if self.batches == 0 {
+            0.0
+        } else {
+            (self.binary_tanimoto_sum / self.batches as f64) as f32
         }
     }
 }
@@ -213,9 +225,17 @@ where
             let loss = losses.total();
             let batch_metrics = match (fingerprints_for_metrics, reconstructed_for_metrics) {
                 (Some(fingerprints), Some(reconstructed)) => {
-                    let tanimoto =
-                        batch_sparse_log_count_tanimoto(&fingerprints, reconstructed).mean();
-                    Some(loss_metrics(loss.clone(), &losses, tanimoto)?)
+                    let count_tanimoto =
+                        batch_sparse_log_count_tanimoto(&fingerprints, reconstructed.clone())
+                            .mean();
+                    let binary_tanimoto =
+                        batch_sparse_log_count_binary_tanimoto(&fingerprints, reconstructed).mean();
+                    Some(loss_metrics(
+                        loss.clone(),
+                        &losses,
+                        count_tanimoto,
+                        binary_tanimoto,
+                    )?)
                 }
                 _ => None,
             };
@@ -311,10 +331,18 @@ where
             let losses =
                 model.loss_from_output(output, fingerprints, descriptor_targets, tanimoto_ranking);
             let total_loss = losses.total();
-            let tanimoto_tensor =
-                batch_sparse_log_count_tanimoto(&fingerprints_for_metrics, reconstructed).mean();
-            let (batch_metrics, tanimoto) =
-                validation_metrics(total_loss.clone(), &losses, tanimoto_tensor)?;
+            let count_tanimoto_tensor =
+                batch_sparse_log_count_tanimoto(&fingerprints_for_metrics, reconstructed.clone())
+                    .mean();
+            let binary_tanimoto_tensor =
+                batch_sparse_log_count_binary_tanimoto(&fingerprints_for_metrics, reconstructed)
+                    .mean();
+            let (batch_metrics, count_tanimoto, binary_tanimoto) = validation_metrics(
+                total_loss.clone(),
+                &losses,
+                count_tanimoto_tensor,
+                binary_tanimoto_tensor,
+            )?;
             if !batch_metrics.loss.is_finite() {
                 return Err(invalid_input("non-finite validation loss"));
             }
@@ -322,7 +350,8 @@ where
             summary.record(
                 rows,
                 Some(batch_metrics.loss),
-                tanimoto,
+                count_tanimoto,
+                binary_tanimoto,
                 data_time,
                 step_time,
             );
@@ -332,7 +361,8 @@ where
                 summary.batches,
                 rows,
                 Some(batch_metrics),
-                tanimoto,
+                count_tanimoto,
+                binary_tanimoto,
             ))
         },
     )?;

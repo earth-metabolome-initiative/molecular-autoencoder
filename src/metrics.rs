@@ -57,6 +57,80 @@ pub fn batch_log_count_tanimoto<B: Backend>(
     batch_log_count_reconstruction_tanimoto(target_counts, predicted_log_counts)
 }
 
+/// Backend-native per-row binary Tanimoto for dense `[batch, width]` count tensors.
+///
+/// Treats each position with a positive count as a set bit and computes
+/// `|A ∩ B| / |A ∪ B|`. Rows where both sides are empty return `1.0`.
+///
+/// # Panics
+///
+/// Panics when the two count tensors have different shapes.
+#[must_use]
+pub fn batch_binary_tanimoto<B: Backend>(
+    left_counts: Tensor<B, 2>,
+    right_counts: Tensor<B, 2>,
+) -> Tensor<B, 1> {
+    let left_dims = left_counts.dims();
+    assert_eq!(
+        left_dims,
+        right_counts.dims(),
+        "count tensors must share a shape"
+    );
+
+    let batch_size = left_dims[0];
+    let device = left_counts.device();
+    let left_bits = left_counts.greater_elem(0.0).float();
+    let right_bits = right_counts.greater_elem(0.0).float();
+    let numerator = left_bits.clone().min_pair(right_bits.clone()).sum_dim(1);
+    let denominator = left_bits.max_pair(right_bits).sum_dim(1);
+    let raw = numerator / denominator.clone().clamp_min(1.0e-12);
+    let ones = Tensor::<B, 2>::ones([batch_size, 1], &device);
+    raw.mask_where(denominator.lower_equal_elem(0.0), ones)
+        .squeeze_dim(1)
+}
+
+/// Backend-native per-row binary Tanimoto from sparse target and dense
+/// reconstructed log-count tensors.
+///
+/// A position contributes a set bit on the target side iff the sparse
+/// mask is active there, and on the predicted side iff
+/// `exp(log_count) - 1 > 0`, i.e. `log_count > 0`.
+///
+/// # Panics
+///
+/// Panics when the predicted dense tensor shape does not match the sparse
+/// target batch size and fingerprint width.
+#[must_use]
+pub fn batch_sparse_log_count_binary_tanimoto<B: Backend>(
+    target: &SparseFingerprintBatch<B>,
+    predicted_log_counts: Tensor<B, 2>,
+) -> Tensor<B, 1> {
+    let predicted_dims = predicted_log_counts.dims();
+    assert_eq!(
+        predicted_dims[0],
+        target.batch_size(),
+        "predicted and target batches must have the same row count"
+    );
+    assert_eq!(
+        predicted_dims[1], target.fingerprint_size,
+        "predicted reconstruction width must match sparse fingerprint width"
+    );
+
+    let batch_size = predicted_dims[0];
+    let device = predicted_log_counts.device();
+    let predicted_bits = predicted_log_counts.greater_elem(0.0).float();
+    let predicted_total = predicted_bits.clone().sum_dim(1);
+    let predicted_at_target =
+        predicted_bits.gather(1, target.indices.clone()) * target.mask.clone();
+    let target_total = target.mask.clone().sum_dim(1);
+    let intersection = predicted_at_target.sum_dim(1);
+    let denominator = target_total + predicted_total - intersection.clone();
+    let raw = intersection / denominator.clone().clamp_min(1.0e-12);
+    let ones = Tensor::<B, 2>::ones([batch_size, 1], &device);
+    raw.mask_where(denominator.lower_equal_elem(0.0), ones)
+        .squeeze_dim(1)
+}
+
 /// Backend-native per-row Tanimoto from sparse target and dense reconstructed log-count tensors.
 ///
 /// # Panics
@@ -236,6 +310,43 @@ mod tests {
         ));
 
         assert!((values[0] - 0.25).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn binary_tanimoto_counts_bit_set_overlap() {
+        // target bits: {0, 2}, predicted bits: {0, 1}. |A ∩ B| = 1, |A ∪ B| = 3.
+        let left = tensor(vec![2.0, 0.0, 1.0, 0.0, 0.0, 0.0], [2, 3]);
+        let right = tensor(vec![3.0, 1.0, 0.0, 0.0, 0.0, 0.0], [2, 3]);
+        let values = tensor_values(batch_binary_tanimoto(left, right));
+
+        assert!((values[0] - (1.0 / 3.0)).abs() < 1.0e-6);
+        assert_eq!(values[1], 1.0);
+    }
+
+    #[test]
+    fn sparse_binary_tanimoto_matches_dense_metric() {
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let sparse = SparseFingerprintBatch {
+            indices: Tensor::<TestBackend, 2, burn::tensor::Int>::from_data([[0_i64, 2]], &device),
+            counts: tensor(vec![2.0, 1.0], [1, 2]),
+            log_counts: tensor(vec![2.0_f32.ln_1p(), 1.0_f32.ln_1p()], [1, 2]),
+            mask: tensor(vec![1.0, 1.0], [1, 2]),
+            fingerprint_size: 4,
+            max_nnz: 2,
+        };
+        let target = tensor(vec![2.0, 0.0, 1.0, 0.0], [1, 4]);
+        // Predicted log counts: positions 0, 1 active (log_count > 0), positions 2, 3 inactive.
+        let predicted_log = tensor(vec![1.0_f32.ln_1p(), 1.0_f32.ln_1p(), 0.0, -1.0], [1, 4]);
+        let dense = tensor_values(batch_binary_tanimoto(
+            target,
+            (predicted_log.clone().exp() - 1.0).clamp_min(0.0),
+        ));
+        let sparse = tensor_values(batch_sparse_log_count_binary_tanimoto(
+            &sparse,
+            predicted_log,
+        ));
+
+        assert!((dense[0] - sparse[0]).abs() < 1.0e-6);
     }
 
     #[test]

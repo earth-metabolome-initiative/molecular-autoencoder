@@ -187,8 +187,9 @@ where
                     let valid_loss = valid.mean_loss();
                     if !reporter.is_active() {
                         println!(
-                            "epoch={epoch} valid_loss={valid_loss:.6} valid_count_tanimoto={:.6} valid_batches={} valid_examples={} valid_data_wait_ms_per_batch={:.3} valid_step_ms_per_batch={:.3}",
-                            valid.mean_tanimoto(),
+                            "epoch={epoch} valid_loss={valid_loss:.6} valid_count_tanimoto={:.6} valid_binary_tanimoto={:.6} valid_batches={} valid_examples={} valid_data_wait_ms_per_batch={:.3} valid_step_ms_per_batch={:.3}",
+                            valid.mean_count_tanimoto(),
+                            valid.mean_binary_tanimoto(),
                             valid.batches,
                             valid.examples,
                             millis_per_batch(valid.data_time, valid.batches),

@@ -2,7 +2,8 @@
 //!
 //! Schema (pinned at [`EncodingSink::open`]):
 //! - `smiles`: `Utf8`
-//! - `tanimoto`: `Float32`
+//! - `count_tanimoto`: `Float32`
+//! - `binary_tanimoto`: `Float32`
 //! - `log_mse`: `Float32`
 //! - `latent`: `FixedSizeList<Float32, latent_width>`
 
@@ -31,7 +32,8 @@ pub struct ParquetSink {
     schema: Option<Arc<Schema>>,
     latent_width: Option<usize>,
     pending_smiles: Vec<String>,
-    pending_tanimoto: Vec<f32>,
+    pending_count_tanimoto: Vec<f32>,
+    pending_binary_tanimoto: Vec<f32>,
     pending_log_mse: Vec<f32>,
     pending_latent: Vec<f32>,
     flush_threshold: usize,
@@ -55,7 +57,8 @@ impl ParquetSink {
             schema: None,
             latent_width: None,
             pending_smiles: Vec::new(),
-            pending_tanimoto: Vec::new(),
+            pending_count_tanimoto: Vec::new(),
+            pending_binary_tanimoto: Vec::new(),
             pending_log_mse: Vec::new(),
             pending_latent: Vec::new(),
             flush_threshold: 4096,
@@ -81,8 +84,11 @@ impl ParquetSink {
 
         let smiles_array: ArrayRef =
             Arc::new(StringArray::from(std::mem::take(&mut self.pending_smiles)));
-        let tanimoto_array: ArrayRef = Arc::new(Float32Array::from(std::mem::take(
-            &mut self.pending_tanimoto,
+        let count_tanimoto_array: ArrayRef = Arc::new(Float32Array::from(std::mem::take(
+            &mut self.pending_count_tanimoto,
+        )));
+        let binary_tanimoto_array: ArrayRef = Arc::new(Float32Array::from(std::mem::take(
+            &mut self.pending_binary_tanimoto,
         )));
         let log_mse_array: ArrayRef = Arc::new(Float32Array::from(std::mem::take(
             &mut self.pending_log_mse,
@@ -104,7 +110,13 @@ impl ParquetSink {
 
         let batch = RecordBatch::try_new(
             schema,
-            vec![smiles_array, tanimoto_array, log_mse_array, latent_array],
+            vec![
+                smiles_array,
+                count_tanimoto_array,
+                binary_tanimoto_array,
+                log_mse_array,
+                latent_array,
+            ],
         )
         .map_err(|source| {
             Error::InvalidBatch(format!("parquet record batch build failed: {source}"))
@@ -123,7 +135,8 @@ impl EncodingSink for ParquetSink {
         let latent_field = Arc::new(Field::new("item", DataType::Float32, false));
         let arrow_schema = Arc::new(Schema::new(vec![
             Field::new("smiles", DataType::Utf8, false),
-            Field::new("tanimoto", DataType::Float32, false),
+            Field::new("count_tanimoto", DataType::Float32, false),
+            Field::new("binary_tanimoto", DataType::Float32, false),
             Field::new("log_mse", DataType::Float32, false),
             Field::new(
                 "latent",
@@ -162,8 +175,10 @@ impl EncodingSink for ParquetSink {
             )));
         }
         self.pending_smiles.push(row.smiles.clone());
-        self.pending_tanimoto
+        self.pending_count_tanimoto
             .push(row.reconstruction_count_tanimoto);
+        self.pending_binary_tanimoto
+            .push(row.reconstruction_binary_tanimoto);
         self.pending_log_mse.push(row.reconstruction_log_mse);
         self.pending_latent.extend_from_slice(&row.latent);
         if self.pending_smiles.len() >= self.flush_threshold {
@@ -222,6 +237,7 @@ mod tests {
                     smiles: smiles.to_string(),
                     latent: vec![0.1, 0.2, 0.3],
                     reconstruction_count_tanimoto: 0.8,
+                    reconstruction_binary_tanimoto: 0.91,
                     reconstruction_log_mse: 0.05,
                 }
                 .into(),
@@ -242,8 +258,11 @@ mod tests {
         assert_eq!(total_rows, 2);
         let first = &batches[0];
         assert_eq!(first.schema().field(0).name(), "smiles");
-        assert_eq!(first.schema().field(3).name(), "latent");
-        match first.schema().field(3).data_type() {
+        assert_eq!(first.schema().field(1).name(), "count_tanimoto");
+        assert_eq!(first.schema().field(2).name(), "binary_tanimoto");
+        assert_eq!(first.schema().field(3).name(), "log_mse");
+        assert_eq!(first.schema().field(4).name(), "latent");
+        match first.schema().field(4).data_type() {
             DataType::FixedSizeList(_, size) => assert_eq!(size, &3),
             other => panic!("expected fixed-size list, got {other:?}"),
         }

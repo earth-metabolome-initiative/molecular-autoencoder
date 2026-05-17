@@ -18,11 +18,11 @@ use smiles_parser::prelude::Smiles;
 use crate::{
     CountedEcfpConfig, Error, MoleculeAutoencoder, MoleculeAutoencoderBatch,
     MoleculeAutoencoderBatcher, MoleculeAutoencoderConfig, MoleculeAutoencoderSample, Result,
-    batch_sparse_log_count_tanimoto, compute_fingerprint_targets,
-    features::REGRESSION_TARGET_WIDTH,
+    batch_sparse_log_count_binary_tanimoto, batch_sparse_log_count_tanimoto,
+    compute_fingerprint_targets, features::REGRESSION_TARGET_WIDTH,
 };
 
-/// One molecule's encoder output: the latent embedding plus the two
+/// One molecule's encoder output: the latent embedding plus the
 /// reconstruction-quality signals used for out-of-distribution detection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodingRow {
@@ -35,6 +35,11 @@ pub struct EncodingRow {
     /// fingerprint and the decoder's reconstructed counts. Range `[0, 1]`;
     /// low values flag inputs the model can't reproduce well.
     pub reconstruction_count_tanimoto: f32,
+    /// Per-row binary (bit-presence) Tanimoto similarity between the input
+    /// fingerprint and the decoder's reconstructed counts. Range `[0, 1]`;
+    /// useful for spotting reconstructions that hit the right bits but
+    /// miss the magnitudes.
+    pub reconstruction_binary_tanimoto: f32,
     /// Per-row mean-squared error over `log1p(count)` predictions. Higher
     /// values mean the reconstruction is further from the input.
     pub reconstruction_log_mse: f32,
@@ -152,7 +157,11 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
             self.batcher.batch_profiled(samples, &self.device);
         let output = self.model.forward(&batch.fingerprints);
 
-        let tanimoto = batch_sparse_log_count_tanimoto(
+        let count_tanimoto = batch_sparse_log_count_tanimoto(
+            &batch.fingerprints,
+            output.reconstructed_log_counts.clone(),
+        );
+        let binary_tanimoto = batch_sparse_log_count_binary_tanimoto(
             &batch.fingerprints,
             output.reconstructed_log_counts.clone(),
         );
@@ -163,9 +172,15 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
             .mean_dim(1);
         let log_mse: Tensor<B, 1> = log_mse_2d.squeeze_dim(1);
 
-        let [latent, tanimoto_data, log_mse_data] = Transaction::default()
+        let [
+            latent,
+            count_tanimoto_data,
+            binary_tanimoto_data,
+            log_mse_data,
+        ] = Transaction::default()
             .register(output.latent)
-            .register(tanimoto)
+            .register(count_tanimoto)
+            .register(binary_tanimoto)
             .register(log_mse)
             .try_execute()
             .map_err(|source| Error::InvalidBatch(format!("encode transaction failed: {source}")))?
@@ -178,9 +193,12 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
         let latent_values = latent
             .as_slice::<f32>()
             .map_err(|source| Error::InvalidBatch(format!("latent tensor not f32: {source}")))?;
-        let tanimoto_values = tanimoto_data
-            .as_slice::<f32>()
-            .map_err(|source| Error::InvalidBatch(format!("tanimoto tensor not f32: {source}")))?;
+        let count_tanimoto_values = count_tanimoto_data.as_slice::<f32>().map_err(|source| {
+            Error::InvalidBatch(format!("count tanimoto tensor not f32: {source}"))
+        })?;
+        let binary_tanimoto_values = binary_tanimoto_data.as_slice::<f32>().map_err(|source| {
+            Error::InvalidBatch(format!("binary tanimoto tensor not f32: {source}"))
+        })?;
         let log_mse_values = log_mse_data
             .as_slice::<f32>()
             .map_err(|source| Error::InvalidBatch(format!("log_mse tensor not f32: {source}")))?;
@@ -195,7 +213,8 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
                     EncodingRow {
                         smiles: smiles[input_index].clone(),
                         latent: latent_values[start..end].to_vec(),
-                        reconstruction_count_tanimoto: tanimoto_values[index],
+                        reconstruction_count_tanimoto: count_tanimoto_values[index],
+                        reconstruction_binary_tanimoto: binary_tanimoto_values[index],
                         reconstruction_log_mse: log_mse_values[index],
                     }
                 })

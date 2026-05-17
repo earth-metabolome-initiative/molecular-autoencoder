@@ -34,7 +34,7 @@ impl StdoutSink {
 
 impl EncodingSink for StdoutSink {
     fn open(&mut self, schema: &EncodingSchema) -> Result<()> {
-        let mut header = String::from("smiles\ttanimoto\tlog_mse");
+        let mut header = String::from("smiles\tcount_tanimoto\tbinary_tanimoto\tlog_mse");
         for index in 0..schema.latent_width {
             write!(header, "\tlatent_{index}").map_err(stdout_fmt_error)?;
         }
@@ -61,8 +61,10 @@ impl EncodingSink for StdoutSink {
         line.push_str(&row.smiles);
         write!(
             line,
-            "\t{:.7}\t{:.7}",
-            row.reconstruction_count_tanimoto, row.reconstruction_log_mse
+            "\t{:.7}\t{:.7}\t{:.7}",
+            row.reconstruction_count_tanimoto,
+            row.reconstruction_binary_tanimoto,
+            row.reconstruction_log_mse
         )
         .map_err(stdout_fmt_error)?;
         for value in &row.latent {

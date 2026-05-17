@@ -1,7 +1,7 @@
 //! `.tsv` / `.csv` writer.
 //!
 //! Column layout:
-//! `smiles  tanimoto  log_mse  latent_0  latent_1  ...  latent_{N-1}`
+//! `smiles  count_tanimoto  binary_tanimoto  log_mse  latent_0  latent_1  ...  latent_{N-1}`
 //! where the separator is set at construction time.
 
 use std::{fs::File, path::Path};
@@ -41,9 +41,10 @@ impl TsvSink {
 
 impl EncodingSink for TsvSink {
     fn open(&mut self, schema: &EncodingSchema) -> Result<()> {
-        let mut headers = Vec::with_capacity(3 + schema.latent_width);
+        let mut headers = Vec::with_capacity(4 + schema.latent_width);
         headers.push("smiles".to_string());
-        headers.push("tanimoto".to_string());
+        headers.push("count_tanimoto".to_string());
+        headers.push("binary_tanimoto".to_string());
         headers.push("log_mse".to_string());
         for index in 0..schema.latent_width {
             headers.push(format!("latent_{index}"));
@@ -66,9 +67,10 @@ impl EncodingSink for TsvSink {
                 row.latent.len()
             )));
         }
-        let mut fields = Vec::with_capacity(3 + row.latent.len());
+        let mut fields = Vec::with_capacity(4 + row.latent.len());
         fields.push(row.smiles.clone());
         fields.push(format_f32(row.reconstruction_count_tanimoto));
+        fields.push(format_f32(row.reconstruction_binary_tanimoto));
         fields.push(format_f32(row.reconstruction_log_mse));
         for value in &row.latent {
             fields.push(format_f32(*value));
@@ -109,6 +111,7 @@ mod tests {
             smiles: "CCO".into(),
             latent: vec![0.1, 0.2, 0.3],
             reconstruction_count_tanimoto: 0.85,
+            reconstruction_binary_tanimoto: 0.93,
             reconstruction_log_mse: 0.042,
         };
         sink.write(&row.into()).expect("write");
@@ -122,10 +125,10 @@ mod tests {
         let mut lines = text.lines();
         assert_eq!(
             lines.next().expect("header"),
-            "smiles\ttanimoto\tlog_mse\tlatent_0\tlatent_1\tlatent_2"
+            "smiles\tcount_tanimoto\tbinary_tanimoto\tlog_mse\tlatent_0\tlatent_1\tlatent_2"
         );
         let data = lines.next().expect("row");
         assert!(data.starts_with("CCO\t"));
-        assert_eq!(data.matches('\t').count(), 5);
+        assert_eq!(data.matches('\t').count(), 6);
     }
 }

@@ -22,7 +22,8 @@ pub struct JsonlSink {
 #[derive(Serialize)]
 struct JsonlRow<'a> {
     smiles: &'a str,
-    tanimoto: f32,
+    count_tanimoto: f32,
+    binary_tanimoto: f32,
     log_mse: f32,
     latent: &'a [f32],
 }
@@ -51,7 +52,8 @@ impl EncodingSink for JsonlSink {
         let row = &record.row;
         let payload = JsonlRow {
             smiles: &row.smiles,
-            tanimoto: row.reconstruction_count_tanimoto,
+            count_tanimoto: row.reconstruction_count_tanimoto,
+            binary_tanimoto: row.reconstruction_binary_tanimoto,
             log_mse: row.reconstruction_log_mse,
             latent: &row.latent,
         };
@@ -92,6 +94,7 @@ mod tests {
                 smiles: "CCO".into(),
                 latent: vec![0.1_f32, -0.5],
                 reconstruction_count_tanimoto: 0.9,
+                reconstruction_binary_tanimoto: 0.95,
                 reconstruction_log_mse: 0.01,
             }
             .into(),
@@ -106,6 +109,8 @@ mod tests {
             .expect("read");
         let value: serde_json::Value = serde_json::from_str(text.trim()).expect("parse");
         assert_eq!(value["smiles"], "CCO");
+        assert_eq!(value["count_tanimoto"], 0.9_f32);
+        assert_eq!(value["binary_tanimoto"], 0.95_f32);
         assert_eq!(value["latent"][0], 0.1_f32);
         assert_eq!(value["latent"][1], -0.5_f32);
     }

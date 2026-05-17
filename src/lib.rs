@@ -48,8 +48,9 @@ pub use fingerprints::{
     FingerprintTargets, compute_fingerprint_targets,
 };
 pub use metrics::{
-    CountReconstructionMetrics, batch_count_tanimoto, batch_log_count_reconstruction_tanimoto,
-    batch_log_count_tanimoto, batch_sparse_log_count_tanimoto, count_tanimoto,
+    CountReconstructionMetrics, batch_binary_tanimoto, batch_count_tanimoto,
+    batch_log_count_reconstruction_tanimoto, batch_log_count_tanimoto,
+    batch_sparse_log_count_binary_tanimoto, batch_sparse_log_count_tanimoto, count_tanimoto,
 };
 pub use model::{
     AuxiliaryLossWeights, AuxiliaryLossWeightsBuilder, DEFAULT_DESCRIPTOR_WEIGHT,

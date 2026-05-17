@@ -142,8 +142,13 @@ impl TrainingReporter {
                     examples,
                 ));
                 renderer.update_train(metric_state(
-                    self.metric_ids.tanimoto.clone(),
+                    self.metric_ids.count_tanimoto.clone(),
                     metrics.count_tanimoto,
+                    examples,
+                ));
+                renderer.update_train(metric_state(
+                    self.metric_ids.binary_tanimoto.clone(),
+                    metrics.binary_tanimoto,
                     examples,
                 ));
             }
@@ -183,6 +188,7 @@ impl TrainingReporter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn valid_batch(
         &mut self,
         epoch: usize,
@@ -190,7 +196,8 @@ impl TrainingReporter {
         iteration: usize,
         examples: usize,
         metrics: Option<BatchLossMetrics>,
-        tanimoto: f32,
+        count_tanimoto: f32,
+        binary_tanimoto: f32,
     ) -> BatchControl {
         if self.valid_epoch != Some(epoch) {
             self.valid_epoch = Some(epoch);
@@ -230,8 +237,13 @@ impl TrainingReporter {
                 ));
             }
             renderer.update_valid(metric_state(
-                self.metric_ids.tanimoto.clone(),
-                tanimoto,
+                self.metric_ids.count_tanimoto.clone(),
+                count_tanimoto,
+                examples,
+            ));
+            renderer.update_valid(metric_state(
+                self.metric_ids.binary_tanimoto.clone(),
+                binary_tanimoto,
                 examples,
             ));
             renderer.render_valid(
@@ -258,7 +270,8 @@ impl TrainingReporter {
                 self.valid_processed,
                 self.valid_total,
                 metrics,
-                tanimoto,
+                count_tanimoto,
+                binary_tanimoto,
             );
         }
 
@@ -322,18 +335,20 @@ impl IndicatifTrainingBars {
         let step_ms = step_time.as_secs_f64() * 1000.0;
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} tanimoto={:.4} data_ms={data_ms:.1} step_ms={step_ms:.1}",
+                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} count_tan={:.4} bin_tan={:.4} data_ms={data_ms:.1} step_ms={step_ms:.1}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.descriptors,
                 metrics.tanimoto_ranking,
                 metrics.tanimoto_ranking_accuracy,
                 metrics.count_tanimoto,
+                metrics.binary_tanimoto,
             )),
             None => bar.set_message(format!("data_ms={data_ms:.1} step_ms={step_ms:.1}")),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn valid_batch(
         &mut self,
         epoch: usize,
@@ -341,20 +356,25 @@ impl IndicatifTrainingBars {
         processed: usize,
         total: usize,
         metrics: Option<BatchLossMetrics>,
-        tanimoto: f32,
+        count_tanimoto: f32,
+        binary_tanimoto: f32,
     ) {
         let bar = self.phase_bar(ProgressKind::Valid, epoch, epoch_total, total);
         bar.set_position(processed as u64);
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} tanimoto={tanimoto:.4}",
+                "loss={:.4} recon={:.4} desc={:.4} tanrank={:.4} acc={:.3} count_tan={count_tanimoto:.4} bin_tan={binary_tanimoto:.4}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.descriptors,
                 metrics.tanimoto_ranking,
                 metrics.tanimoto_ranking_accuracy,
             )),
-            None => bar.set_message(format!("tanimoto={tanimoto:.4}")),
+            None => {
+                bar.set_message(format!(
+                    "count_tan={count_tanimoto:.4} bin_tan={binary_tanimoto:.4}"
+                ));
+            }
         }
     }
 
@@ -399,17 +419,19 @@ enum ReporterMetric {
     Descriptors,
     TanimotoRanking,
     TanimotoRankingAccuracy,
-    Tanimoto,
+    CountTanimoto,
+    BinaryTanimoto,
 }
 
 impl ReporterMetric {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Loss,
         Self::Reconstruction,
         Self::Descriptors,
         Self::TanimotoRanking,
         Self::TanimotoRankingAccuracy,
-        Self::Tanimoto,
+        Self::CountTanimoto,
+        Self::BinaryTanimoto,
     ];
 
     const fn name(self) -> &'static str {
@@ -419,7 +441,8 @@ impl ReporterMetric {
             Self::Descriptors => "Descriptor Loss",
             Self::TanimotoRanking => "Tanimoto Geometry Loss",
             Self::TanimotoRankingAccuracy => "Tanimoto Geometry Accuracy",
-            Self::Tanimoto => "Count Tanimoto",
+            Self::CountTanimoto => "Count Tanimoto",
+            Self::BinaryTanimoto => "Binary Tanimoto",
         }
     }
 
@@ -432,12 +455,16 @@ impl ReporterMetric {
             Self::TanimotoRankingAccuracy => {
                 "latent best-candidate accuracy for sampled Tanimoto sets"
             }
-            Self::Tanimoto => "counted fingerprint Tanimoto reconstruction metric",
+            Self::CountTanimoto => "counted fingerprint Tanimoto reconstruction metric",
+            Self::BinaryTanimoto => "binary fingerprint Tanimoto reconstruction metric",
         }
     }
 
     const fn higher_is_better(self) -> bool {
-        matches!(self, Self::Tanimoto | Self::TanimotoRankingAccuracy)
+        matches!(
+            self,
+            Self::CountTanimoto | Self::BinaryTanimoto | Self::TanimotoRankingAccuracy
+        )
     }
 
     fn definition(self, metric_id: MetricId) -> MetricDefinition {
@@ -460,7 +487,8 @@ struct ReporterMetricIds {
     descriptors: MetricId,
     tanimoto_ranking: MetricId,
     tanimoto_ranking_accuracy: MetricId,
-    tanimoto: MetricId,
+    count_tanimoto: MetricId,
+    binary_tanimoto: MetricId,
 }
 
 impl ReporterMetricIds {
@@ -471,7 +499,8 @@ impl ReporterMetricIds {
             descriptors: metric_id(ReporterMetric::Descriptors),
             tanimoto_ranking: metric_id(ReporterMetric::TanimotoRanking),
             tanimoto_ranking_accuracy: metric_id(ReporterMetric::TanimotoRankingAccuracy),
-            tanimoto: metric_id(ReporterMetric::Tanimoto),
+            count_tanimoto: metric_id(ReporterMetric::CountTanimoto),
+            binary_tanimoto: metric_id(ReporterMetric::BinaryTanimoto),
         }
     }
 
@@ -482,7 +511,8 @@ impl ReporterMetricIds {
             ReporterMetric::Descriptors => self.descriptors.clone(),
             ReporterMetric::TanimotoRanking => self.tanimoto_ranking.clone(),
             ReporterMetric::TanimotoRankingAccuracy => self.tanimoto_ranking_accuracy.clone(),
-            ReporterMetric::Tanimoto => self.tanimoto.clone(),
+            ReporterMetric::CountTanimoto => self.count_tanimoto.clone(),
+            ReporterMetric::BinaryTanimoto => self.binary_tanimoto.clone(),
         }
     }
 }
