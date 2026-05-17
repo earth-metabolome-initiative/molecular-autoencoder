@@ -1,8 +1,17 @@
-\documentclass[border=1pt]{standalone}
+\documentclass[border=2pt]{standalone}
 \usepackage{amsmath}
+\usepackage{amssymb}
 \usepackage{xcolor}
 \begin{document}
 \color[HTML]{1F3342}
-$\mathcal{L}_{\mathrm{recon}} =
-\operatorname{Huber}_{\beta}\!\left(\hat{\mathbf{x}}_{\log}, \mathbf{x}_{\log}\right)$
+\(\displaystyle
+\begin{aligned}
+\mathcal{L}_{\mathrm{recon}}
+&= \frac{1}{N}\sum_{i=1}^{N}
+   w_{i}^{\mathrm{H}}\, H_{\beta}\!\left(\widehat{z}_{i} - z_{i}\right)\\
+&\quad + \lambda_{\mathrm{B}}\,\frac{1}{N}\sum_{i=1}^{N}
+   w_{i}^{\mathrm{B}}\!\left[\operatorname{softplus}(\widehat{z}_{i})
+   - \widehat{z}_{i}\,y_{i}\right]
+\end{aligned}
+\)
 \end{document}
