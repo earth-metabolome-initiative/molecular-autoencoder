@@ -8,7 +8,6 @@ use std::error::Error as StdError;
 
 use clap::Parser;
 
-mod bit_counts;
 mod checkpoint;
 mod cli;
 mod dataloader;

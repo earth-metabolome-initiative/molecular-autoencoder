@@ -53,10 +53,14 @@ where
     let state_path = args.checkpoint_dir.join("state.json");
 
     std::fs::create_dir_all(&args.checkpoint_dir)?;
-    let bit_frequencies = match args.bit_counts.as_deref() {
-        Some(path) => crate::bit_counts::load_bit_frequencies(path, fingerprint_size)?,
-        None => Vec::new(),
-    };
+    let bit_frequencies = manifest.bit_frequencies().unwrap_or_default();
+    if bit_frequencies.is_empty() {
+        eprintln!(
+            "warning: manifest at {} has no bit-count statistics; BCE will fall back to uniform \
+             weighting. Re-preprocess (or `--force-preprocess`) to enable per-bin reweighting.",
+            manifest_path.display()
+        );
+    }
     let model_config = if args.resume && model_config_path.exists() {
         let config = MoleculeAutoencoderConfig::load_json(&model_config_path)?;
         config.validate(fingerprint_size)?;

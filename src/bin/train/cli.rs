@@ -322,13 +322,6 @@ pub struct Args {
     /// Per-position weight applied to active bins inside the BCE term.
     #[arg(long, default_value_t = DEFAULT_BCE_NONZERO_WEIGHT)]
     pub bce_nonzero_weight: f64,
-
-    /// Path to a `bit_counts_ECFP_fp_size<N>.csv` file (produced by
-    /// `molecular-fingerprint-bucket-counts`) whose `fraction` column is
-    /// used as the per-bin marginal frequency `p_i` driving the BCE
-    /// class reweighting. When omitted, BCE stays uniform.
-    #[arg(long, value_name = "PATH")]
-    pub bit_counts: Option<PathBuf>,
 }
 
 impl Args {

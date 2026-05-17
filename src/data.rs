@@ -648,6 +648,11 @@ pub struct SparseMoleculeShard {
     counts: Vec<u16>,
     descriptor_targets: Vec<f32>,
     splits: Vec<DataSplit>,
+    /// Per-bin tally of rows in which each fingerprint bit fires at all.
+    /// Length equals `fingerprint_size`. Length 0 on legacy shards loaded
+    /// from disk that predate the bit-count accumulator.
+    #[serde(default)]
+    bit_counts: Vec<u64>,
 }
 
 impl SparseMoleculeShard {
@@ -663,6 +668,7 @@ impl SparseMoleculeShard {
             counts: Vec::new(),
             descriptor_targets: Vec::new(),
             splits: Vec::new(),
+            bit_counts: vec![0_u64; fingerprint_size],
         }
     }
 
@@ -714,6 +720,13 @@ impl SparseMoleculeShard {
         &self.splits
     }
 
+    /// Per-bin tally of how many rows have each fingerprint bit set. Empty
+    /// on legacy shards loaded from disk that predate the accumulator.
+    #[must_use]
+    pub fn bit_counts(&self) -> &[u64] {
+        &self.bit_counts
+    }
+
     /// Number of rows.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -760,6 +773,11 @@ impl SparseMoleculeShard {
             .extend_from_slice(descriptor_targets);
         self.splits.push(split);
         self.row_offsets.push(self.indices.len() as u64);
+        if self.bit_counts.len() == self.fingerprint_size {
+            for &index in fingerprint.indices() {
+                self.bit_counts[usize::from(index)] += 1;
+            }
+        }
         Ok(())
     }
 
@@ -912,6 +930,9 @@ impl SparseMoleculeShard {
             counts,
             descriptor_targets,
             splits,
+            // Not persisted in the binary shard format; the manifest is the
+            // canonical source for per-bin counts.
+            bit_counts: Vec::new(),
         };
         shard.validate_for_path(path)?;
         Ok(shard)
@@ -1064,6 +1085,9 @@ impl SparseMoleculeShard {
             counts,
             descriptor_targets,
             splits,
+            // Not persisted in the binary shard format; the manifest is the
+            // canonical source for per-bin counts.
+            bit_counts: Vec::new(),
         };
         shard.validate_for_path(path)?;
         Ok(shard)
@@ -1146,12 +1170,18 @@ pub struct ShardManifest {
     row_count: usize,
     skipped_count: usize,
     error_count: usize,
+    /// Per-bin row count across all shards. Empty on legacy manifests
+    /// produced before the accumulator existed; in that case the training
+    /// loop falls back to uniform BCE.
+    #[serde(default)]
+    bit_counts: Vec<u64>,
 }
 
 impl ShardManifest {
     /// Creates an empty manifest.
     #[must_use]
     pub fn new(source: impl Into<String>, preprocessing: PreprocessingConfig) -> Self {
+        let fingerprint_size = preprocessing.counted_ecfp().size();
         Self {
             manifest_version: SHARD_MANIFEST_VERSION,
             source: source.into(),
@@ -1160,6 +1190,7 @@ impl ShardManifest {
             row_count: 0,
             skipped_count: 0,
             error_count: 0,
+            bit_counts: vec![0_u64; fingerprint_size],
         }
     }
 
@@ -1223,6 +1254,40 @@ impl ShardManifest {
             row_count: shard.len(),
             nnz: shard.indices.len(),
         });
+        if !shard.bit_counts.is_empty() {
+            let fingerprint_size = shard.fingerprint_size();
+            if self.bit_counts.len() != fingerprint_size {
+                self.bit_counts = vec![0_u64; fingerprint_size];
+            }
+            for (slot, increment) in self.bit_counts.iter_mut().zip(&shard.bit_counts) {
+                *slot += increment;
+            }
+        }
+    }
+
+    /// Per-bin row count across all shards (length 0 means the manifest
+    /// predates the accumulator).
+    #[must_use]
+    pub fn bit_counts(&self) -> &[u64] {
+        &self.bit_counts
+    }
+
+    /// Per-bin marginal frequencies `p_i = bit_counts[i] / row_count`.
+    /// Returns `None` when the manifest predates the accumulator or has
+    /// zero rows; the training loop should fall back to uniform BCE in
+    /// that case.
+    #[must_use]
+    pub fn bit_frequencies(&self) -> Option<Vec<f32>> {
+        if self.bit_counts.is_empty() || self.row_count == 0 {
+            return None;
+        }
+        let row_count = self.row_count as f32;
+        Some(
+            self.bit_counts
+                .iter()
+                .map(|count| *count as f32 / row_count)
+                .collect(),
+        )
     }
 
     /// Writes the manifest as pretty JSON.
@@ -1760,12 +1825,15 @@ mod tests {
     fn sparse_shard_roundtrip_preserves_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("shard.maeshard");
-        let shard = test_shard();
+        let mut shard = test_shard();
 
         shard.write_to_path(&path).expect("write");
         let loaded = SparseMoleculeShard::read_from_path(&path).expect("read");
         let row = loaded.row(0).expect("row");
 
+        // Per-bin counts are accumulated in memory and forwarded to the
+        // manifest; the binary shard format itself does not persist them.
+        shard.bit_counts.clear();
         assert_eq!(loaded, shard);
         assert_eq!(row.cid, 702);
         assert_eq!(row.fingerprint_indices, &[3, 9]);
@@ -1962,5 +2030,49 @@ mod tests {
         assert_eq!(loaded, manifest);
         assert_eq!(loaded.row_count, 1);
         assert_eq!(loaded.shards[0].nnz, 2);
+    }
+
+    #[test]
+    fn manifest_bit_frequencies_match_aggregated_shard_counts() {
+        let config = PreprocessingConfig::default();
+        let fp_size = config.counted_ecfp().size();
+        let mut shard_a = SparseMoleculeShard::new(fp_size, REGRESSION_TARGET_WIDTH);
+        // Row 1: bits {3, 9}; row 2: bits {3, 100}. Bit 3 fires in both
+        // rows, 9 and 100 in one each.
+        let fp1 = FingerprintTargets::new(vec![3, 9], vec![1, 4], fp_size).expect("fp1");
+        let fp2 = FingerprintTargets::new(vec![3, 100], vec![2, 1], fp_size).expect("fp2");
+        let descriptors = vec![0.0_f32; REGRESSION_TARGET_WIDTH];
+        shard_a
+            .push(701, &fp1, &descriptors, DataSplit::Train)
+            .expect("push 1");
+        shard_a
+            .push(702, &fp2, &descriptors, DataSplit::Train)
+            .expect("push 2");
+
+        let mut shard_b = SparseMoleculeShard::new(fp_size, REGRESSION_TARGET_WIDTH);
+        let fp3 = FingerprintTargets::new(vec![9], vec![3], fp_size).expect("fp3");
+        shard_b
+            .push(703, &fp3, &descriptors, DataSplit::Train)
+            .expect("push 3");
+
+        let mut manifest = ShardManifest::new("fixture", config);
+        manifest.push_shard("shard-00000.maeshard", &shard_a);
+        manifest.push_shard("shard-00001.maeshard", &shard_b);
+
+        let frequencies = manifest.bit_frequencies().expect("frequencies");
+        assert_eq!(frequencies.len(), fp_size);
+        let row_count = 3.0_f32;
+        assert!((frequencies[3] - 2.0 / row_count).abs() < 1.0e-6);
+        assert!((frequencies[9] - 2.0 / row_count).abs() < 1.0e-6);
+        assert!((frequencies[100] - 1.0 / row_count).abs() < 1.0e-6);
+        assert_eq!(frequencies[0], 0.0);
+    }
+
+    #[test]
+    fn manifest_bit_frequencies_none_for_legacy_manifest() {
+        let config = PreprocessingConfig::default();
+        let mut manifest = ShardManifest::new("legacy-fixture", config);
+        manifest.bit_counts.clear();
+        assert!(manifest.bit_frequencies().is_none());
     }
 }
