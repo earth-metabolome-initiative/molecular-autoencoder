@@ -275,9 +275,10 @@ pub struct Args {
     #[arg(long, default_value_t = DEFAULT_PREPROCESS_THREADS, value_parser = positive_usize)]
     pub preprocess_threads: usize,
 
-    /// CUDA device ordinal (ignored on the ndarray backend).
-    #[arg(long, default_value_t = 0)]
-    pub cuda_device: usize,
+    /// CUDA device ordinals (comma-separated). When omitted, every visible
+    /// CUDA device is used. Ignored on the ndarray backend.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub cuda_devices: Vec<usize>,
 
     /// Minimum heavy-atom count quality bound.
     #[arg(long)]
@@ -339,6 +340,50 @@ impl Args {
             cache_dir,
             source_selection,
         })
+    }
+
+    /// Resolves the CUDA device ordinals to use for training.
+    ///
+    /// When `--cuda-devices` is empty, enumerates every visible CUDA device via
+    /// `cudarc`. When it is specified, validates each index against the visible
+    /// count and rejects out-of-range entries.
+    ///
+    /// Honours `CUDA_VISIBLE_DEVICES` because `cudarc` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the CUDA driver fails to initialise, when no
+    /// device is visible, or when `--cuda-devices` references an unavailable
+    /// index.
+    #[cfg(feature = "cuda")]
+    pub fn resolved_cuda_devices(&self) -> AppResult<Vec<usize>> {
+        cudarc::driver::result::init()
+            .map_err(|err| invalid_input(format!("CUDA driver init failed: {err}")))?;
+        let raw = cudarc::driver::result::device::get_count()
+            .map_err(|err| invalid_input(format!("CUDA enumeration failed: {err}")))?;
+        let visible = usize::try_from(raw)
+            .map_err(|_| invalid_input(format!("CUDA reported negative device count {raw}")))?;
+        if visible == 0 {
+            return Err(invalid_input("no CUDA devices visible"));
+        }
+        if self.cuda_devices.is_empty() {
+            Ok((0..visible).collect())
+        } else {
+            for &index in &self.cuda_devices {
+                if index >= visible {
+                    return Err(invalid_input(format!(
+                        "--cuda-devices: index {index} is not less than visible count {visible}"
+                    )));
+                }
+            }
+            let mut sorted = self.cuda_devices.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.len() != self.cuda_devices.len() {
+                return Err(invalid_input("--cuda-devices contains duplicate indices"));
+            }
+            Ok(sorted)
+        }
     }
 
     /// Returns `None` when `--full-validation` is set; otherwise the cap.

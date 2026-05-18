@@ -35,7 +35,8 @@ std = [
 ndarray = ["burn/ndarray"]
 train = ["burn/train", "ndarray", "dep:indicatif", "dep:clap"]
 tui = ["train", "burn/tui"]
-cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl"]
+multi-gpu = ["burn/collective", "dep:burn-collective", "dep:cudarc"]
+cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl", "multi-gpu"]
 cuda-fusion = ["cuda", "burn/fusion", "burn/autotune", "dep:burn-fusion", "dep:burn-ir"]
 cuda-no-fusion = ["cuda", "burn/autotune"]
 fingerprints = ["finge-rs/smiles-support"]
@@ -47,9 +48,11 @@ embed-parquet = ["embed", "dep:parquet", "dep:arrow"]
 [dependencies]
 arrow = { version = "55", default-features = false, optional = true }
 burn = { version = "=0.21.0", default-features = false }
+burn-collective = { version = "=0.21.0", default-features = false, optional = true }
 burn-cubecl = { version = "=0.21.0", default-features = false, optional = true }
 burn-fusion = { version = "=0.21.0", default-features = false, optional = true }
 burn-ir = { version = "=0.21.0", default-features = false, optional = true }
+cudarc = { version = "=0.19.4", default-features = false, features = ["driver", "fallback-dynamic-loading", "cuda-version-from-build-system"], optional = true }
 clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"], optional = true }
 csv = { version = "1", optional = true }
 cubecl = { version = "=0.10.0", default-features = false, optional = true }

@@ -1,12 +1,21 @@
 //! Training and evaluation per-epoch loops.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender, TryRecvError},
+    },
+    time::{Duration, Instant},
+};
 
 use burn::{
     optim::{GradientsParams, Optimizer},
     prelude::*,
     tensor::backend::AutodiffBackend,
 };
+#[cfg(feature = "multi-gpu")]
+use burn_collective::{PeerId, ReduceOperation};
 use molecular_autoencoder::{
     DataSplit, MoleculeAutoencoder, MoleculeAutoencoderBatch, MoleculeAutoencoderBatcher,
     TanimotoRankingRuntimeConfig, batch_sparse_log_count_binary_tanimoto,
@@ -17,7 +26,7 @@ use crate::{
     AppResult,
     checkpoint::{CachedShardInfo, CheckpointState},
     cli::Args,
-    dataloader::{BatchIterationContext, for_each_batch},
+    dataloader::{BatchControl, BatchIterationContext, for_each_batch},
     invalid_input,
     metrics::{BatchLossMetrics, loss_metrics, should_sample_metrics, validation_metrics},
     ranking::{TanimotoMetricBackend, attach_tanimoto_ranking, tanimoto_ranking_seed},
@@ -122,7 +131,176 @@ impl EvaluationSummary {
     }
 }
 
-/// Per-epoch training context owned by the run loop.
+/// Payload routed from a worker peer to the lead peer's training reporter.
+#[derive(Debug, Clone)]
+pub struct TrainBatchPayload {
+    pub epoch: usize,
+    pub epoch_total: usize,
+    pub global_step: usize,
+    pub batch_size: usize,
+    pub metrics: Option<BatchLossMetrics>,
+    pub data_time: Duration,
+    pub step_time: Duration,
+}
+
+/// Payload routed from a worker peer to the lead peer's validation reporter.
+#[derive(Debug, Clone)]
+pub struct ValidBatchPayload {
+    pub epoch: usize,
+    pub epoch_total: usize,
+    pub batch_index: usize,
+    pub batch_size: usize,
+    pub metrics: Option<BatchLossMetrics>,
+    pub count_tanimoto: f32,
+    pub binary_tanimoto: f32,
+}
+
+/// Inter-peer message envelope (worker → lead).
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "multi-gpu"), allow(dead_code))]
+pub enum BatchUpdate {
+    /// One training batch completed on a worker peer.
+    Train(TrainBatchPayload),
+    /// One validation batch completed on a worker peer.
+    Valid(ValidBatchPayload),
+    /// Sentinel from one worker that finished its training epoch.
+    TrainEpochComplete,
+    /// Sentinel from one worker that finished its validation pass.
+    ValidEpochComplete,
+}
+
+/// Routes batch-level metrics either to the local reporter (lead peer, peer 0)
+/// or to an mpsc channel drained by peer 0 (worker peers).
+pub enum BatchSink<'a> {
+    Lead {
+        reporter: &'a mut TrainingReporter,
+        stop_flag: Arc<AtomicBool>,
+        /// Channel drained between own batches to surface worker peers'
+        /// metrics on the lead reporter. `None` in single-GPU runs.
+        receiver: Option<&'a Receiver<BatchUpdate>>,
+    },
+    #[cfg_attr(not(feature = "multi-gpu"), allow(dead_code))]
+    Worker {
+        tx: Sender<BatchUpdate>,
+        stop_flag: Arc<AtomicBool>,
+    },
+}
+
+impl BatchSink<'_> {
+    fn train_batch(&mut self, payload: TrainBatchPayload) -> BatchControl {
+        match self {
+            Self::Lead {
+                reporter,
+                stop_flag,
+                receiver,
+            } => {
+                let control = forward_train(reporter, stop_flag, payload);
+                if let Some(rx) = receiver {
+                    drain_worker_updates(reporter, stop_flag, rx);
+                }
+                control
+            }
+            Self::Worker { tx, stop_flag } => {
+                let _ = tx.send(BatchUpdate::Train(payload));
+                if stop_flag.load(Ordering::Acquire) {
+                    BatchControl::Stop
+                } else {
+                    BatchControl::Continue
+                }
+            }
+        }
+    }
+
+    fn valid_batch(&mut self, payload: ValidBatchPayload) -> BatchControl {
+        match self {
+            Self::Lead {
+                reporter,
+                stop_flag,
+                receiver,
+            } => {
+                let control = forward_valid(reporter, stop_flag, payload);
+                if let Some(rx) = receiver {
+                    drain_worker_updates(reporter, stop_flag, rx);
+                }
+                control
+            }
+            Self::Worker { tx, stop_flag } => {
+                let _ = tx.send(BatchUpdate::Valid(payload));
+                if stop_flag.load(Ordering::Acquire) {
+                    BatchControl::Stop
+                } else {
+                    BatchControl::Continue
+                }
+            }
+        }
+    }
+}
+
+fn forward_train(
+    reporter: &mut TrainingReporter,
+    stop_flag: &AtomicBool,
+    payload: TrainBatchPayload,
+) -> BatchControl {
+    let control = reporter.train_batch(
+        payload.epoch,
+        payload.epoch_total,
+        payload.global_step,
+        payload.batch_size,
+        payload.metrics,
+        payload.data_time,
+        payload.step_time,
+    );
+    if matches!(control, BatchControl::Stop) {
+        stop_flag.store(true, Ordering::Release);
+    }
+    control
+}
+
+fn forward_valid(
+    reporter: &mut TrainingReporter,
+    stop_flag: &AtomicBool,
+    payload: ValidBatchPayload,
+) -> BatchControl {
+    let control = reporter.valid_batch(
+        payload.epoch,
+        payload.epoch_total,
+        payload.batch_index,
+        payload.batch_size,
+        payload.metrics,
+        payload.count_tanimoto,
+        payload.binary_tanimoto,
+    );
+    if matches!(control, BatchControl::Stop) {
+        stop_flag.store(true, Ordering::Release);
+    }
+    control
+}
+
+/// Non-blocking drain: forwards every pending worker-side `BatchUpdate` to the
+/// lead reporter, propagating any `BatchControl::Stop` into the shared flag.
+fn drain_worker_updates(
+    reporter: &mut TrainingReporter,
+    stop_flag: &AtomicBool,
+    receiver: &Receiver<BatchUpdate>,
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(BatchUpdate::Train(payload)) => {
+                let _ = forward_train(reporter, stop_flag, payload);
+            }
+            Ok(BatchUpdate::Valid(payload)) => {
+                let _ = forward_valid(reporter, stop_flag, payload);
+            }
+            Ok(BatchUpdate::TrainEpochComplete | BatchUpdate::ValidEpochComplete) => {
+                // Sentinels are observed by the orchestrator on the rendezvous path; the
+                // reporter does not need to see them.
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+/// Per-epoch training context owned by the run loop or per-worker DDP loop.
 pub struct TrainEpochContext<'a, B: Backend> {
     pub shards: &'a [CachedShardInfo],
     pub batcher: MoleculeAutoencoderBatcher,
@@ -132,11 +310,13 @@ pub struct TrainEpochContext<'a, B: Backend> {
     pub loader_profile_every: usize,
     pub validation_per_mille: u16,
     pub state: &'a mut CheckpointState,
-    pub reporter: &'a mut TrainingReporter,
+    pub sink: BatchSink<'a>,
     pub epoch: usize,
+    pub peer_id: u32,
+    pub world_size: u32,
 }
 
-/// Per-validation context owned by the run loop.
+/// Per-validation context owned by the run loop or per-worker DDP loop.
 pub struct EvaluationContext<'a, B: Backend> {
     pub shards: &'a [CachedShardInfo],
     pub batcher: MoleculeAutoencoderBatcher,
@@ -148,9 +328,10 @@ pub struct EvaluationContext<'a, B: Backend> {
     pub loader_profile_every: usize,
     pub tanimoto_ranking: TanimotoRankingRuntimeConfig,
     pub validation_per_mille: u16,
-    pub reporter: &'a mut TrainingReporter,
+    pub sink: BatchSink<'a>,
     pub epoch: usize,
     pub epoch_total: usize,
+    pub peer_id: u32,
 }
 
 /// Runs the training loop for a single epoch and returns the updated model
@@ -175,8 +356,10 @@ where
         loader_profile_every,
         validation_per_mille,
         state,
-        reporter,
+        mut sink,
         epoch,
+        peer_id,
+        world_size,
     } = context;
     let mut model = Some(model);
     let mut summary = EpochSummary::default();
@@ -198,7 +381,7 @@ where
             attach_tanimoto_ranking(
                 &mut batch,
                 tanimoto_ranking,
-                tanimoto_ranking_seed(epoch, state.global_step),
+                tanimoto_ranking_seed(epoch, state.global_step, peer_id),
             );
             let current = model
                 .take()
@@ -246,6 +429,7 @@ where
                 )));
             }
             let grads = GradientsParams::from_grads(loss.backward(), &current);
+            let grads = all_reduce_mean::<B>(grads, peer_id, world_size)?;
             model = Some(optimizer.step(args.learning_rate, current, grads));
             state.global_step = next_step;
             let step_time = step_start.elapsed();
@@ -255,15 +439,15 @@ where
                 data_time,
                 step_time,
             );
-            Ok(reporter.train_batch(
+            Ok(sink.train_batch(TrainBatchPayload {
                 epoch,
-                args.epochs,
-                state.global_step,
+                epoch_total: args.epochs,
+                global_step: state.global_step,
                 batch_size,
-                batch_metrics,
+                metrics: batch_metrics,
                 data_time,
                 step_time,
-            ))
+            }))
         },
     )?;
 
@@ -294,9 +478,10 @@ where
         loader_profile_every,
         tanimoto_ranking,
         validation_per_mille,
-        reporter,
+        mut sink,
         epoch,
         epoch_total,
+        peer_id,
     } = context;
     let mut summary = EvaluationSummary::default();
     for_each_batch(
@@ -316,7 +501,7 @@ where
             attach_tanimoto_ranking(
                 &mut batch,
                 tanimoto_ranking,
-                tanimoto_ranking_seed(epoch, summary.batches),
+                tanimoto_ranking_seed(epoch, summary.batches, peer_id),
             );
             let step_start = Instant::now();
             let MoleculeAutoencoderBatch {
@@ -355,15 +540,15 @@ where
                 data_time,
                 step_time,
             );
-            Ok(reporter.valid_batch(
+            Ok(sink.valid_batch(ValidBatchPayload {
                 epoch,
                 epoch_total,
-                summary.batches,
-                rows,
-                Some(batch_metrics),
+                batch_index: summary.batches,
+                batch_size: rows,
+                metrics: Some(batch_metrics),
                 count_tanimoto,
                 binary_tanimoto,
-            ))
+            }))
         },
     )?;
 
@@ -372,4 +557,40 @@ where
     } else {
         Ok(Some(summary))
     }
+}
+
+/// Mean-reduces parameter gradients across all DDP peers. When `world_size <=
+/// 1` or the `multi-gpu` feature is disabled, this is a no-op identity.
+#[cfg(feature = "multi-gpu")]
+fn all_reduce_mean<B>(
+    grads: GradientsParams,
+    peer_id: u32,
+    world_size: u32,
+) -> AppResult<GradientsParams>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    if world_size <= 1 {
+        return Ok(grads);
+    }
+    grads
+        .all_reduce::<B::InnerBackend>(PeerId::from(peer_id), ReduceOperation::Mean)
+        .map_err(|err| invalid_input(format!("gradient all-reduce failed: {err:?}")))
+}
+
+#[cfg(not(feature = "multi-gpu"))]
+#[allow(
+    clippy::extra_unused_type_parameters,
+    clippy::unnecessary_wraps,
+    reason = "the multi-gpu cfg uses `B::InnerBackend` and returns Result; the cfg-off variant must keep the same signature so the hot path stays cfg-agnostic"
+)]
+fn all_reduce_mean<B>(
+    grads: GradientsParams,
+    _peer_id: u32,
+    _world_size: u32,
+) -> AppResult<GradientsParams>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    Ok(grads)
 }

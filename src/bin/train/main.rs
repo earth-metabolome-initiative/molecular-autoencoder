@@ -11,6 +11,8 @@ use clap::Parser;
 mod checkpoint;
 mod cli;
 mod dataloader;
+#[cfg(feature = "multi-gpu")]
+mod ddp;
 mod metrics;
 mod preprocess;
 mod ranking;
@@ -30,8 +32,12 @@ pub fn invalid_input(message: impl Into<String>) -> Box<dyn StdError> {
 fn main() -> AppResult<()> {
     type Backend = burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>;
     let args = cli::Args::parse();
-    let device = burn::backend::cuda::CudaDevice::new(args.cuda_device);
-    run::run::<Backend>(args, device)
+    let device_indices = args.resolved_cuda_devices()?;
+    let devices: Vec<_> = device_indices
+        .iter()
+        .map(|&index| burn::backend::cuda::CudaDevice::new(index))
+        .collect();
+    run::run::<Backend>(args, devices)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -42,6 +48,6 @@ fn main() -> AppResult<()> {
          `cuda-no-fusion` for the intended training path"
     );
     let args = cli::Args::parse();
-    let device = burn::backend::ndarray::NdArrayDevice::default();
-    run::run::<Backend>(args, device)
+    let devices = vec![burn::backend::ndarray::NdArrayDevice::default()];
+    run::run::<Backend>(args, devices)
 }

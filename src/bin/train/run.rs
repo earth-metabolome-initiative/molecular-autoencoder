@@ -1,6 +1,9 @@
 //! End-to-end training orchestrator.
 
-use std::time::Instant;
+use std::{
+    sync::{Arc, atomic::AtomicBool},
+    time::Instant,
+};
 
 use burn::{
     module::{AutodiffModule, Module},
@@ -22,11 +25,16 @@ use crate::{
     preprocess::prepare_manifest,
     ranking::{TanimotoMetricBackend, effective_device_prefetch_batches},
     reporter::TrainingReporter,
-    training::{EvaluationContext, TrainEpochContext, evaluate, train_epoch},
+    training::{BatchSink, EvaluationContext, TrainEpochContext, evaluate, train_epoch},
 };
 
 /// Trains the molecular autoencoder according to the parsed CLI arguments.
-pub fn run<B>(args: Args, device: B::Device) -> AppResult<()>
+///
+/// `devices` carries one entry per participating peer. With a single entry the
+/// orchestrator runs the legacy single-GPU training loop; with multiple entries
+/// it spawns one worker thread per device and synchronises gradients via
+/// `burn-collective`.
+pub fn run<B>(args: Args, devices: Vec<B::Device>) -> AppResult<()>
 where
     B: AutodiffBackend<FloatElem = f32> + TanimotoMetricBackend,
     B::Device: Clone + Send + Sync,
@@ -36,6 +44,25 @@ where
     MoleculeAutoencoderBatch<B::InnerBackend>: Send,
     <B::InnerBackend as burn::tensor::backend::BackendTypes>::Device: Clone + Send + Sync,
 {
+    if devices.is_empty() {
+        return Err(invalid_input("run::run requires at least one device"));
+    }
+    let device = devices
+        .first()
+        .cloned()
+        .expect("non-empty devices checked above");
+    if devices.len() > 1 {
+        #[cfg(feature = "multi-gpu")]
+        {
+            return crate::ddp::run_multi::<B>(args, devices);
+        }
+        #[cfg(not(feature = "multi-gpu"))]
+        {
+            return Err(invalid_input(
+                "multi-device training requires the `multi-gpu` feature (auto-enabled with cuda)",
+            ));
+        }
+    }
     let mut args = args;
     let requested_device_prefetch_batches = args.device_prefetch_batches;
     args.device_prefetch_batches =
@@ -126,6 +153,8 @@ where
         model_config.reconstruction_loss().bce_nonzero_weight()
     );
 
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
     for epoch in (state.completed_epoch + 1)..=args.epochs {
         let epoch_start = Instant::now();
         let (next_model, summary) = train_epoch(
@@ -140,8 +169,14 @@ where
                 loader_profile_every,
                 validation_per_mille: manifest.preprocessing().validation_per_mille(),
                 state: &mut state,
-                reporter: &mut reporter,
+                sink: BatchSink::Lead {
+                    reporter: &mut reporter,
+                    stop_flag: stop_flag.clone(),
+                    receiver: None,
+                },
                 epoch,
+                peer_id: 0,
+                world_size: 1,
             },
         )?;
         model = next_model;
@@ -181,9 +216,14 @@ where
                     loader_profile_every,
                     tanimoto_ranking,
                     validation_per_mille: manifest.preprocessing().validation_per_mille(),
-                    reporter: &mut reporter,
+                    sink: BatchSink::Lead {
+                        reporter: &mut reporter,
+                        stop_flag: stop_flag.clone(),
+                        receiver: None,
+                    },
                     epoch,
                     epoch_total: args.epochs,
+                    peer_id: 0,
                 },
             )? {
                 Some(valid) => {

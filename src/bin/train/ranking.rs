@@ -29,9 +29,14 @@ pub trait TanimotoMetricBackend: Backend {}
 #[cfg(not(feature = "cuda"))]
 impl<B> TanimotoMetricBackend for B where B: Backend {}
 
-/// Per-batch deterministic seed derived from `(epoch, batch_index)`.
-pub fn tanimoto_ranking_seed(epoch: usize, batch_index: usize) -> u64 {
-    ((epoch as u64) << 32) ^ (batch_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+/// Per-batch deterministic seed derived from `(epoch, batch_index, peer_id)`.
+///
+/// The `peer_id` term keeps the per-batch RNG distinct across DDP workers, so
+/// the contrastive anchor selection on rank 1 does not mirror rank 0's draws
+/// for the same `(epoch, batch_index)`.
+pub fn tanimoto_ranking_seed(epoch: usize, batch_index: usize, peer_id: u32) -> u64 {
+    let base = ((epoch as u64) << 32) ^ (batch_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    base ^ (u64::from(peer_id)).wrapping_mul(0xbf58_476d_1ce4_e5b9)
 }
 
 /// Fills the Tanimoto ranking labels on the batch when the geometry loss is
