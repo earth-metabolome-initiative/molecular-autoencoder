@@ -44,24 +44,7 @@ where
     let max_valid_batches = args.max_valid_batches();
 
     let manifest_path = prepare_manifest(&args, &paths)?;
-    let mut manifest = ShardManifest::read_from_path(&manifest_path)?;
-    if manifest.bit_frequencies().is_none() && !manifest.shards().is_empty() {
-        let shard_dir = manifest_path.parent().map_or_else(
-            || std::path::PathBuf::from("."),
-            std::path::Path::to_path_buf,
-        );
-        println!(
-            "backfilling bit_counts in {} by scanning {} cached shards (one-time)...",
-            manifest_path.display(),
-            manifest.shards().len()
-        );
-        manifest.backfill_bit_counts(&shard_dir)?;
-        manifest.write_to_path(&manifest_path)?;
-        println!(
-            "bit_counts written into {}; subsequent runs reuse them directly",
-            manifest_path.display()
-        );
-    }
+    let manifest = ShardManifest::read_from_path(&manifest_path)?;
     let shards = shard_infos(&manifest_path, &manifest)?;
     let fingerprint_size = manifest.preprocessing().counted_ecfp().size();
     let ecfp_radius = manifest.preprocessing().counted_ecfp().radius();
@@ -70,20 +53,12 @@ where
     let state_path = args.checkpoint_dir.join("state.json");
 
     std::fs::create_dir_all(&args.checkpoint_dir)?;
-    let bit_frequencies = manifest.bit_frequencies().unwrap_or_default();
-    if bit_frequencies.is_empty() {
-        eprintln!(
-            "warning: manifest at {} has no shards and no bit-count statistics; BCE will fall \
-             back to uniform weighting.",
-            manifest_path.display()
-        );
-    }
     let model_config = if args.resume && model_config_path.exists() {
         let config = MoleculeAutoencoderConfig::load_json(&model_config_path)?;
         config.validate(fingerprint_size)?;
         config
     } else {
-        let config = args.to_model_config(fingerprint_size, ecfp_radius, bit_frequencies)?;
+        let config = args.to_model_config(fingerprint_size, ecfp_radius)?;
         config.save_json(&model_config_path)?;
         config
     };
@@ -124,9 +99,8 @@ where
     } else {
         args.loader_profile_every
     };
-    let bit_freq_count = model_config.bit_frequencies().len();
     println!(
-        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_latent_temperature={} tanimoto_ranking_metric_temperature={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={} bce_weight={} bce_zero_weight={} bce_nonzero_weight={} bit_frequencies={}",
+        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_latent_temperature={} tanimoto_ranking_metric_temperature={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={} bce_weight={} bce_zero_weight={} bce_nonzero_weight={}",
         manifest_path.display(),
         shards.len(),
         args.checkpoint_dir.display(),
@@ -149,12 +123,7 @@ where
         tanimoto_ranking.pairs_per_batch(),
         model_config.reconstruction_loss().bce_weight(),
         model_config.reconstruction_loss().bce_zero_weight(),
-        model_config.reconstruction_loss().bce_nonzero_weight(),
-        if bit_freq_count == 0 {
-            "uniform".to_string()
-        } else {
-            format!("per-bin[{bit_freq_count}]")
-        }
+        model_config.reconstruction_loss().bce_nonzero_weight()
     );
 
     for epoch in (state.completed_epoch + 1)..=args.epochs {

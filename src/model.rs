@@ -911,12 +911,6 @@ pub struct MoleculeAutoencoderConfig {
     latent_noise_std: f64,
     #[serde(default = "default_ecfp_radius")]
     ecfp_radius: u8,
-    /// Per-bin marginal frequencies `p_i ∈ [0, 1]`. Length 0 disables the
-    /// per-class per-bin BCE reweighting; any other length must match the
-    /// encoder's input width. Loaded from a `bit_counts_ECFP_fp_size<N>.csv`
-    /// produced by `molecular-fingerprint-bucket-counts`.
-    #[serde(default)]
-    bit_frequencies: Vec<f32>,
 }
 
 impl MoleculeAutoencoderConfig {
@@ -948,7 +942,6 @@ impl MoleculeAutoencoderConfig {
             tanimoto_ranking: TanimotoRankingConfig::default(),
             latent_noise_std: default_latent_noise_std(),
             ecfp_radius: default_ecfp_radius(),
-            bit_frequencies: Vec::new(),
         }
     }
 
@@ -1007,13 +1000,6 @@ impl MoleculeAutoencoderConfig {
     #[must_use]
     pub const fn ecfp_radius(&self) -> u8 {
         self.ecfp_radius
-    }
-
-    /// Per-bin marginal frequencies driving the BCE class reweighting.
-    /// Empty slice means uniform BCE (no per-bin scaling).
-    #[must_use]
-    pub fn bit_frequencies(&self) -> &[f32] {
-        &self.bit_frequencies
     }
 
     /// Returns the flat runtime view of the Tanimoto geometry side task.
@@ -1122,19 +1108,6 @@ impl MoleculeAutoencoderConfig {
         if self.ecfp_radius == 0 {
             return bail("ecfp radius must be greater than zero".to_string());
         }
-        if !self.bit_frequencies.is_empty() && self.bit_frequencies.len() != expected_input_width {
-            return bail(format!(
-                "bit_frequencies length {} does not match expected width {expected_input_width}",
-                self.bit_frequencies.len()
-            ));
-        }
-        for (index, value) in self.bit_frequencies.iter().enumerate() {
-            if !value.is_finite() || !(0.0..=1.0).contains(value) {
-                return bail(format!(
-                    "bit_frequencies[{index}] must be a probability in [0, 1], got {value}"
-                ));
-            }
-        }
         Ok(())
     }
 
@@ -1190,7 +1163,6 @@ impl MoleculeAutoencoderConfig {
             tanimoto_ranking_min_gap: self.tanimoto_ranking.min_gap,
             tanimoto_ranking_pairs_per_batch: self.tanimoto_ranking.pairs_per_batch,
             latent_noise_std: self.latent_noise_std,
-            bit_frequencies: self.bit_frequencies.clone(),
         }
     }
 }
@@ -1224,7 +1196,6 @@ pub struct MoleculeAutoencoderConfigBuilder {
     bce_weight: f64,
     bce_zero_weight: f64,
     bce_nonzero_weight: f64,
-    bit_frequencies: Vec<f32>,
 }
 
 impl Default for MoleculeAutoencoderConfigBuilder {
@@ -1253,7 +1224,6 @@ impl MoleculeAutoencoderConfigBuilder {
             bce_weight: DEFAULT_BCE_WEIGHT,
             bce_zero_weight: DEFAULT_BCE_ZERO_WEIGHT,
             bce_nonzero_weight: DEFAULT_BCE_NONZERO_WEIGHT,
-            bit_frequencies: Vec::new(),
         }
     }
 
@@ -1362,14 +1332,6 @@ impl MoleculeAutoencoderConfigBuilder {
         self
     }
 
-    /// Sets the per-bin marginal frequencies driving the BCE class
-    /// reweighting. Passing an empty vector keeps the BCE uniform.
-    #[must_use]
-    pub fn bit_frequencies(mut self, value: Vec<f32>) -> Self {
-        self.bit_frequencies = value;
-        self
-    }
-
     /// Validates the configured fields and builds the immutable config.
     ///
     /// # Errors
@@ -1412,7 +1374,6 @@ impl MoleculeAutoencoderConfigBuilder {
             },
             latent_noise_std: self.latent_noise_std,
             ecfp_radius: self.ecfp_radius,
-            bit_frequencies: self.bit_frequencies,
         };
         config.validate(fingerprint_size)?;
         Ok(config)
@@ -1543,9 +1504,6 @@ pub struct MoleculeAutoencoder<B: Backend> {
     tanimoto_ranking_min_gap: f64,
     tanimoto_ranking_pairs_per_batch: usize,
     latent_noise_std: f64,
-    /// Per-bin marginal frequencies `p_i ∈ [0, 1]` for the BCE class
-    /// reweighting. Empty means uniform (no per-bin scaling).
-    bit_frequencies: Vec<f32>,
 }
 
 impl<B: Backend> MoleculeAutoencoder<B> {
@@ -1620,19 +1578,11 @@ impl<B: Backend> MoleculeAutoencoder<B> {
         let device = output.reconstructed_log_counts.device();
         let latent = output.latent;
         let reconstruction_bce = if self.bce_weight > 0.0 {
-            let (pos_weights, neg_weights) = if self.bit_frequencies.is_empty() {
-                (None, None)
-            } else {
-                let (pos, neg) = bit_frequency_class_weights(&self.bit_frequencies, &device);
-                (Some(pos), Some(neg))
-            };
             weighted_sparse_log_count_bce_loss(
                 output.reconstructed_log_counts.clone(),
                 &fingerprints,
                 self.bce_zero_weight,
                 self.bce_nonzero_weight,
-                pos_weights.as_ref(),
-                neg_weights.as_ref(),
             ) * self.bce_weight
         } else {
             Tensor::zeros([1], &device)
@@ -1736,30 +1686,6 @@ fn softplus<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
     x.clamp_min(0.0) + (neg_abs.exp() + 1.0).log()
 }
 
-/// Converts per-bin marginal frequencies `p_i ∈ [0, 1]` into IDF-style
-/// per-class weights for the BCE term:
-///
-/// - `pos_weight_i = −ln(p_i + ε)` — large for rare positives, ~0 for
-///   bins that fire almost everywhere.
-/// - `neg_weight_i = −ln(1 − p_i + ε)` — large for rare negatives, ~0
-///   for bins that are almost never set.
-///
-/// `ε` clamps the logarithm so frequencies at the 0/1 endpoints remain
-/// finite. Returns tensors of shape `[fingerprint_size]` on `device`.
-fn bit_frequency_class_weights<B: Backend>(
-    frequencies: &[f32],
-    device: &B::Device,
-) -> (Tensor<B, 1>, Tensor<B, 1>) {
-    let eps = 1.0e-6_f32;
-    let len = frequencies.len();
-    let pos: Vec<f32> = frequencies.iter().map(|p| -(p + eps).ln()).collect();
-    let neg: Vec<f32> = frequencies.iter().map(|p| -(1.0 - p + eps).ln()).collect();
-    (
-        Tensor::<B, 1>::from_data(TensorData::new(pos, [len]), device),
-        Tensor::<B, 1>::from_data(TensorData::new(neg, [len]), device),
-    )
-}
-
 /// Per-position weighted bit-presence loss against the sparse fingerprint
 /// target.
 ///
@@ -1778,25 +1704,16 @@ fn bit_frequency_class_weights<B: Backend>(
 /// Computation mirrors [`weighted_sparse_log_count_huber_loss`] — assume the
 /// target bit is zero everywhere, then correct at the sparse active indices.
 ///
-/// `pos_class_weights` and `neg_class_weights`, when provided, are length-
-/// `fingerprint_size` per-bin multipliers stacked on top of the scalar
-/// `nonzero_weight` / `zero_weight`. They let frequent bits and rare bits
-/// contribute differently to the BCE — see
-/// [`MoleculeAutoencoderConfig::bit_frequencies`].
-///
 /// # Panics
 ///
 /// Panics when the predicted dense reconstruction shape does not match the
-/// sparse target batch size and fingerprint width, or when supplied per-bin
-/// weight tensors do not have length `fingerprint_size`.
+/// sparse target batch size and fingerprint width.
 #[must_use]
 pub fn weighted_sparse_log_count_bce_loss<B: Backend>(
     predicted_log_counts: Tensor<B, 2>,
     target: &SparseFingerprintBatch<B>,
     zero_weight: f64,
     nonzero_weight: f64,
-    pos_class_weights: Option<&Tensor<B, 1>>,
-    neg_class_weights: Option<&Tensor<B, 1>>,
 ) -> Tensor<B, 1> {
     let predicted_dims = predicted_log_counts.dims();
     assert_eq!(
@@ -1808,32 +1725,11 @@ pub fn weighted_sparse_log_count_bce_loss<B: Backend>(
         predicted_dims[1], target.fingerprint_size,
         "predicted reconstruction width must match sparse fingerprint width"
     );
-    if let Some(weights) = pos_class_weights {
-        assert_eq!(
-            weights.dims()[0],
-            target.fingerprint_size,
-            "pos_class_weights length must match fingerprint width"
-        );
-    }
-    if let Some(weights) = neg_class_weights {
-        assert_eq!(
-            weights.dims()[0],
-            target.fingerprint_size,
-            "neg_class_weights length must match fingerprint width"
-        );
-    }
 
     let log2 = std::f64::consts::LN_2;
-    let batch_size = predicted_dims[0];
-    let fp_size = predicted_dims[1];
-    let denominator = (batch_size * fp_size) as f64;
+    let denominator = (predicted_dims[0] * predicted_dims[1]) as f64;
     // y_i = 0: penalty grows when ẑ_i > 0 (positive leak).
     let zero_bce = (softplus(predicted_log_counts.clone()) - log2).clamp_min(0.0);
-    let zero_bce = match neg_class_weights {
-        // Broadcast [fingerprint_size] over batch dim via reshape.
-        Some(neg) => zero_bce * neg.clone().reshape([1, fp_size]),
-        None => zero_bce,
-    };
     let zero_total = zero_bce.sum() * zero_weight;
     let predicted_nonzero = predicted_log_counts.gather(1, target.indices.clone());
     // y_i = 1: penalty grows when ẑ_i < 0 (negative dip).
@@ -1841,28 +1737,6 @@ pub fn weighted_sparse_log_count_bce_loss<B: Backend>(
     // Subtract the "assumed y_i = 0" contribution at the same active indices,
     // matching the sparse correction pattern used by the Huber loss above.
     let zero_at_active_bce = (softplus(predicted_nonzero) - log2).clamp_min(0.0);
-    let active_bce = match pos_class_weights {
-        Some(pos) => {
-            let pos_at_active = pos
-                .clone()
-                .reshape([1, fp_size])
-                .expand([batch_size, fp_size])
-                .gather(1, target.indices.clone());
-            active_bce * pos_at_active
-        }
-        None => active_bce,
-    };
-    let zero_at_active_bce = match neg_class_weights {
-        Some(neg) => {
-            let neg_at_active = neg
-                .clone()
-                .reshape([1, fp_size])
-                .expand([batch_size, fp_size])
-                .gather(1, target.indices.clone());
-            zero_at_active_bce * neg_at_active
-        }
-        None => zero_at_active_bce,
-    };
     let correction =
         (active_bce * nonzero_weight - zero_at_active_bce * zero_weight) * target.mask.clone();
 
@@ -2157,8 +2031,6 @@ mod tests {
             &batch.fingerprints,
             zero_weight,
             nonzero_weight,
-            None,
-            None,
         )
         .into_scalar();
 
@@ -2211,64 +2083,11 @@ mod tests {
             TensorData::new(vec![-0.1_f32, 0.1, -0.1, 0.1], [1, 4]),
             &device,
         );
-        let value = weighted_sparse_log_count_bce_loss(
-            predicted,
-            &batch.fingerprints,
-            4.0,
-            1.0,
-            None,
-            None,
-        )
-        .into_scalar();
+        let value = weighted_sparse_log_count_bce_loss(predicted, &batch.fingerprints, 4.0, 1.0)
+            .into_scalar();
         assert!(
             value.abs() < 1.0e-6,
             "expected exactly zero BCE for correctly classified bins, got {value}"
-        );
-    }
-
-    #[test]
-    fn sparse_bce_scales_with_per_bin_class_weights() {
-        type B = burn::backend::NdArray<f32, i64>;
-        let device = burn::backend::ndarray::NdArrayDevice::default();
-        let batcher = MoleculeAutoencoderBatcher::new(2, REGRESSION_TARGET_WIDTH);
-        let batch = batcher.batch(
-            vec![MoleculeAutoencoderSample {
-                cid: 1,
-                fingerprint_indices: vec![0],
-                fingerprint_counts: vec![1],
-                descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
-            }],
-            &device,
-        );
-        // Active bin at index 0 wrongly predicts negative; inactive bin at
-        // index 1 wrongly predicts positive. Use per-bin weights of (3.0, 5.0)
-        // at the two positions so each side's contribution can be checked.
-        let predicted =
-            Tensor::<B, 2>::from_data(TensorData::new(vec![-1.0_f32, 1.0], [1, 2]), &device);
-        let pos = Tensor::<B, 1>::from_data(TensorData::new(vec![3.0_f32, 7.0], [2]), &device);
-        let neg = Tensor::<B, 1>::from_data(TensorData::new(vec![11.0_f32, 5.0], [2]), &device);
-        let value = weighted_sparse_log_count_bce_loss(
-            predicted,
-            &batch.fingerprints,
-            1.0,
-            1.0,
-            Some(&pos),
-            Some(&neg),
-        )
-        .into_scalar();
-        // CPU reference: only the wrong-direction sides contribute.
-        // - Active bin 0, ẑ=-1: softplus(1) - ln 2 = ln((1+e)/2) ≈ 0.6201,
-        //   weighted by pos[0] = 3.0 → 1.8602
-        // - Inactive bin 1, ẑ=1: softplus(1) - ln 2 ≈ 0.6201, weighted by
-        //   neg[1] = 5.0 → 3.1003
-        // Averaged over N=2: (1.8602 + 3.1003)/2 ≈ 2.4803
-        let log2 = std::f32::consts::LN_2;
-        let softplus = 1.0_f32.max(0.0) + (-1.0_f32.abs()).exp().ln_1p();
-        let shifted = (softplus - log2).max(0.0);
-        let expected = f32::midpoint(shifted * 3.0, shifted * 5.0);
-        assert!(
-            (value - expected).abs() < 1.0e-4,
-            "expected {expected}, got {value}"
         );
     }
 
@@ -2291,15 +2110,8 @@ mod tests {
         // contribute.
         let predicted =
             Tensor::<B, 2>::from_data(TensorData::new(vec![-2.0_f32, -5.0], [1, 2]), &device);
-        let value = weighted_sparse_log_count_bce_loss(
-            predicted,
-            &batch.fingerprints,
-            4.0,
-            1.0,
-            None,
-            None,
-        )
-        .into_scalar();
+        let value = weighted_sparse_log_count_bce_loss(predicted, &batch.fingerprints, 4.0, 1.0)
+            .into_scalar();
         // Expected: per-bin loss at position 0 only.
         // softplus(2) ≈ 2.1269, minus ln 2 ≈ 0.6931 → 1.4338, weighted by 1.0,
         // averaged over N=2 → ≈ 0.7169.
@@ -2331,15 +2143,8 @@ mod tests {
             TensorData::new(vec![-50.0_f32, 50.0, -50.0, 50.0], [1, 4]),
             &device,
         );
-        let value = weighted_sparse_log_count_bce_loss(
-            predicted,
-            &batch.fingerprints,
-            4.0,
-            1.0,
-            None,
-            None,
-        )
-        .into_scalar();
+        let value = weighted_sparse_log_count_bce_loss(predicted, &batch.fingerprints, 4.0, 1.0)
+            .into_scalar();
         assert!(value.abs() < 1.0e-6, "expected near-zero BCE, got {value}");
     }
 

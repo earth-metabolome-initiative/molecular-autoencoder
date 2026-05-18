@@ -361,7 +361,6 @@ impl Args {
         &self,
         fingerprint_size: usize,
         ecfp_radius: u8,
-        bit_frequencies: Vec<f32>,
     ) -> AppResult<MoleculeAutoencoderConfig> {
         MoleculeAutoencoderConfig::builder()
             .fingerprint_size(fingerprint_size)
@@ -379,7 +378,6 @@ impl Args {
             .bce_weight(self.bce_weight)
             .bce_zero_weight(self.bce_zero_weight)
             .bce_nonzero_weight(self.bce_nonzero_weight)
-            .bit_frequencies(bit_frequencies)
             .build()
             .map_err(Into::into)
     }
@@ -586,7 +584,7 @@ mod tests {
         ])
         .expect("parse");
         let config = args
-            .to_model_config(64, 3, Vec::new())
+            .to_model_config(64, 3)
             .expect("builder accepts overrides");
 
         assert_eq!(config.encoder().input_width(), 64);
@@ -617,7 +615,7 @@ mod tests {
         ])
         .expect("parse");
         let error = args
-            .to_model_config(64, DEFAULT_ECFP_RADIUS, Vec::new())
+            .to_model_config(64, DEFAULT_ECFP_RADIUS)
             .expect_err("builder must reject");
         assert!(error.to_string().contains("candidates_per_anchor"));
     }
