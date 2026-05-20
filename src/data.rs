@@ -1963,4 +1963,84 @@ mod tests {
         assert_eq!(loaded.row_count, 1);
         assert_eq!(loaded.shards[0].nnz, 2);
     }
+
+    #[test]
+    fn molecule_record_accessors_return_constructed_values() {
+        let record = MoleculeRecord::new("pubchem-smiles", "42", "CCO");
+        assert_eq!(record.dataset_id(), "pubchem-smiles");
+        assert_eq!(record.record_id(), "42");
+        assert_eq!(record.stable_id(), 42);
+        assert_eq!(record.smiles(), "CCO");
+    }
+
+    #[test]
+    fn shard_manifest_accessors_and_counters_track_state() {
+        let config = PreprocessingConfig::default();
+        let mut manifest = ShardManifest::new("fixture", config);
+        let shard = test_shard();
+
+        assert_eq!(manifest.manifest_version(), SHARD_MANIFEST_VERSION);
+        assert_eq!(manifest.source(), "fixture");
+        assert_eq!(manifest.row_count(), 0);
+        assert_eq!(manifest.skipped_count(), 0);
+        assert_eq!(manifest.error_count(), 0);
+        assert!(manifest.shards().is_empty());
+        assert_eq!(manifest.preprocessing(), &PreprocessingConfig::default());
+
+        manifest.record_skipped();
+        manifest.record_skipped();
+        manifest.record_error();
+        manifest.push_shard("shard-00000.maeshard", &shard);
+
+        assert_eq!(manifest.skipped_count(), 2);
+        assert_eq!(manifest.error_count(), 1);
+        assert_eq!(manifest.row_count(), shard.len());
+        assert_eq!(manifest.shards().len(), 1);
+        let entry = &manifest.shards()[0];
+        assert_eq!(entry.path(), "shard-00000.maeshard");
+        assert_eq!(entry.row_count(), shard.len());
+        assert_eq!(entry.nnz(), shard.indices.len());
+    }
+
+    #[test]
+    fn molecule_targets_accessors_round_trip_preprocessed_record() {
+        let config = PreprocessingConfig::default();
+        let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
+        let record = MoleculeRecord::new("pubchem-smiles", "702", "CCO");
+        let targets = preprocess_record(&record, &config, &mut scratch)
+            .expect("preprocess ok")
+            .expect("CCO passes the default quality filter");
+
+        assert_eq!(targets.cid(), 702);
+        assert_eq!(targets.source_smiles(), "CCO");
+        assert_eq!(
+            targets.fingerprint().fingerprint_size(),
+            config.counted_ecfp().size()
+        );
+        assert!(targets.descriptors().carbon_count() >= 2);
+        // The split tag must be one of the two enum variants.
+        assert!(matches!(
+            targets.split(),
+            DataSplit::Train | DataSplit::Validation
+        ));
+    }
+
+    #[cfg(feature = "datasets")]
+    #[test]
+    fn dataset_preprocess_options_accessors_round_trip_builder() {
+        let options = DatasetPreprocessOptions::builder()
+            .chunk_rows(256)
+            .threads(Some(4))
+            .build()
+            .expect("valid options");
+        assert_eq!(options.chunk_rows(), 256);
+        assert_eq!(options.threads(), Some(4));
+
+        let unbounded = DatasetPreprocessOptions::builder()
+            .chunk_rows(512)
+            .threads(None)
+            .build()
+            .expect("None threads is valid");
+        assert_eq!(unbounded.threads(), None);
+    }
 }

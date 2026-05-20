@@ -568,4 +568,15 @@ mod tests {
 
         let _ = MoleculeAutoencoderBatcher::new(16, 2).batch_inner::<B>(vec![item], &device);
     }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn batch_build_profile_total_sums_phase_durations() {
+        let profile = MoleculeBatchBuildProfile {
+            sparse_allocation: std::time::Duration::from_micros(100),
+            sparse_fill: std::time::Duration::from_micros(200),
+            tensor_build: std::time::Duration::from_micros(300),
+        };
+        assert_eq!(profile.total(), std::time::Duration::from_micros(600));
+    }
 }

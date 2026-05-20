@@ -827,4 +827,78 @@ mod tests {
         assert_eq!(targets[13], 6.0);
         assert_eq!(targets[16], 1.0);
     }
+
+    #[test]
+    fn descriptor_accessors_expose_all_stored_fields() {
+        let smiles: Smiles = "[F].[Cl].[Br].[I].[P].[S].[N].[O]"
+            .parse()
+            .expect("valid SMILES");
+        let descriptors = DescriptorTargets::from_smiles(&smiles);
+
+        // Every accessor is a thin getter; calling each one ensures the
+        // public surface returns the value placed there at construction.
+        assert!(descriptors.molecular_mass() > 0.0);
+        assert_eq!(descriptors.formal_charge(), 0);
+        assert_eq!(descriptors.carbon_count(), 0);
+        assert_eq!(descriptors.nitrogen_count(), 1);
+        assert_eq!(descriptors.oxygen_count(), 1);
+        assert_eq!(descriptors.phosphorus_count(), 1);
+        assert_eq!(descriptors.sulfur_count(), 1);
+        assert_eq!(descriptors.fluorine_count(), 1);
+        assert_eq!(descriptors.chlorine_count(), 1);
+        assert_eq!(descriptors.bromine_count(), 1);
+        assert_eq!(descriptors.iodine_count(), 1);
+        assert_eq!(descriptors.heavy_atom_count(), 8);
+        assert_eq!(
+            descriptors.hydrogen_count(),
+            descriptors.total_hydrogen_count()
+        );
+        assert_eq!(descriptors.ring_atom_count(), 0);
+        assert_eq!(descriptors.ring_bond_count(), 0);
+        // Eight disconnected single-atom fragments.
+        assert_eq!(descriptors.connected_component_count(), 8);
+        assert_eq!(descriptors.aromatic_atom_count(), 0);
+    }
+
+    #[test]
+    fn regression_targets_layout_matches_label_order() {
+        let smiles: Smiles = "c1ccccc1".parse().expect("valid SMILES");
+        let descriptors = DescriptorTargets::from_smiles(&smiles);
+        let config = DescriptorConfig::builder()
+            .mass_scale(1.0)
+            .count_scale(1.0)
+            .charge_scale(1.0)
+            .build()
+            .expect("valid descriptor config");
+        let targets = descriptors.regression_targets(config);
+
+        for (index, label) in REGRESSION_TARGET_LABELS.iter().enumerate() {
+            let expected = match *label {
+                "molecular_mass" => descriptors.molecular_mass(),
+                "formal_charge" => descriptors.formal_charge() as f32,
+                "count_c" => descriptors.carbon_count() as f32,
+                "count_h" => descriptors.hydrogen_count() as f32,
+                "count_n" => descriptors.nitrogen_count() as f32,
+                "count_o" => descriptors.oxygen_count() as f32,
+                "count_p" => descriptors.phosphorus_count() as f32,
+                "count_s" => descriptors.sulfur_count() as f32,
+                "count_f" => descriptors.fluorine_count() as f32,
+                "count_cl" => descriptors.chlorine_count() as f32,
+                "count_br" => descriptors.bromine_count() as f32,
+                "count_i" => descriptors.iodine_count() as f32,
+                "heavy_atom_count" => descriptors.heavy_atom_count() as f32,
+                "total_hydrogen_count" => descriptors.total_hydrogen_count() as f32,
+                "ring_atom_count" => descriptors.ring_atom_count() as f32,
+                "ring_bond_count" => descriptors.ring_bond_count() as f32,
+                "component_count" => descriptors.connected_component_count() as f32,
+                "aromatic_atom_count" => descriptors.aromatic_atom_count() as f32,
+                other => panic!("unknown descriptor label `{other}` at index {index}"),
+            };
+            assert!(
+                (targets[index] - expected).abs() < 1.0e-6,
+                "label `{label}` at index {index}: got {} expected {expected}",
+                targets[index]
+            );
+        }
+    }
 }

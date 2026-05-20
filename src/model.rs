@@ -2529,4 +2529,268 @@ mod tests {
             assert!((sparse - dense).abs() < 1.0e-5);
         }
     }
+
+    #[test]
+    fn decoder_builder_rejects_missing_or_zero_fields() {
+        let err = DecoderConfig::builder()
+            .build()
+            .expect_err("missing latent_width should fail");
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message } if message.contains("latent_width")
+        ));
+
+        let err = DecoderConfig::builder()
+            .latent_width(8)
+            .build()
+            .expect_err("missing output_width should fail");
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message } if message.contains("output_width")
+        ));
+
+        let err = DecoderConfig::builder()
+            .latent_width(0)
+            .output_width(64)
+            .build()
+            .expect_err("zero latent_width should fail");
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message } if message.contains("latent_width")
+        ));
+
+        let err = DecoderConfig::builder()
+            .latent_width(8)
+            .output_width(0)
+            .build()
+            .expect_err("zero output_width should fail");
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message } if message.contains("output_width")
+        ));
+
+        let err = DecoderConfig::builder()
+            .latent_width(8)
+            .output_width(64)
+            .hidden_widths(vec![32, 0, 16])
+            .build()
+            .expect_err("zero hidden width should fail");
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message } if message.contains("hidden widths")
+        ));
+
+        let config = DecoderConfig::builder()
+            .latent_width(8)
+            .output_width(64)
+            .hidden_widths(vec![32, 16])
+            .build()
+            .expect("valid builder must produce a config");
+        assert_eq!(config.latent_width(), 8);
+        assert_eq!(config.output_width(), 64);
+        assert_eq!(config.hidden_widths(), &[32, 16]);
+    }
+
+    #[test]
+    fn validate_rejects_decoder_output_width_mismatch() {
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.decoder.output_width += 1;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("decoder output width mismatch must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("decoder output width")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_encoder_hidden_widths() {
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.encoder.hidden_widths.clear();
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("empty encoder hidden widths must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("encoder hidden widths")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_latent_width() {
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.encoder.latent_width = 0;
+        config.decoder.latent_width = 0;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("zero latent width must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("latent width")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_encoder_decoder_latent_width_mismatch() {
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.decoder.latent_width = config.encoder.latent_width + 1;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("latent width mismatch must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("latent width")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_descriptor_width() {
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.descriptor_width = 0;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("zero descriptor width must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("descriptor")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_reconstruction_beta_and_weights() {
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.reconstruction_loss.beta = 0.0;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("zero beta must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("beta")
+        ));
+
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.reconstruction_loss.beta = f64::INFINITY;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("infinite beta must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("beta")
+        ));
+
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.reconstruction_loss.zero_weight = -1.0;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("negative reconstruction weight must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("reconstruction loss weights")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_tanimoto_ranking_configuration() {
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.tanimoto_ranking.metric_temperature = -1.0;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("non-positive metric temperature must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("metric temperature")
+        ));
+
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.tanimoto_ranking.min_gap = -0.1;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("negative min_gap must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("min_gap")
+        ));
+
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.auxiliary_weights.tanimoto_ranking = 1.0;
+        config.tanimoto_ranking.candidates_per_anchor = 1;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("candidates < 2 with positive ranking weight must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("candidates_per_anchor")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_ecfp_radius_and_nonfinite_noise() {
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.ecfp_radius = 0;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("zero ecfp radius must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("ecfp radius")
+        ));
+
+        let mut config = MoleculeAutoencoderConfig::v1_counted_ecfp();
+        config.latent_noise_std = f64::NAN;
+        let error = config
+            .validate(config.encoder.input_width)
+            .expect_err("NaN latent noise std must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::ConfigInvalid { message } if message.contains("latent noise")
+        ));
+    }
+
+    #[test]
+    fn tanimoto_ranking_config_accessors_expose_builder_values() {
+        let config = TanimotoRankingConfig::builder()
+            .latent_temperature(0.42)
+            .metric_temperature(0.84)
+            .min_gap(0.05)
+            .candidates_per_anchor(7)
+            .pairs_per_batch(11)
+            .build()
+            .expect("valid builder");
+        assert!((config.latent_temperature() - 0.42).abs() < 1.0e-12);
+        assert!((config.metric_temperature() - 0.84).abs() < 1.0e-12);
+        assert!((config.min_gap() - 0.05).abs() < 1.0e-12);
+        assert_eq!(config.candidates_per_anchor(), 7);
+        assert_eq!(config.pairs_per_batch(), 11);
+    }
+
+    #[test]
+    fn tanimoto_ranking_builder_rejects_non_finite_or_non_positive_fields() {
+        let err = TanimotoRankingConfig::builder()
+            .latent_temperature(0.0)
+            .build()
+            .expect_err("zero latent temperature must be rejected");
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message } if message.contains("latent temperature")
+        ));
+
+        let err = TanimotoRankingConfig::builder()
+            .metric_temperature(f64::NAN)
+            .build()
+            .expect_err("NaN metric temperature must be rejected");
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message } if message.contains("metric temperature")
+        ));
+
+        let err = TanimotoRankingConfig::builder()
+            .min_gap(-1.0)
+            .build()
+            .expect_err("negative min_gap must be rejected");
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message } if message.contains("min_gap")
+        ));
+    }
 }

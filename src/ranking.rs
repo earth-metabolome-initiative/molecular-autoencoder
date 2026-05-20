@@ -303,4 +303,63 @@ mod tests {
         let max_logit = logit0.max(logit1);
         max_logit + ((logit0 - max_logit).exp() + (logit1 - max_logit).exp()).ln() - logit0
     }
+
+    #[test]
+    fn ranking_loss_is_zero_when_candidate_count_is_below_two() {
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let latent = Tensor::<B, 2>::zeros([3, 2], &device);
+        let batch = TanimotoRankingBatch {
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![0_i64; 3], [3, 1]),
+                &device,
+            ),
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![0_i64; 3], [3]),
+                &device,
+            ),
+            top2_gap: Tensor::<B, 2>::zeros([3, 1], &device),
+        };
+        let output = tanimoto_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01);
+        assert_eq!(output.loss.into_scalar(), 0.0);
+        assert_eq!(output.valid_pairs.into_scalar(), 0.0);
+        assert_eq!(output.accuracy.into_scalar(), 0.0);
+    }
+
+    #[test]
+    fn weighted_ranking_returns_zero_diagnostics_when_weight_is_zero() {
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let latent = Tensor::<B, 2>::ones([3, 2], &device);
+        let batch = TanimotoRankingBatch::zeros(3, &device);
+        let output = weighted_tanimoto_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01, 0.0);
+        assert_eq!(output.loss.into_scalar(), 0.0);
+        assert_eq!(output.valid_pairs.into_scalar(), 0.0);
+        assert_eq!(output.accuracy.into_scalar(), 0.0);
+    }
+
+    #[test]
+    fn weighted_ranking_scales_loss_by_weight() {
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let latent = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![0.0_f32, 1.0, 1.0, 0.0, 0.5, 0.5], [3, 2]),
+            &device,
+        );
+        let batch = TanimotoRankingBatch {
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![1_i64, 2, 2, 0, 0, 1], [3, 2]),
+                &device,
+            ),
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![0_i64, 0, 0], [3]),
+                &device,
+            ),
+            top2_gap: Tensor::<B, 2>::ones([3, 1], &device),
+        };
+        let unweighted = tanimoto_ranking_output(latent.clone(), batch.clone(), 0, 0.5, 0.5, 0.01)
+            .loss
+            .into_scalar();
+        let weighted = weighted_tanimoto_ranking_output(latent, batch, 0, 0.5, 0.5, 0.01, 2.5)
+            .loss
+            .into_scalar();
+        assert!((weighted - unweighted * 2.5).abs() < 1.0e-5);
+    }
 }
