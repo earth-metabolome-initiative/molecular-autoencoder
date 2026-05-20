@@ -10,10 +10,13 @@
 mod api;
 #[cfg(feature = "train")]
 mod autodiff;
+mod cpu;
 mod cube_backend;
 #[cfg(feature = "cuda-fusion")]
 mod fusion;
 mod kernels;
+#[cfg(feature = "ndarray")]
+mod ndarray_backend;
 #[cfg(test)]
 mod tests;
 
