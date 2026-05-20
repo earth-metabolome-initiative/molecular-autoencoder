@@ -114,3 +114,52 @@ pub fn effective_device_prefetch_batches(requested: usize) -> usize {
         requested
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tanimoto_ranking_seed_is_deterministic() {
+        assert_eq!(
+            tanimoto_ranking_seed(7, 31, 2),
+            tanimoto_ranking_seed(7, 31, 2)
+        );
+    }
+
+    #[test]
+    fn tanimoto_ranking_seed_differs_across_epoch_batch_or_peer() {
+        let base = tanimoto_ranking_seed(0, 0, 0);
+        assert_ne!(base, tanimoto_ranking_seed(1, 0, 0));
+        assert_ne!(base, tanimoto_ranking_seed(0, 1, 0));
+        assert_ne!(base, tanimoto_ranking_seed(0, 0, 1));
+    }
+
+    #[test]
+    fn tanimoto_ranking_seed_decorrelates_neighboring_peers() {
+        // Two peers running the same (epoch, batch) must not draw identical
+        // contrastive partners — guard the constant-multiplier reuse.
+        let peer0 = tanimoto_ranking_seed(3, 17, 0);
+        let peer1 = tanimoto_ranking_seed(3, 17, 1);
+        let peer2 = tanimoto_ranking_seed(3, 17, 2);
+        assert_ne!(peer0, peer1);
+        assert_ne!(peer0, peer2);
+        assert_ne!(peer1, peer2);
+    }
+
+    #[test]
+    fn effective_device_prefetch_batches_passes_requested_value_on_cpu() {
+        // Under non-CUDA builds the requested depth flows through unchanged;
+        // under CUDA builds the helper warns and returns 0 (printed to stderr).
+        let result = effective_device_prefetch_batches(4);
+        #[cfg(feature = "cuda")]
+        assert_eq!(result, 0);
+        #[cfg(not(feature = "cuda"))]
+        assert_eq!(result, 4);
+    }
+
+    #[test]
+    fn effective_device_prefetch_batches_zero_request_is_idempotent() {
+        assert_eq!(effective_device_prefetch_batches(0), 0);
+    }
+}

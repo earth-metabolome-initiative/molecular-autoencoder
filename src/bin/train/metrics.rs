@@ -221,3 +221,102 @@ impl Drop for LoaderProfileReporter {
         self.flush();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_label_maps_each_variant_once() {
+        assert_eq!(split_label(DataSplit::Train), "train");
+        assert_eq!(split_label(DataSplit::Validation), "valid");
+    }
+
+    #[test]
+    fn should_sample_metrics_always_fires_on_first_batch() {
+        assert!(should_sample_metrics(1, 0));
+        assert!(should_sample_metrics(1, 100));
+    }
+
+    #[test]
+    fn should_sample_metrics_respects_period_after_first_batch() {
+        assert!(should_sample_metrics(20, 10));
+        assert!(should_sample_metrics(30, 10));
+        assert!(!should_sample_metrics(15, 10));
+        // every=0 disables sampling for non-first batches.
+        assert!(!should_sample_metrics(2, 0));
+        assert!(!should_sample_metrics(100, 0));
+    }
+
+    #[test]
+    fn examples_per_second_returns_zero_for_zero_elapsed() {
+        assert_eq!(examples_per_second(1000, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn examples_per_second_divides_by_seconds() {
+        let throughput = examples_per_second(500, Duration::from_secs_f64(2.0));
+        assert!((throughput - 250.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn millis_per_batch_returns_zero_when_no_batches() {
+        assert_eq!(millis_per_batch(Duration::from_secs(3), 0), 0.0);
+    }
+
+    #[test]
+    fn millis_per_batch_converts_to_milliseconds() {
+        let result = millis_per_batch(Duration::from_secs(4), 8);
+        assert!((result - 500.0).abs() < 1.0e-9);
+    }
+
+    fn fixture_profile() -> BatchLoadProfile {
+        BatchLoadProfile {
+            shard_read: Duration::from_millis(1),
+            row_scan: Duration::from_millis(2),
+            sparse_allocation: Duration::from_millis(3),
+            sparse_fill: Duration::from_millis(4),
+            tensor_build: Duration::from_millis(5),
+            producer_total: Duration::from_millis(15),
+        }
+    }
+
+    #[test]
+    fn loader_profile_reporter_with_every_zero_is_a_noop() {
+        let mut reporter = LoaderProfileReporter::new("train", 0);
+        reporter.record(Duration::from_millis(10), 32, fixture_profile());
+        // record() bailed out early; summary stays empty.
+        assert_eq!(reporter.summary.batches, 0);
+        assert_eq!(reporter.summary.rows, 0);
+        assert!(reporter.summary.wait.is_zero());
+    }
+
+    #[test]
+    fn loader_profile_reporter_flushes_after_period() {
+        let mut reporter = LoaderProfileReporter::new("train", 2);
+        reporter.record(Duration::from_millis(1), 8, fixture_profile());
+        assert_eq!(reporter.summary.batches, 1);
+        // Second call hits `batches >= every` and flushes (eprintln side effect).
+        reporter.record(Duration::from_millis(2), 8, fixture_profile());
+        // Post-flush the summary is reset.
+        assert_eq!(reporter.summary.batches, 0);
+        assert_eq!(reporter.summary.rows, 0);
+        assert!(reporter.summary.wait.is_zero());
+    }
+
+    #[test]
+    fn loader_profile_reporter_flush_is_idempotent_when_empty() {
+        let mut reporter = LoaderProfileReporter::new("valid", 4);
+        reporter.flush();
+        assert_eq!(reporter.summary.batches, 0);
+    }
+
+    #[test]
+    fn loader_profile_reporter_drop_flushes_partial_summary() {
+        let mut reporter = LoaderProfileReporter::new("train", 100);
+        reporter.record(Duration::from_millis(1), 4, fixture_profile());
+        assert_eq!(reporter.summary.batches, 1);
+        // Drop runs flush(); just ensure it doesn't panic.
+        drop(reporter);
+    }
+}

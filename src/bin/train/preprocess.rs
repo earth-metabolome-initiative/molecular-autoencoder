@@ -348,3 +348,195 @@ fn spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("{spinner:.green} {elapsed_precise} {wide_msg}")
         .unwrap_or_else(|_| ProgressStyle::default_spinner())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Args, ResolvedPaths, Zinc20ChunkRange};
+    use clap::Parser;
+    use molecular_autoencoder::{DataSplit, FingerprintTargets};
+
+    const FINGERPRINT_WIDTH: usize = 4096;
+
+    fn args_with(checkpoint_dir: &Path, shards: &Path) -> Args {
+        Args::try_parse_from([
+            "train",
+            shards.to_str().expect("utf-8"),
+            checkpoint_dir.to_str().expect("utf-8"),
+        ])
+        .expect("parse")
+    }
+
+    fn fixture_shard() -> SparseMoleculeShard {
+        let mut shard = SparseMoleculeShard::new(FINGERPRINT_WIDTH, REGRESSION_TARGET_WIDTH);
+        let fingerprint = FingerprintTargets::new(vec![3, 11], vec![1, 2], FINGERPRINT_WIDTH)
+            .expect("valid fingerprint");
+        shard
+            .push(
+                17,
+                &fingerprint,
+                &[0.0; REGRESSION_TARGET_WIDTH],
+                DataSplit::Train,
+            )
+            .expect("push row");
+        shard
+    }
+
+    #[test]
+    fn prepare_manifest_short_circuits_when_no_cache_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join("custom.json");
+        std::fs::write(&manifest_path, "{}").expect("write placeholder");
+        let args = args_with(&dir.path().join("runs"), &manifest_path);
+        let resolved = ResolvedPaths {
+            manifest_path: manifest_path.clone(),
+            cache_dir: None,
+            source_selection: Some(SourceSelection::PubChem),
+        };
+
+        let result = prepare_manifest(&args, &resolved).expect("prepare manifest");
+        assert_eq!(result, manifest_path);
+    }
+
+    #[test]
+    fn prepare_manifest_short_circuits_when_no_source_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join("manifest.json");
+        let args = args_with(&dir.path().join("runs"), dir.path());
+        let resolved = ResolvedPaths {
+            manifest_path: manifest_path.clone(),
+            cache_dir: Some(dir.path().to_path_buf()),
+            source_selection: None,
+        };
+
+        let result = prepare_manifest(&args, &resolved).expect("prepare manifest");
+        assert_eq!(result, manifest_path);
+    }
+
+    #[test]
+    fn prepare_manifest_reuses_matching_cached_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join("manifest.json");
+
+        let mut manifest = ShardManifest::new(
+            SourceSelection::PubChem.manifest_source(),
+            PreprocessingConfig::default(),
+        );
+        manifest.push_shard("shard-00000.maeshard", &fixture_shard());
+        manifest
+            .write_to_path(&manifest_path)
+            .expect("write manifest");
+
+        let args = args_with(&dir.path().join("runs"), dir.path());
+        let resolved = ResolvedPaths {
+            manifest_path: manifest_path.clone(),
+            cache_dir: Some(dir.path().to_path_buf()),
+            source_selection: Some(SourceSelection::PubChem),
+        };
+
+        let result = prepare_manifest(&args, &resolved).expect("prepare manifest");
+        assert_eq!(result, manifest_path);
+    }
+
+    #[test]
+    fn prepare_manifest_logs_source_mismatch_warning_before_rebuilding() {
+        // We can't run the full preprocessing pipeline (it would download
+        // PubChem), so we just exercise the source-mismatch detection up to
+        // the point where it would call preprocess_cache. That path triggers
+        // preprocessing, which we short-circuit by forcing `rows_per_shard=0`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join("manifest.json");
+
+        let mut manifest = ShardManifest::new(
+            // Wrong source: cached PubChem, requesting Zinc20.
+            SourceSelection::PubChem.manifest_source(),
+            PreprocessingConfig::default(),
+        );
+        manifest.push_shard("shard-00000.maeshard", &fixture_shard());
+        manifest
+            .write_to_path(&manifest_path)
+            .expect("write manifest");
+
+        let mut args = args_with(&dir.path().join("runs"), dir.path());
+        args.rows_per_shard = 0; // force preprocess_cache to bail before downloads
+        let resolved = ResolvedPaths {
+            manifest_path,
+            cache_dir: Some(dir.path().to_path_buf()),
+            source_selection: Some(SourceSelection::Zinc20(Zinc20ChunkRange {
+                first: 1,
+                last: 2,
+            })),
+        };
+
+        let err = prepare_manifest(&args, &resolved)
+            .expect_err("preprocessing aborts before any network fetch");
+        assert!(err.to_string().contains("rows per shard"), "got: {err}");
+    }
+
+    #[test]
+    fn prepare_manifest_force_preprocess_bypasses_cache_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join("manifest.json");
+
+        let mut manifest = ShardManifest::new(
+            SourceSelection::PubChem.manifest_source(),
+            PreprocessingConfig::default(),
+        );
+        manifest.push_shard("shard-00000.maeshard", &fixture_shard());
+        manifest
+            .write_to_path(&manifest_path)
+            .expect("write manifest");
+
+        let mut args = args_with(&dir.path().join("runs"), dir.path());
+        args.force_preprocess = true;
+        args.rows_per_shard = 0; // halt preprocess_cache before any IO
+        let resolved = ResolvedPaths {
+            manifest_path,
+            cache_dir: Some(dir.path().to_path_buf()),
+            source_selection: Some(SourceSelection::PubChem),
+        };
+
+        let err = prepare_manifest(&args, &resolved)
+            .expect_err("force_preprocess + rows_per_shard=0 must trigger preprocess_cache");
+        assert!(err.to_string().contains("rows per shard"));
+    }
+
+    #[test]
+    fn write_preprocessed_shard_appends_entry_and_writes_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut manifest = ShardManifest::new(
+            SourceSelection::PubChem.manifest_source(),
+            PreprocessingConfig::default(),
+        );
+        let shard = fixture_shard();
+
+        write_preprocessed_shard(dir.path(), 0, &mut manifest, &shard).expect("write");
+
+        assert_eq!(manifest.shards().len(), 1);
+        let entry = &manifest.shards()[0];
+        assert_eq!(entry.path(), "shard-00000.maeshard");
+        assert_eq!(entry.row_count(), shard.len());
+        assert!(dir.path().join("shard-00000.maeshard").exists());
+    }
+
+    #[test]
+    fn preprocess_progress_message_helpers_are_callable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let progress = PreprocessProgress::new(dir.path(), SourceSelection::PubChem, 64, 1);
+        let manifest = ShardManifest::new(
+            SourceSelection::PubChem.manifest_source(),
+            PreprocessingConfig::default(),
+        );
+        progress.record("PubChem", 1, &manifest, 0);
+        progress.record("PubChem", 1024, &manifest, 8);
+        progress.shard_written(&manifest, 0);
+        progress.finish(1024, &manifest, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn spinner_returns_a_progress_bar_with_message() {
+        let bar = spinner("hello");
+        assert_eq!(bar.message(), "hello");
+        bar.finish_and_clear();
+    }
+}

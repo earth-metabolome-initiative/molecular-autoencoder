@@ -674,4 +674,110 @@ mod tests {
             vec![DatasetKind::Pubchem, DatasetKind::Zinc20]
         );
     }
+
+    #[test]
+    fn source_selection_zinc20_alone_uses_default_chunk_range_when_unset() {
+        let selection = SourceSelection::from_flags(&[DatasetKind::Zinc20], None)
+            .expect("zinc20 only")
+            .expect("non-empty");
+        assert_eq!(
+            selection,
+            SourceSelection::Zinc20(Zinc20ChunkRange {
+                first: ZINC20_FIRST_CHUNK,
+                last: ZINC20_LAST_CHUNK,
+            })
+        );
+    }
+
+    #[test]
+    fn source_selection_rejects_zinc20_duplicate() {
+        assert!(
+            SourceSelection::from_flags(&[DatasetKind::Zinc20, DatasetKind::Zinc20], None).is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_source_formats_each_variant() {
+        assert_eq!(SourceSelection::PubChem.manifest_source(), "pubchem-smiles");
+        let range = Zinc20ChunkRange { first: 1, last: 5 };
+        assert_eq!(
+            SourceSelection::Zinc20(range).manifest_source(),
+            "zinc20-smiles chunks 1..=5"
+        );
+        assert_eq!(
+            SourceSelection::PubChemAndZinc20(range).manifest_source(),
+            "pubchem-smiles + zinc20-smiles chunks 1..=5"
+        );
+    }
+
+    #[test]
+    fn manifest_paths_picks_manifest_inside_existing_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args =
+            Args::try_parse_from(["train", dir.path().to_str().expect("utf-8"), "checkpoints"])
+                .expect("parse");
+        let resolved = args.manifest_paths().expect("manifest paths");
+        assert_eq!(resolved.manifest_path, dir.path().join("manifest.json"));
+        assert_eq!(resolved.cache_dir, Some(dir.path().to_path_buf()));
+        assert!(resolved.source_selection.is_none());
+    }
+
+    #[test]
+    fn manifest_paths_uses_explicit_manifest_file_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("custom-manifest.json");
+        std::fs::write(&manifest, "{}").expect("write placeholder");
+        let args =
+            Args::try_parse_from(["train", manifest.to_str().expect("utf-8"), "checkpoints"])
+                .expect("parse");
+        let resolved = args.manifest_paths().expect("manifest paths");
+        assert_eq!(resolved.manifest_path, manifest);
+        assert!(resolved.cache_dir.is_none());
+    }
+
+    #[test]
+    fn manifest_paths_treats_missing_path_as_cache_dir() {
+        let args = Args::try_parse_from(["train", "/tmp/does-not-exist-xyz", "checkpoints"])
+            .expect("parse");
+        let resolved = args.manifest_paths().expect("manifest paths");
+        assert_eq!(
+            resolved.manifest_path,
+            PathBuf::from("/tmp/does-not-exist-xyz/manifest.json")
+        );
+        assert_eq!(
+            resolved.cache_dir,
+            Some(PathBuf::from("/tmp/does-not-exist-xyz"))
+        );
+    }
+
+    #[test]
+    fn quality_filter_threads_mass_bounds_through_builder() {
+        let args = Args::try_parse_from([
+            "train",
+            "s",
+            "c",
+            "--min-molecular-mass",
+            "120.0",
+            "--max-molecular-mass",
+            "500.0",
+        ])
+        .expect("parse");
+        let filter = args.quality_filter().expect("valid filter");
+        assert_eq!(filter.min_molecular_mass(), Some(120.0));
+        assert_eq!(filter.max_molecular_mass(), Some(500.0));
+    }
+
+    #[test]
+    fn positive_usize_parser_rejects_zero() {
+        assert!(positive_usize("0").is_err());
+        assert_eq!(positive_usize("64").expect("nonzero"), 64);
+        assert!(positive_usize("not-a-number").is_err());
+    }
+
+    #[test]
+    fn positive_u8_parser_rejects_zero() {
+        assert!(positive_u8("0").is_err());
+        assert_eq!(positive_u8("3").expect("nonzero"), 3);
+        assert!(positive_u8("not-a-number").is_err());
+    }
 }
