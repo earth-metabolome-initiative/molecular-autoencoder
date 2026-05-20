@@ -4400,6 +4400,7 @@ dependencies = [
  "arrow",
  "burn",
  "burn-collective",
+ "burn-cpu",
  "burn-cubecl",
  "burn-fusion",
  "burn-ir",

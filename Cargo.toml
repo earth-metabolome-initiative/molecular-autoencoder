@@ -39,6 +39,10 @@ multi-gpu = ["burn/collective", "dep:burn-collective", "dep:cudarc"]
 cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl", "multi-gpu"]
 cuda-fusion = ["cuda", "burn/fusion", "burn/autotune", "dep:burn-fusion", "dep:burn-ir"]
 cuda-no-fusion = ["cuda", "burn/autotune"]
+# CPU CubeCL runtime — used by tests to exercise the tanimoto_cuda kernels
+# without CUDA hardware. Not for production builds; the WASM inference build
+# must never enable this (it pulls MLIR / LLVM via tracel-llvm-bundler).
+cubecl-cpu = ["dep:burn-cpu", "dep:burn-cubecl", "dep:cubecl"]
 fingerprints = ["finge-rs/smiles-support"]
 datasets = ["std", "dep:indicatif", "dep:rayon", "smiles-parser/datasets"]
 embed = ["std", "ndarray", "dep:csv", "dep:clap"]
@@ -49,6 +53,7 @@ embed-parquet = ["embed", "dep:parquet", "dep:arrow"]
 arrow = { version = "55", default-features = false, optional = true }
 burn = { version = "=0.21.0", default-features = false }
 burn-collective = { version = "=0.21.0", default-features = false, optional = true }
+burn-cpu = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
 burn-cubecl = { version = "=0.21.0", default-features = false, optional = true }
 burn-fusion = { version = "=0.21.0", default-features = false, optional = true }
 burn-ir = { version = "=0.21.0", default-features = false, optional = true }

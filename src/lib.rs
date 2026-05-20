@@ -16,7 +16,7 @@ pub mod fingerprints;
 pub mod metrics;
 pub mod model;
 pub mod ranking;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cubecl-cpu"))]
 pub mod tanimoto_cuda;
 #[cfg(feature = "train")]
 pub mod training;

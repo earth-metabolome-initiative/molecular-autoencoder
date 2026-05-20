@@ -1,15 +1,34 @@
 use super::*;
 
 use burn::{
-    backend::{Autodiff, Cuda, cuda::CudaDevice},
+    backend::Autodiff,
     tensor::{Tensor as BurnTensor, TensorData},
 };
 
-type TestBackend = Autodiff<Cuda<f32, i32>>;
+#[cfg(feature = "cuda")]
+mod backend_alias {
+    pub use burn::backend::Cuda as TestInner;
+    pub use burn::backend::cuda::CudaDevice as TestDevice;
+}
+
+#[cfg(all(not(feature = "cuda"), feature = "cubecl-cpu"))]
+mod backend_alias {
+    pub use burn_cpu::Cpu as TestInner;
+    pub use burn_cpu::CpuDevice as TestDevice;
+}
+
+use backend_alias::{TestDevice, TestInner};
+
+type TestBackend = Autodiff<TestInner<f32, i32>>;
 
 #[test]
+#[allow(
+    clippy::default_constructed_unit_structs,
+    reason = "TestDevice is a unit struct under cubecl-cpu and a tuple struct under cuda; \
+              the cross-feature alias uses Default::default to keep one expression."
+)]
 fn ranking_kernel_matches_cpu_counted_tanimoto_reference() {
-    let device = CudaDevice::default();
+    let device = TestDevice::default();
     let rows = SparseRows {
         indices: vec![
             1, 3, 0, //
