@@ -67,6 +67,14 @@ pub enum Error {
         /// Human-readable configuration error.
         message: String,
     },
+    /// Network failure while fetching a remote model artifact.
+    #[error("network error fetching {url}: {message}")]
+    Network {
+        /// URL that the failure originated from.
+        url: String,
+        /// Human-readable transport error text.
+        message: String,
+    },
 }
 
 impl Error {

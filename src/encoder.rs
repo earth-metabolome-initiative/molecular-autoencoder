@@ -10,9 +10,21 @@
 //! directly without depending on any of the I/O traits in
 //! [`crate::embed`].
 
+// `reqwest::Response` and the wasm-bindgen futures it produces are not
+// `Send` on wasm32 (browser fetch values aren't shareable between
+// threads), so the async constructors below intentionally return futures
+// without `Send` when targeting wasm. Single-threaded JS is the only
+// runtime there; on native targets the lint stays active.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::future_not_send))]
+
 use std::path::Path;
 
-use burn::{module::Module, prelude::*, record::DefaultRecorder, tensor::Transaction};
+use burn::{
+    module::Module,
+    prelude::*,
+    record::{DefaultRecorder, FullPrecisionSettings, NamedMpkBytesRecorder, Recorder},
+    tensor::Transaction,
+};
 use smiles_parser::prelude::Smiles;
 
 use crate::{
@@ -21,6 +33,94 @@ use crate::{
     batch_sparse_log_count_binary_tanimoto, batch_sparse_log_count_tanimoto,
     compute_fingerprint_targets, features::REGRESSION_TARGET_WIDTH,
 };
+
+#[cfg(feature = "http")]
+mod http_loader {
+    use std::path::PathBuf;
+
+    use sha2::{Digest, Sha256};
+
+    use crate::{Error, Result};
+
+    /// Filename for the JSON config artifact when laid out at a URL or in
+    /// a HuggingFace repository.
+    pub const CONFIG_FILENAME: &str = "model-config.json";
+    /// Filename for the model record (Burn `NamedMpk` format).
+    pub const RECORD_FILENAME: &str = "model.mpk";
+
+    /// Cache scope derived from two URLs: a 16-hex-char prefix of the
+    /// SHA-256 of `config_url || '\n' || record_url`. Lets two calls to
+    /// `from_url` with different URLs share no cache entries while keeping
+    /// the directory name compact.
+    pub fn url_cache_scope(config_url: &str, record_url: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(config_url.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(record_url.as_bytes());
+        let digest = hasher.finalize();
+        format!("url-{}", hex::encode(&digest[..8]))
+    }
+
+    /// Resolves the platform default cache root, or `None` when the
+    /// target has no addressable filesystem (wasm32) or the OS exposes
+    /// no per-user cache location.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn default_cache_root() -> Option<PathBuf> {
+        dirs::cache_dir().map(|root| root.join("molecular-autoencoder"))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn default_cache_root() -> Option<PathBuf> {
+        None
+    }
+
+    /// Like [`fetch_bytes`], but with an explicit cache root override.
+    /// Pass `None` to disable the on-disk cache entirely (useful in tests
+    /// or in CLIs that want full control over where downloads land).
+    pub async fn fetch_bytes_with_cache_root(
+        url: &str,
+        scope: &str,
+        filename: &str,
+        cache_root: Option<PathBuf>,
+    ) -> Result<Vec<u8>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let cache_path = cache_root.map(|root| root.join(scope).join(filename));
+        #[cfg(target_arch = "wasm32")]
+        let _ = (cache_root, scope, filename);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = cache_path.as_ref()
+            && path.exists()
+        {
+            return std::fs::read(path).map_err(|source| Error::io(path, source));
+        }
+
+        let response = reqwest::get(url).await.map_err(|source| Error::Network {
+            url: url.to_string(),
+            message: source.to_string(),
+        })?;
+        if !response.status().is_success() {
+            return Err(Error::Network {
+                url: url.to_string(),
+                message: format!("HTTP status {}", response.status()),
+            });
+        }
+        let bytes = response.bytes().await.map_err(|source| Error::Network {
+            url: url.to_string(),
+            message: source.to_string(),
+        })?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = cache_path.as_ref() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| Error::io(parent, source))?;
+            }
+            std::fs::write(path, &bytes).map_err(|source| Error::io(path, source))?;
+        }
+
+        Ok(bytes.to_vec())
+    }
+}
 
 /// One molecule's encoder output: the latent embedding plus the
 /// reconstruction-quality signals used for out-of-distribution detection.
@@ -75,24 +175,73 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
     pub fn from_checkpoint(checkpoint_dir: &Path, device: B::Device) -> Result<Self> {
         let config_path = checkpoint_dir.join("model-config.json");
         let config = MoleculeAutoencoderConfig::load_json(&config_path)?;
-        let fingerprint_size = config.encoder().input_width();
-        config.validate(fingerprint_size)?;
+        config.validate(config.encoder().input_width())?;
 
         let recorder = DefaultRecorder::default();
-        let mut model = config.init::<B>(&device);
-        model = model
+        let model = config
+            .init::<B>(&device)
             .load_file(checkpoint_dir.join("model"), &recorder, &device)
             .map_err(|source| Error::Io {
                 path: checkpoint_dir.join("model"),
                 source: std::io::Error::other(source.to_string()),
             })?;
 
+        Self::assemble(config, model, device)
+    }
+
+    /// Builds the encoder from already-resident config and model-record
+    /// bytes, without touching the filesystem.
+    ///
+    /// `config_json` is the verbatim contents of `model-config.json`;
+    /// `model_record` is the verbatim contents of `model.mpk` (the
+    /// [`NamedMpkFileRecorder`](burn::record::NamedMpkFileRecorder) format
+    /// emitted by [`crate::checkpoint`-style](crate) writers). Loading is
+    /// identical to [`from_checkpoint`](Self::from_checkpoint) but the
+    /// caller is in charge of acquiring the bytes — which means this is
+    /// the entry point that works in WASM, embedded contexts, or anywhere
+    /// without an addressable filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Json`] when `config_json` cannot be deserialized
+    /// or fails validation, [`Error::ConfigInvalid`] when the deserialized
+    /// configuration is internally inconsistent, and [`Error::Io`] (with a
+    /// synthetic `<bytes>` path) when the model record cannot be decoded.
+    pub fn from_bytes(
+        config_json: &[u8],
+        model_record: Vec<u8>,
+        device: B::Device,
+    ) -> Result<Self> {
+        let config = MoleculeAutoencoderConfig::from_json_bytes(config_json)?;
+        config.validate(config.encoder().input_width())?;
+
+        let recorder = NamedMpkBytesRecorder::<FullPrecisionSettings>::default();
+        let record =
+            Recorder::<B>::load(&recorder, model_record, &device).map_err(|source| Error::Io {
+                path: std::path::PathBuf::from("<bytes>"),
+                source: std::io::Error::other(source.to_string()),
+            })?;
+        let model = config.init::<B>(&device).load_record(record);
+
+        Self::assemble(config, model, device)
+    }
+
+    /// Shared assembly tail used by every constructor: builds the
+    /// fingerprint config + batcher + scratch buffer around an
+    /// already-validated config and an already-loaded model. Keeps the
+    /// `from_checkpoint` / `from_bytes` / URL-based paths from drifting
+    /// over time.
+    fn assemble(
+        config: MoleculeAutoencoderConfig,
+        model: MoleculeAutoencoder<B>,
+        device: B::Device,
+    ) -> Result<Self> {
+        let fingerprint_size = config.encoder().input_width();
         let batcher = MoleculeAutoencoderBatcher::new(fingerprint_size, config.descriptor_width());
         let ecfp_config = CountedEcfpConfig::builder()
             .radius(config.ecfp_radius())
             .size(fingerprint_size)
             .build()?;
-
         Ok(Self {
             model,
             config,
@@ -101,6 +250,128 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
             scratch: finge_rs::smiles_support::SmilesRdkitScratch::default(),
             device,
         })
+    }
+
+    /// Builds the encoder by fetching `model-config.json` and `model.mpk`
+    /// from the supplied URLs.
+    ///
+    /// On native targets, the downloaded artifacts are mirrored under
+    /// `~/.cache/molecular-autoencoder/<hash>/` so repeated calls with the
+    /// same URLs short-circuit the network round-trip. On `wasm32` the
+    /// caller relies on the surrounding fetch layer (e.g. the browser's
+    /// HTTP cache) for any reuse. Use
+    /// [`from_url_with_cache_root`](Self::from_url_with_cache_root) to
+    /// point the cache somewhere else or disable it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Network`] when either GET fails or returns a
+    /// non-success status, [`Error::Json`] when the config payload is not
+    /// valid JSON, and [`Error::Io`] when the model record cannot be
+    /// decoded or — on native — when the cache directory cannot be
+    /// written.
+    #[cfg(feature = "http")]
+    pub async fn from_url(config_url: &str, record_url: &str, device: B::Device) -> Result<Self> {
+        Self::from_url_with_cache_root(
+            config_url,
+            record_url,
+            device,
+            http_loader::default_cache_root(),
+        )
+        .await
+    }
+
+    /// Like [`from_url`](Self::from_url), but with an explicit cache
+    /// root. Pass `None` to disable on-disk caching entirely.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`from_url`](Self::from_url).
+    #[cfg(feature = "http")]
+    pub async fn from_url_with_cache_root(
+        config_url: &str,
+        record_url: &str,
+        device: B::Device,
+        cache_root: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        let scope = http_loader::url_cache_scope(config_url, record_url);
+        Self::from_scoped_urls(config_url, record_url, &scope, cache_root, device).await
+    }
+
+    /// Internal helper: fetch the canonical pair of artifacts under a
+    /// caller-chosen cache `scope` and assemble the encoder. Centralises
+    /// the fetch + `from_bytes` plumbing so the URL- and HuggingFace-
+    /// flavoured constructors share one body.
+    #[cfg(feature = "http")]
+    async fn from_scoped_urls(
+        config_url: &str,
+        record_url: &str,
+        scope: &str,
+        cache_root: Option<std::path::PathBuf>,
+        device: B::Device,
+    ) -> Result<Self> {
+        let config_bytes = http_loader::fetch_bytes_with_cache_root(
+            config_url,
+            scope,
+            http_loader::CONFIG_FILENAME,
+            cache_root.clone(),
+        )
+        .await?;
+        let record_bytes = http_loader::fetch_bytes_with_cache_root(
+            record_url,
+            scope,
+            http_loader::RECORD_FILENAME,
+            cache_root,
+        )
+        .await?;
+        Self::from_bytes(&config_bytes, record_bytes, device)
+    }
+
+    /// Builds the encoder by fetching the model artifacts from a
+    /// HuggingFace repository revision.
+    ///
+    /// Resolves `https://huggingface.co/{repo}/resolve/{revision}/model-config.json`
+    /// and `.../model.mpk` and delegates to the URL-based loader. On
+    /// native targets the cache scope is keyed by repo + revision so each
+    /// published revision occupies its own directory. Use
+    /// [`from_huggingface_with_cache_root`](Self::from_huggingface_with_cache_root)
+    /// to override the cache location.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`from_url`](Self::from_url) — typically
+    /// [`Error::Network`] when the repository or revision is unreachable
+    /// and [`Error::Json`] / [`Error::Io`] when the artifacts are not
+    /// shaped as expected.
+    #[cfg(feature = "huggingface")]
+    pub async fn from_huggingface(repo: &str, revision: &str, device: B::Device) -> Result<Self> {
+        Self::from_huggingface_with_cache_root(
+            repo,
+            revision,
+            device,
+            http_loader::default_cache_root(),
+        )
+        .await
+    }
+
+    /// Like [`from_huggingface`](Self::from_huggingface), with an
+    /// explicit cache root override.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`from_huggingface`](Self::from_huggingface).
+    #[cfg(feature = "huggingface")]
+    pub async fn from_huggingface_with_cache_root(
+        repo: &str,
+        revision: &str,
+        device: B::Device,
+        cache_root: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        let base = format!("https://huggingface.co/{repo}/resolve/{revision}");
+        let config_url = format!("{base}/{}", http_loader::CONFIG_FILENAME);
+        let record_url = format!("{base}/{}", http_loader::RECORD_FILENAME);
+        let scope = format!("huggingface/{repo}/{revision}");
+        Self::from_scoped_urls(&config_url, &record_url, &scope, cache_root, device).await
     }
 
     /// Latent embedding width (column count of [`EncodingRow::latent`]).

@@ -48,6 +48,10 @@ datasets = ["std", "dep:indicatif", "dep:rayon", "smiles-parser/datasets"]
 embed = ["std", "ndarray", "dep:csv", "dep:clap"]
 embed-mgf = ["embed", "dep:mascot-rs"]
 embed-parquet = ["embed", "dep:parquet", "dep:arrow"]
+# Generic URL-based model loading (works on native and wasm32).
+http = ["std", "dep:reqwest", "dep:sha2", "dep:hex", "dep:dirs"]
+# HuggingFace-flavoured convenience constructor on top of `http`.
+huggingface = ["http"]
 
 [dependencies]
 arrow = { version = "55", default-features = false, optional = true }
@@ -67,13 +71,27 @@ indicatif = { version = "0.18", optional = true }
 mascot-rs = { git = "https://github.com/LucaCappelletti94/mascot-rs", optional = true }
 parquet = { version = "55", default-features = false, features = ["arrow", "snap", "zstd"], optional = true }
 rayon = { version = "1.11", optional = true }
+# reqwest auto-picks fetch on wasm32 and hyper+rustls on native, so the
+# same async surface compiles to both targets without per-target deps.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+sha2 = { version = "0.10", default-features = false, features = ["std"], optional = true }
+hex = { version = "0.4", default-features = false, features = ["std"], optional = true }
+dirs = { version = "5", optional = true }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main", default-features = false }
 thiserror = { version = "2", default-features = false }
 
+# wasm32-unknown-unknown lacks a system RNG, so getrandom needs its
+# `wasm_js` backend turned on explicitly. The dependency itself is pulled
+# transitively through burn-ndarray → rand; we just override the feature
+# set for that target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "=0.4.2", default-features = false, features = ["wasm_js"] }
+
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 
 [profile.release]
 opt-level = 3

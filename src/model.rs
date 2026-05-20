@@ -1127,6 +1127,25 @@ impl MoleculeAutoencoderConfig {
         })
     }
 
+    /// Parses a configuration from raw JSON bytes.
+    ///
+    /// Bytes-based counterpart of [`load_json`](Self::load_json) for callers
+    /// that load configuration from a non-filesystem source (HTTP body,
+    /// embedded asset, browser fetch).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Json`] when the bytes are not valid JSON for this
+    /// configuration shape. The `path` field on the error is left as a
+    /// synthetic `<bytes>` marker so downstream display still works.
+    #[cfg(feature = "std")]
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes).map_err(|source| Error::Json {
+            path: std::path::PathBuf::from("<bytes>"),
+            source,
+        })
+    }
+
     /// Writes the configuration to a JSON file, pretty-printed.
     ///
     /// # Errors

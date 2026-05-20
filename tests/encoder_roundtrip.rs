@@ -170,3 +170,55 @@ fn encoder_exposes_config_dimensions() {
     assert_eq!(encoder.fingerprint_size(), FINGERPRINT_SIZE);
     assert_eq!(encoder.config().encoder().latent_width(), LATENT_WIDTH);
 }
+
+#[test]
+fn from_bytes_loads_the_same_model_as_from_checkpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    save_tiny_checkpoint(dir.path());
+
+    let config_bytes = std::fs::read(dir.path().join("model-config.json")).expect("read config");
+    let record_bytes = std::fs::read(dir.path().join("model.mpk")).expect("read record");
+
+    let mut path_encoder = load_encoder(dir.path());
+    let mut bytes_encoder =
+        MoleculeEncoder::<B>::from_bytes(&config_bytes, record_bytes, NdArrayDevice::default())
+            .expect("from_bytes");
+
+    let smiles: Vec<String> = ["CCO", "c1ccccc1"]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let from_path = path_encoder.encode(&smiles).expect("encode path");
+    let from_bytes = bytes_encoder.encode(&smiles).expect("encode bytes");
+
+    assert_eq!(from_path.len(), from_bytes.len());
+    for (left, right) in from_path.iter().zip(from_bytes.iter()) {
+        let left_row = left.as_ref().expect("path row");
+        let right_row = right.as_ref().expect("bytes row");
+        assert_eq!(left_row.latent, right_row.latent);
+    }
+}
+
+#[test]
+fn from_bytes_rejects_invalid_config_json() {
+    let device = NdArrayDevice::default();
+    match MoleculeEncoder::<B>::from_bytes(b"{not valid json}", vec![], device) {
+        Err(Error::Json { .. }) => {}
+        Err(other) => panic!("unexpected error variant: {other:?}"),
+        Ok(_) => panic!("malformed config must not produce an encoder"),
+    }
+}
+
+#[test]
+fn from_bytes_rejects_malformed_model_record() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    save_tiny_checkpoint(dir.path());
+    let config_bytes = std::fs::read(dir.path().join("model-config.json")).expect("read config");
+    let device = NdArrayDevice::default();
+
+    match MoleculeEncoder::<B>::from_bytes(&config_bytes, b"definitely not mpk".to_vec(), device) {
+        Err(Error::Io { .. }) => {}
+        Err(other) => panic!("unexpected error variant: {other:?}"),
+        Ok(_) => panic!("malformed record must not produce an encoder"),
+    }
+}
