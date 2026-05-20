@@ -74,6 +74,29 @@ mod http_loader {
         None
     }
 
+    /// HuggingFace base URL ("https://huggingface.co"). Pulled out as a
+    /// constant so a mirror or private endpoint can be swapped in via a
+    /// `with_base_url` constructor later without touching call sites.
+    pub const HUGGINGFACE_BASE_URL: &str = "https://huggingface.co";
+
+    /// Builds the canonical `(config_url, record_url)` pair for a
+    /// HuggingFace repository revision. Extracted so the URL pattern is
+    /// directly unit-testable instead of buried inside an async fn.
+    pub fn huggingface_artifact_urls(repo: &str, revision: &str) -> (String, String) {
+        let base = format!("{HUGGINGFACE_BASE_URL}/{repo}/resolve/{revision}");
+        (
+            format!("{base}/{CONFIG_FILENAME}"),
+            format!("{base}/{RECORD_FILENAME}"),
+        )
+    }
+
+    /// Cache scope key for HuggingFace artifacts. Stable across runs and
+    /// human-readable so `~/.cache/molecular-autoencoder/` stays
+    /// browsable.
+    pub fn huggingface_cache_scope(repo: &str, revision: &str) -> String {
+        format!("huggingface/{repo}/{revision}")
+    }
+
     /// Like [`fetch_bytes`], but with an explicit cache root override.
     /// Pass `None` to disable the on-disk cache entirely (useful in tests
     /// or in CLIs that want full control over where downloads land).
@@ -119,6 +142,64 @@ mod http_loader {
         }
 
         Ok(bytes.to_vec())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn url_cache_scope_is_deterministic_and_url_sensitive() {
+            let base = url_cache_scope("https://a.example/c", "https://a.example/r");
+            assert_eq!(
+                base,
+                url_cache_scope("https://a.example/c", "https://a.example/r")
+            );
+            // Any single-character change in either URL changes the scope.
+            assert_ne!(
+                base,
+                url_cache_scope("https://a.example/C", "https://a.example/r")
+            );
+            assert_ne!(
+                base,
+                url_cache_scope("https://a.example/c", "https://a.example/R")
+            );
+            assert!(base.starts_with("url-"));
+            assert_eq!(base.len(), "url-".len() + 16);
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn default_cache_root_is_under_molecular_autoencoder() {
+            let root = default_cache_root().expect("OS exposes a cache dir");
+            assert!(
+                root.ends_with("molecular-autoencoder"),
+                "got {}",
+                root.display()
+            );
+        }
+
+        #[test]
+        fn huggingface_urls_follow_resolve_pattern() {
+            let (config, record) =
+                huggingface_artifact_urls("EarthMetabolomeInitiative/mae", "main");
+            assert_eq!(
+                config,
+                "https://huggingface.co/EarthMetabolomeInitiative/mae/resolve/main/model-config.json"
+            );
+            assert_eq!(
+                record,
+                "https://huggingface.co/EarthMetabolomeInitiative/mae/resolve/main/model.mpk"
+            );
+        }
+
+        #[test]
+        fn huggingface_scope_is_path_friendly() {
+            assert_eq!(
+                huggingface_cache_scope("Org/repo", "v1.0"),
+                "huggingface/Org/repo/v1.0"
+            );
+        }
     }
 }
 
@@ -367,10 +448,8 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
         device: B::Device,
         cache_root: Option<std::path::PathBuf>,
     ) -> Result<Self> {
-        let base = format!("https://huggingface.co/{repo}/resolve/{revision}");
-        let config_url = format!("{base}/{}", http_loader::CONFIG_FILENAME);
-        let record_url = format!("{base}/{}", http_loader::RECORD_FILENAME);
-        let scope = format!("huggingface/{repo}/{revision}");
+        let (config_url, record_url) = http_loader::huggingface_artifact_urls(repo, revision);
+        let scope = http_loader::huggingface_cache_scope(repo, revision);
         Self::from_scoped_urls(&config_url, &record_url, &scope, cache_root, device).await
     }
 
