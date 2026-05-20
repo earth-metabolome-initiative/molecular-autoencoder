@@ -155,6 +155,9 @@ impl MoleculeAutoencoderBatcher {
         }
     }
 
+    /// Internal entry point that routes either through the profiled
+    /// host-batch path (under `std`) or the no-std unprofiled path.
+    /// Used by tests so the shared assertions don't drift between cfgs.
     #[cfg(any(feature = "std", test))]
     fn batch_inner<B: Backend>(
         &self,
@@ -391,6 +394,9 @@ impl MoleculeAutoencoderBatcher {
     }
 }
 
+/// Writes one `(row, column)` slot of the sparse host-side buffers
+/// while validating the fingerprint index and converting the count into
+/// the dense / log-count layouts the batcher emits.
 #[cfg(feature = "std")]
 #[allow(clippy::too_many_arguments)]
 fn fill_sparse_slot(

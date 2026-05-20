@@ -14,7 +14,9 @@ pub const DEFAULT_ECFP_SIZE: usize = 4096;
 /// Counted ECFP configuration. Construct via [`CountedEcfpConfig::builder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CountedEcfpConfig {
+    /// ECFP Morgan radius (depth of the neighbourhood walks).
     radius: u8,
+    /// Folded fingerprint width (number of bits / counters).
     size: usize,
 }
 
@@ -55,7 +57,9 @@ impl CountedEcfpConfig {
 /// Fluent builder for [`CountedEcfpConfig`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CountedEcfpConfigBuilder {
+    /// Pending Morgan radius.
     radius: u8,
+    /// Pending folded fingerprint width.
     size: usize,
 }
 
@@ -125,8 +129,11 @@ impl CountedEcfpConfigBuilder {
 /// [`FingerprintTargets::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FingerprintTargets {
+    /// Sparse bit indices contributing to the fingerprint.
     indices: Vec<u16>,
+    /// Counts aligned with `indices`.
     counts: Vec<u16>,
+    /// Dense fingerprint width recovered when materialising counts.
     fingerprint_size: usize,
 }
 

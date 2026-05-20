@@ -14,14 +14,25 @@ use crate::{
     SmilesQualityFilter, compute_fingerprint_targets,
 };
 
+/// Magic bytes stamped at the start of every cached sparse shard file.
 const SHARD_MAGIC: [u8; 8] = *b"MAESH02\0";
+/// FNV-1a 64-bit offset basis used to derive stable molecule IDs from
+/// dataset + record string tuples.
 const STABLE_ID_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64-bit prime used alongside [`STABLE_ID_FNV_OFFSET`].
 const STABLE_ID_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// Top-2-bit namespace tag (`0b01`) marking hash-derived stable IDs for
+/// datasets without a natively numeric record identifier.
 const HASH_STABLE_ID_NAMESPACE: u64 = 0x4000_0000_0000_0000;
+/// Bitmask isolating the FNV hash bits within a hash-namespaced ID.
 const HASH_STABLE_ID_MASK: u64 = 0x3fff_ffff_ffff_ffff;
+/// Top-bit namespace tag (`0b10`) marking ZINC20-derived stable IDs.
 const ZINC20_STABLE_ID_NAMESPACE: u64 = 0x8000_0000_0000_0000;
+/// Bit shift applied to the ZINC20 tranche suffix within a stable ID.
 const ZINC20_STABLE_ID_SUFFIX_SHIFT: u32 = 48;
+/// Bitmask isolating the ZINC20 numeric part of a stable ID.
 const ZINC20_STABLE_ID_NUMBER_MASK: u64 = 0x0000_ffff_ffff_ffff;
+/// Bitmask isolating the 15-bit ZINC20 tranche suffix.
 const ZINC20_STABLE_ID_SUFFIX_MASK: u64 = 0x7fff;
 /// Current cached-shard manifest schema version.
 pub const SHARD_MANIFEST_VERSION: u32 = 2;
@@ -39,9 +50,14 @@ pub const DEFAULT_ROWS_PER_SHARD: usize = 10_000_000;
 /// [`MoleculeRecord::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoleculeRecord {
+    /// Source dataset label (e.g. `"pubchem-smiles"`, `"zinc20-smiles"`).
     dataset_id: String,
+    /// Dataset-specific identifier exactly as the source supplied it.
     record_id: String,
+    /// Deterministic 64-bit ID derived from `dataset_id` + `record_id`
+    /// used by shard metadata and the train/validation split function.
     stable_id: u64,
+    /// Source SMILES text.
     smiles: String,
 }
 
@@ -142,7 +158,10 @@ where
 #[cfg(feature = "datasets")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatasetPreprocessOptions {
+    /// Number of dataset records read before each Rayon chunk dispatch.
     chunk_rows: usize,
+    /// Optional thread count for the per-chunk Rayon pool; `None` uses
+    /// the global pool.
     threads: Option<usize>,
 }
 
@@ -180,7 +199,9 @@ impl DatasetPreprocessOptions {
 #[cfg(feature = "datasets")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatasetPreprocessOptionsBuilder {
+    /// Pending per-chunk row count.
     chunk_rows: usize,
+    /// Pending Rayon thread count.
     threads: Option<usize>,
 }
 
@@ -248,7 +269,12 @@ impl DatasetPreprocessOptionsBuilder {
 #[cfg(feature = "datasets")]
 #[derive(Debug)]
 pub struct PreprocessedDatasetChunk {
+    /// Cumulative count of source dataset records consumed up to this
+    /// chunk.
     records_seen: usize,
+    /// Per-record preprocessing outcome: `Ok(Some(_))` accepted,
+    /// `Ok(None)` skipped by the quality filter, `Err(_)` parse / RDKit
+    /// failure.
     results: Vec<Result<Option<MoleculeTargets>>>,
 }
 
@@ -330,6 +356,9 @@ where
     }
 }
 
+/// Preprocesses a chunk of molecule records in parallel via Rayon.
+/// Each worker thread owns its own `SmilesRdkitScratch` so the
+/// fingerprint allocations are reused across records.
 #[cfg(feature = "datasets")]
 fn preprocess_record_chunk_parallel(
     chunk: Vec<Result<MoleculeRecord>>,
@@ -356,6 +385,7 @@ pub enum DataSplit {
 }
 
 impl DataSplit {
+    /// Serialises the split as a single byte for on-disk shard storage.
     const fn as_byte(self) -> u8 {
         match self {
             Self::Train => 0,
@@ -363,6 +393,8 @@ impl DataSplit {
         }
     }
 
+    /// Parses a split byte from a shard payload. Returns `None` for any
+    /// unrecognised tag so callers can flag shard corruption.
     const fn from_byte(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Train),
@@ -376,9 +408,13 @@ impl DataSplit {
 /// [`PreprocessingConfig::builder`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreprocessingConfig {
+    /// Counted-ECFP fingerprint configuration (size + radius).
     counted_ecfp: CountedEcfpConfig,
+    /// Descriptor normalisation scales applied to the regression head.
     descriptors: DescriptorConfig,
+    /// Validation split fraction in permille (0..=1000).
     validation_per_mille: u16,
+    /// Quality bounds applied to candidate SMILES before fingerprinting.
     #[serde(default)]
     quality_filter: SmilesQualityFilter,
 }
@@ -437,9 +473,13 @@ impl PreprocessingConfig {
 /// Fluent builder for [`PreprocessingConfig`].
 #[derive(Debug, Clone)]
 pub struct PreprocessingConfigBuilder {
+    /// Pending counted-ECFP fingerprint configuration.
     counted_ecfp: CountedEcfpConfig,
+    /// Pending descriptor configuration.
     descriptors: DescriptorConfig,
+    /// Pending validation split fraction in permille.
     validation_per_mille: u16,
+    /// Pending SMILES quality filter.
     quality_filter: SmilesQualityFilter,
 }
 
@@ -519,10 +559,15 @@ impl PreprocessingConfigBuilder {
 /// below.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoleculeTargets {
+    /// Stable numeric molecule identifier (the FNV / ZINC20-packed ID).
     cid: u64,
+    /// Original SMILES string for traceability.
     source_smiles: String,
+    /// Counted-ECFP fingerprint vector.
     fingerprint: FingerprintTargets,
+    /// Scalar descriptor regression targets.
     descriptors: DescriptorTargets,
+    /// Deterministic train/validation split assignment.
     split: DataSplit,
 }
 
@@ -598,10 +643,15 @@ pub fn preprocess_record(
 /// One row view into a sparse molecule shard.
 #[derive(Debug, Clone, Copy)]
 pub struct MoleculeShardRow<'a> {
+    /// Stable molecule identifier for this row.
     cid: u64,
+    /// Sparse fingerprint indices for this row (no padding).
     fingerprint_indices: &'a [u16],
+    /// Sparse fingerprint counts aligned with `fingerprint_indices`.
     fingerprint_counts: &'a [u16],
+    /// Scalar descriptor regression targets for this row.
     descriptor_targets: &'a [f32],
+    /// Train / validation split assignment for this row.
     split: DataSplit,
 }
 
@@ -640,13 +690,21 @@ impl<'a> MoleculeShardRow<'a> {
 /// Tensor-ready sparse molecule shard.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparseMoleculeShard {
+    /// Dense fingerprint width (bit count) used to recover dense tensors.
     fingerprint_size: usize,
+    /// Width of the descriptor regression target row.
     descriptor_width: usize,
+    /// Per-row stable molecule IDs, length `len()`.
     cids: Vec<u64>,
+    /// CSR-style row offsets into `indices` / `counts`, length `len() + 1`.
     row_offsets: Vec<u64>,
+    /// Concatenated sparse fingerprint indices.
     indices: Vec<u16>,
+    /// Concatenated sparse fingerprint counts (aligned with `indices`).
     counts: Vec<u16>,
+    /// Dense descriptor targets concatenated `row_count * descriptor_width`.
     descriptor_targets: Vec<f32>,
+    /// Per-row train / validation split assignments.
     splits: Vec<DataSplit>,
 }
 
@@ -1069,6 +1127,9 @@ impl SparseMoleculeShard {
         Ok(shard)
     }
 
+    /// Cross-checks all internal length invariants of a freshly-loaded
+    /// shard and surfaces any mismatch as [`Error::ShardFormat`] tagged
+    /// with the originating path.
     fn validate_for_path(&self, path: &Path) -> Result<()> {
         if self.row_offsets.len() != self.len() + 1 {
             return Err(Error::ShardFormat {
@@ -1110,8 +1171,11 @@ impl SparseMoleculeShard {
 /// [`ShardManifest::push_shard`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardManifestEntry {
+    /// Shard filename relative to the manifest directory.
     path: String,
+    /// Number of rows in the shard.
     row_count: usize,
+    /// Number of sparse nonzero entries across all rows.
     nnz: usize,
 }
 
@@ -1139,12 +1203,19 @@ impl ShardManifestEntry {
 /// [`ShardManifest::new`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardManifest {
+    /// Manifest schema version stamped at write time.
     manifest_version: u32,
+    /// Human-readable label for the source dataset selection.
     source: String,
+    /// Preprocessing configuration that produced these shards.
     preprocessing: PreprocessingConfig,
+    /// Ordered list of shard entries, one per output file.
     shards: Vec<ShardManifestEntry>,
+    /// Total number of rows written across all shards.
     row_count: usize,
+    /// Number of source records skipped by the quality filter.
     skipped_count: usize,
+    /// Number of source records that failed parsing or fingerprinting.
     error_count: usize,
 }
 
@@ -1254,6 +1325,10 @@ impl ShardManifest {
     }
 }
 
+/// Derives the deterministic 64-bit stable molecule identifier from a
+/// `(dataset_id, record_id)` pair. Recognises the PubChem CID and ZINC20
+/// formats natively; everything else falls back to a namespaced FNV-1a
+/// hash so the value is collision-resistant within a dataset.
 fn stable_molecule_id(dataset_id: &str, record_id: &str) -> u64 {
     if dataset_id == "pubchem-smiles"
         && let Ok(cid) = record_id.parse::<u64>()
@@ -1279,6 +1354,9 @@ fn stable_molecule_id(dataset_id: &str, record_id: &str) -> u64 {
     HASH_STABLE_ID_NAMESPACE | (splitmix64(hash) & HASH_STABLE_ID_MASK)
 }
 
+/// Parses a `ZINC{number}_{suffix}` identifier and packs it into a
+/// 64-bit ID under [`ZINC20_STABLE_ID_NAMESPACE`]. Returns `None` for
+/// malformed strings so the caller can drop the record.
 fn zinc20_stable_molecule_id(record_id: &str) -> Option<u64> {
     let rest = record_id.strip_prefix("ZINC")?;
     let (number, suffix) = rest.split_once('_').unwrap_or((rest, "0"));
@@ -1290,6 +1368,9 @@ fn zinc20_stable_molecule_id(record_id: &str) -> Option<u64> {
     Some(ZINC20_STABLE_ID_NAMESPACE | (suffix << ZINC20_STABLE_ID_SUFFIX_SHIFT) | number)
 }
 
+/// `splitmix64` finaliser used both for shard hashing and for the
+/// per-row train/validation split assignment. Cheap, deterministic, and
+/// passes basic bit-mixing tests.
 fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -1297,25 +1378,42 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// On-disk header read from / written to the start of every shard file.
 #[derive(Debug, Clone, Copy)]
 struct ShardFileHeader {
+    /// Dense fingerprint width recovered from the shard.
     fingerprint_size: usize,
+    /// Descriptor regression row width recovered from the shard.
     descriptor_width: usize,
+    /// Number of rows packed in the shard.
     row_count: usize,
+    /// Total nonzero sparse entries across all rows.
     nnz: usize,
 }
 
+/// Pre-computed byte offsets into a shard file, one per logical section.
+/// All values are absolute byte positions relative to the start of the
+/// file so seeking is constant-time.
 #[derive(Debug, Clone, Copy)]
 struct ShardFileLayout {
+    /// Byte offset of the stable-ID section.
     cids: u64,
+    /// Byte offset of the CSR row-offset section.
     row_offsets: u64,
+    /// Byte offset of the concatenated sparse-index section.
     indices: u64,
+    /// Byte offset of the concatenated sparse-count section.
     counts: u64,
+    /// Byte offset of the descriptor regression target block.
     descriptors: u64,
+    /// Byte offset of the per-row train/validation split byte block.
     splits: u64,
 }
 
 impl ShardFileLayout {
+    /// Computes the absolute byte offsets of every shard section from
+    /// the row count, sparse-NNZ, and descriptor width. Returns
+    /// [`Error::ShardFormat`] when any multiplication overflows `u64`.
     fn new(row_count: usize, nnz: usize, descriptor_width: usize) -> Result<Self> {
         let path = Path::new("<shard layout>");
         let cids = 40_u64;
@@ -1368,48 +1466,59 @@ impl ShardFileLayout {
     }
 }
 
+/// Writes `bytes` to `writer`, tagging any IO failure with `path`.
 fn write_all(path: &Path, writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
     writer
         .write_all(bytes)
         .map_err(|source| Error::io(path, source))
 }
 
+/// Writes a `u64` to `writer` in little-endian byte order.
 fn write_u64(path: &Path, writer: &mut impl Write, value: u64) -> Result<()> {
     write_all(path, writer, &value.to_le_bytes())
 }
 
+/// Writes a `u16` to `writer` in little-endian byte order.
 fn write_u16(path: &Path, writer: &mut impl Write, value: u16) -> Result<()> {
     write_all(path, writer, &value.to_le_bytes())
 }
 
+/// Writes an `f32` to `writer` in little-endian byte order.
 fn write_f32(path: &Path, writer: &mut impl Write, value: f32) -> Result<()> {
     write_all(path, writer, &value.to_le_bytes())
 }
 
+/// Reads exactly `bytes.len()` bytes from `reader`, tagging any IO
+/// failure with `path`.
 fn read_exact(path: &Path, reader: &mut impl Read, bytes: &mut [u8]) -> Result<()> {
     reader
         .read_exact(bytes)
         .map_err(|source| Error::io(path, source))
 }
 
+/// Reads a little-endian `u64` from `reader`.
 fn read_u64(path: &Path, reader: &mut impl Read) -> Result<u64> {
     let mut bytes = [0_u8; 8];
     read_exact(path, reader, &mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
 }
 
+/// Reads a little-endian `u16` from `reader`.
 fn read_u16(path: &Path, reader: &mut impl Read) -> Result<u16> {
     let mut bytes = [0_u8; 2];
     read_exact(path, reader, &mut bytes)?;
     Ok(u16::from_le_bytes(bytes))
 }
 
+/// Reads a little-endian `f32` from `reader`.
 fn read_f32(path: &Path, reader: &mut impl Read) -> Result<f32> {
     let mut bytes = [0_u8; 4];
     read_exact(path, reader, &mut bytes)?;
     Ok(f32::from_le_bytes(bytes))
 }
 
+/// Seeks to the start of `reader` and validates the magic header, then
+/// reads the 32-byte fixed-shape descriptor.
 fn read_shard_header(path: &Path, reader: &mut (impl Read + Seek)) -> Result<ShardFileHeader> {
     reader
         .seek(SeekFrom::Start(0))
@@ -1431,6 +1540,7 @@ fn read_shard_header(path: &Path, reader: &mut (impl Read + Seek)) -> Result<Sha
     })
 }
 
+/// Seeks `reader` to `offset` then reads exactly `bytes.len()` bytes.
 fn read_exact_at(
     path: &Path,
     reader: &mut (impl Read + Seek),
@@ -1443,6 +1553,7 @@ fn read_exact_at(
     read_exact(path, reader, bytes)
 }
 
+/// Reads `len` little-endian `u64`s starting at `offset` in `reader`.
 fn read_u64_vec_at(
     path: &Path,
     reader: &mut (impl Read + Seek),
@@ -1461,6 +1572,7 @@ fn read_u64_vec_at(
         .collect())
 }
 
+/// Reads `len` little-endian `u16`s starting at `offset` in `reader`.
 fn read_u16_vec_at(
     path: &Path,
     reader: &mut (impl Read + Seek),
@@ -1475,6 +1587,7 @@ fn read_u16_vec_at(
         .collect())
 }
 
+/// Reads `len` little-endian `f32`s starting at `offset` in `reader`.
 fn read_f32_vec_at(
     path: &Path,
     reader: &mut (impl Read + Seek),
@@ -1489,6 +1602,8 @@ fn read_f32_vec_at(
         .collect())
 }
 
+/// Multiplies two `usize`s and converts to `u64`, surfacing overflow as
+/// [`Error::ShardFormat`] tagged with `label`.
 fn checked_mul(path: &Path, left: usize, right: usize, label: &str) -> Result<u64> {
     left.checked_mul(right)
         .and_then(|value| u64::try_from(value).ok())
@@ -1498,6 +1613,7 @@ fn checked_mul(path: &Path, left: usize, right: usize, label: &str) -> Result<u6
         })
 }
 
+/// `u64 * u64` with the same overflow contract as [`checked_mul`].
 fn checked_mul_u64(path: &Path, left: u64, right: u64, label: &str) -> Result<u64> {
     left.checked_mul(right).ok_or_else(|| Error::ShardFormat {
         path: path.to_path_buf(),
@@ -1505,6 +1621,7 @@ fn checked_mul_u64(path: &Path, left: u64, right: u64, label: &str) -> Result<u6
     })
 }
 
+/// `u64 + u64` with the same overflow contract as [`checked_mul`].
 fn checked_add(path: &Path, left: u64, right: u64, label: &str) -> Result<u64> {
     left.checked_add(right).ok_or_else(|| Error::ShardFormat {
         path: path.to_path_buf(),

@@ -16,6 +16,7 @@ use crate::{Error, Result, embed::record::MoleculeInput, embed::source::Molecule
 /// Streaming `.mgf` reader. Compression is handled transparently for
 /// `.mgf.zst`, `.mgf.zstd`, `.mgf.gz`, and `.mgf.gzip`.
 pub struct MgfSource {
+    /// Backing `mascot-rs` path iterator yielding parsed MGF records.
     iter: MGFPathIter<f64>,
 }
 

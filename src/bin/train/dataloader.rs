@@ -26,69 +26,107 @@ use crate::{
 /// Signal returned by the per-batch consumer callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchControl {
+    /// Keep iterating.
     Continue,
+    /// Stop the loader and unwind without consuming further batches.
     Stop,
 }
 
 /// Per-component timing for one dataloader batch.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BatchLoadProfile {
+    /// Wall time spent reading shard bytes from disk.
     pub shard_read: Duration,
+    /// Wall time spent scanning shard rows to filter by split.
     pub row_scan: Duration,
+    /// Wall time spent allocating sparse buffers.
     pub sparse_allocation: Duration,
+    /// Wall time spent populating sparse buffers.
     pub sparse_fill: Duration,
+    /// Wall time spent constructing backend tensors.
     pub tensor_build: Duration,
+    /// Sum of all producer-side stages for one batch.
     pub producer_total: Duration,
 }
 
 /// Iteration parameters shared by sync and multi-threaded dataloader paths.
 pub struct BatchIterationContext<'a, B: Backend> {
+    /// Shards to iterate over in manifest order.
     pub shards: &'a [CachedShardInfo],
+    /// Split to keep (train vs. validation).
     pub split: DataSplit,
+    /// Batcher used to assemble samples into tensors.
     pub batcher: MoleculeAutoencoderBatcher,
+    /// Backend device that owns the produced tensors.
     pub device: &'a B::Device,
+    /// Target number of samples per batch.
     pub batch_size: usize,
+    /// Optional upper bound on the number of batches to emit.
     pub max_batches: Option<usize>,
+    /// Number of host-side loader threads; `0` selects the sync path.
     pub loader_workers: usize,
+    /// Depth of the device-side prefetch queue; `0` disables it.
     pub device_prefetch_batches: usize,
+    /// Period (in batches) between loader-profile log lines.
     pub loader_profile_every: usize,
+    /// Validation-split share encoded as parts per mille.
     pub validation_per_mille: u16,
 }
 
 /// One contiguous slice of a shard scheduled for a single batch build.
 #[derive(Debug, Clone)]
 struct CachedBatchPlan {
+    /// Shard the plan reads from.
     shard: CachedShardInfo,
+    /// First row index covered by this plan (inclusive).
     start_row: usize,
+    /// Last row index covered by this plan (exclusive).
     end_row: usize,
+    /// Split to keep when scanning the planned row window.
     split: DataSplit,
 }
 
+/// Sequence of [`CachedBatchPlan`] entries that fully cover a dataset run.
 #[derive(Debug, Clone)]
 struct CachedBatchPlanDataset {
+    /// Ordered list of plans consumed by loader threads.
     plans: Vec<CachedBatchPlan>,
 }
 
+/// Host-side staged batch produced by a loader worker before tensorization.
 #[derive(Debug, Clone)]
 struct CachedLoaderBatch {
+    /// Host batch ready for tensorization.
     host: MoleculeAutoencoderHostBatch,
+    /// Number of samples in the batch.
     rows: usize,
+    /// Per-stage producer timing accumulated so far.
     profile: BatchLoadProfile,
 }
 
+/// Device-side staged batch carrying backend tensors plus timing.
 struct DeviceLoaderBatch<B: Backend> {
+    /// Backend-native batch ready to be consumed.
     batch: MoleculeAutoencoderBatch<B>,
+    /// Number of samples in the batch.
     rows: usize,
+    /// Per-stage producer timing accumulated up to tensorization.
     profile: BatchLoadProfile,
 }
 
+/// Channel payload sent from a loader worker to the consumer / uploader.
 enum HostLoaderMessage {
+    /// Successful host-side batch ready for tensor build.
     Batch(Box<CachedLoaderBatch>),
+    /// Loader-side error message; aborts iteration.
     Error(String),
 }
 
+/// Channel payload sent from the uploader thread to the consumer.
 enum DeviceLoaderMessage<B: Backend> {
+    /// Successful device-side batch ready for consumption.
     Batch(DeviceLoaderBatch<B>),
+    /// Upload-side error message; aborts iteration.
     Error(String),
 }
 
@@ -111,6 +149,8 @@ where
     }
 }
 
+/// Multi-threaded dataloader: producer threads read shards in parallel, an
+/// optional uploader stages device tensors, and the consumer drains batches.
 fn for_each_batch_dataloader<B, F>(
     context: BatchIterationContext<'_, B>,
     mut consume: F,
@@ -181,6 +221,8 @@ where
     })
 }
 
+/// Single-threaded dataloader used when `loader_workers == 0` — reads shards
+/// sequentially and tensorizes batches inline.
 fn for_each_batch_sync<B, F>(context: BatchIterationContext<'_, B>, mut consume: F) -> AppResult<()>
 where
     B: Backend,
@@ -256,6 +298,8 @@ where
     Ok(())
 }
 
+/// Folds shard-read / row-scan timing and the batcher's build profile into a
+/// single [`BatchLoadProfile`].
 fn load_profile(
     shard_read: Duration,
     row_scan: Duration,
@@ -272,6 +316,8 @@ fn load_profile(
 }
 
 impl CachedBatchPlanDataset {
+    /// Plans the shard slicing needed to cover the requested split, honoring
+    /// the optional `max_batches` cap.
     fn new(
         shards: &[CachedShardInfo],
         split: DataSplit,
@@ -301,6 +347,8 @@ impl CachedBatchPlanDataset {
     }
 }
 
+/// Worker entry point: claims the next plan via the shared atomic cursor,
+/// builds a host batch, and pushes it onto the channel.
 fn produce_host_loader_batches(
     batcher: MoleculeAutoencoderBatcher,
     plans: Arc<Vec<CachedBatchPlan>>,
@@ -330,6 +378,8 @@ fn produce_host_loader_batches(
     }
 }
 
+/// Uploader thread: pulls host batches off the producer channel, tensorizes
+/// them onto the backend device, and forwards them to the consumer.
 fn upload_host_loader_batches<B>(
     receiver: Receiver<HostLoaderMessage>,
     batcher: MoleculeAutoencoderBatcher,
@@ -368,6 +418,9 @@ fn upload_host_loader_batches<B>(
     }
 }
 
+/// Consumer half of the device-prefetched pipeline: drains
+/// [`DeviceLoaderMessage`]s, surfaces loader-profile stats, and invokes the
+/// user-supplied callback.
 fn consume_device_loader_batches<B, F>(
     receiver: Receiver<DeviceLoaderMessage<B>>,
     phase: &'static str,
@@ -400,6 +453,8 @@ where
     }
 }
 
+/// Consumer half of the no-prefetch pipeline: drains host batches, performs
+/// inline tensor upload, and invokes the user-supplied callback.
 fn consume_host_loader_batches<B, F>(
     receiver: Receiver<HostLoaderMessage>,
     batcher: MoleculeAutoencoderBatcher,
@@ -442,6 +497,8 @@ where
     }
 }
 
+/// Reads the planned shard range from disk and builds the host-side batch,
+/// returning `Ok(None)` when no rows match the requested split.
 fn build_cached_loader_batch(
     batcher: MoleculeAutoencoderBatcher,
     plan: CachedBatchPlan,
@@ -479,6 +536,9 @@ fn build_cached_loader_batch(
     }))
 }
 
+/// Returns the number of source rows that must be scanned to yield one
+/// `batch_size` batch for the given split, accounting for the validation
+/// split share.
 fn source_rows_per_batch(
     split: DataSplit,
     batch_size: usize,
@@ -501,6 +561,8 @@ fn source_rows_per_batch(
         .max(1))
 }
 
+/// Converts a borrowed shard row into the owned sample shape the batcher
+/// consumes.
 fn sample_from_row(row: MoleculeShardRow<'_>) -> MoleculeAutoencoderSample {
     MoleculeAutoencoderSample {
         cid: row.cid(),

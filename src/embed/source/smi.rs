@@ -18,7 +18,10 @@ use super::MoleculeSource;
 /// first whitespace-separated token taken as the SMILES; the rest of
 /// the line is currently ignored.
 pub struct SmilesLineSource {
+    /// Buffered reader over the underlying byte stream (file or stdin).
     reader: BufReader<Box<dyn std::io::Read + Send>>,
+    /// Reusable scratch buffer used by `read_line` to avoid per-record
+    /// allocations.
     line_buffer: String,
 }
 

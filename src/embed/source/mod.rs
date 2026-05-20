@@ -95,6 +95,8 @@ pub fn source_for_path(path: &Path, options: &SourceOptions) -> Result<Box<dyn M
     }
 }
 
+/// Recognises the sentinel paths (`-` and `/dev/stdin`) that route
+/// input to standard in instead of a regular file.
 fn is_stdin_path(path: &Path) -> bool {
     path == Path::new("-") || path == Path::new("/dev/stdin")
 }

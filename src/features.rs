@@ -41,18 +41,25 @@ pub const REGRESSION_TARGET_WIDTH: usize = 18;
 /// molecules rejected here never reach fingerprint computation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct SmilesQualityFilter {
+    /// Inclusive minimum heavy-atom count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     min_heavy_atoms: Option<u32>,
+    /// Inclusive maximum heavy-atom count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_heavy_atoms: Option<u32>,
+    /// Inclusive minimum molecular mass in atomic mass units.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     min_molecular_mass: Option<f32>,
+    /// Inclusive maximum molecular mass in atomic mass units.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_molecular_mass: Option<f32>,
+    /// Inclusive minimum total formal charge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     min_formal_charge: Option<i32>,
+    /// Inclusive maximum total formal charge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_formal_charge: Option<i32>,
+    /// Inclusive maximum number of disconnected SMILES fragments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_connected_components: Option<u32>,
 }
@@ -166,12 +173,19 @@ impl SmilesQualityFilter {
 /// [`build`](Self::build) to validate ranges and produce an immutable filter.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SmilesQualityFilterBuilder {
+    /// Pending minimum heavy-atom bound.
     min_heavy_atoms: Option<u32>,
+    /// Pending maximum heavy-atom bound.
     max_heavy_atoms: Option<u32>,
+    /// Pending minimum molecular mass.
     min_molecular_mass: Option<f32>,
+    /// Pending maximum molecular mass.
     max_molecular_mass: Option<f32>,
+    /// Pending minimum total formal charge.
     min_formal_charge: Option<i32>,
+    /// Pending maximum total formal charge.
     max_formal_charge: Option<i32>,
+    /// Pending maximum disconnected-fragment count.
     max_connected_components: Option<u32>,
 }
 
@@ -308,8 +322,11 @@ impl SmilesQualityFilterBuilder {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
 pub struct DescriptorConfig {
+    /// Divisor applied to molecular mass before regression.
     mass_scale: f32,
+    /// Divisor applied to integer count descriptors before regression.
     count_scale: f32,
+    /// Divisor applied to the signed formal-charge descriptor.
     charge_scale: f32,
 }
 
@@ -351,8 +368,11 @@ impl DescriptorConfig {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(clippy::struct_field_names)]
 pub struct DescriptorConfigBuilder {
+    /// Pending mass divisor.
     mass_scale: f32,
+    /// Pending count divisor.
     count_scale: f32,
+    /// Pending charge divisor.
     charge_scale: f32,
 }
 
@@ -425,96 +445,161 @@ impl DescriptorConfigBuilder {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
 pub struct DescriptorTargets {
+    /// Molecular mass in atomic mass units.
     molecular_mass: f32,
+    /// Net signed formal charge.
     formal_charge: i32,
+    /// Count of carbon atoms.
     carbon_count: u32,
+    /// Count of explicit + implicit hydrogen atoms (mirror of
+    /// [`Self::total_hydrogen_count`]).
     hydrogen_count: u32,
+    /// Count of nitrogen atoms.
     nitrogen_count: u32,
+    /// Count of oxygen atoms.
     oxygen_count: u32,
+    /// Count of phosphorus atoms.
     phosphorus_count: u32,
+    /// Count of sulfur atoms.
     sulfur_count: u32,
+    /// Count of fluorine atoms.
     fluorine_count: u32,
+    /// Count of chlorine atoms.
     chlorine_count: u32,
+    /// Count of bromine atoms.
     bromine_count: u32,
+    /// Count of iodine atoms.
     iodine_count: u32,
+    /// Count of non-hydrogen atoms.
     heavy_atom_count: u32,
+    /// Sum of explicit and implicit hydrogen atoms.
     total_hydrogen_count: u32,
+    /// Number of atoms in any ring.
     ring_atom_count: u32,
+    /// Number of bonds in any ring.
     ring_bond_count: u32,
+    /// Number of disconnected SMILES fragments.
     connected_component_count: u32,
+    /// Number of atoms flagged aromatic by the SMILES parser.
     aromatic_atom_count: u32,
 }
 
-#[allow(missing_docs)]
 impl DescriptorTargets {
+    /// Sum of the atomic weights of every atom in the molecule, in
+    /// atomic mass units.
     #[must_use]
     pub const fn molecular_mass(&self) -> f32 {
         self.molecular_mass
     }
+
+    /// Net formal charge over the molecule (sum of per-atom formal
+    /// charges). Negative for anions, positive for cations.
     #[must_use]
     pub const fn formal_charge(&self) -> i32 {
         self.formal_charge
     }
+
+    /// Number of carbon atoms in the molecule.
     #[must_use]
     pub const fn carbon_count(&self) -> u32 {
         self.carbon_count
     }
+
+    /// Number of explicit-plus-implicit hydrogen atoms attached to the
+    /// non-hydrogen skeleton. Equal to [`total_hydrogen_count`]; both
+    /// accessors are kept so the regression target order stays stable.
+    ///
+    /// [`total_hydrogen_count`]: Self::total_hydrogen_count
     #[must_use]
     pub const fn hydrogen_count(&self) -> u32 {
         self.hydrogen_count
     }
+
+    /// Number of nitrogen atoms in the molecule.
     #[must_use]
     pub const fn nitrogen_count(&self) -> u32 {
         self.nitrogen_count
     }
+
+    /// Number of oxygen atoms in the molecule.
     #[must_use]
     pub const fn oxygen_count(&self) -> u32 {
         self.oxygen_count
     }
+
+    /// Number of phosphorus atoms in the molecule.
     #[must_use]
     pub const fn phosphorus_count(&self) -> u32 {
         self.phosphorus_count
     }
+
+    /// Number of sulfur atoms in the molecule.
     #[must_use]
     pub const fn sulfur_count(&self) -> u32 {
         self.sulfur_count
     }
+
+    /// Number of fluorine atoms in the molecule.
     #[must_use]
     pub const fn fluorine_count(&self) -> u32 {
         self.fluorine_count
     }
+
+    /// Number of chlorine atoms in the molecule.
     #[must_use]
     pub const fn chlorine_count(&self) -> u32 {
         self.chlorine_count
     }
+
+    /// Number of bromine atoms in the molecule.
     #[must_use]
     pub const fn bromine_count(&self) -> u32 {
         self.bromine_count
     }
+
+    /// Number of iodine atoms in the molecule.
     #[must_use]
     pub const fn iodine_count(&self) -> u32 {
         self.iodine_count
     }
+
+    /// Number of non-hydrogen ("heavy") atoms in the molecule.
     #[must_use]
     pub const fn heavy_atom_count(&self) -> u32 {
         self.heavy_atom_count
     }
+
+    /// Total hydrogen count (explicit hydrogens plus implicit hydrogens
+    /// inferred from each heavy atom's valence). Mirrors
+    /// [`hydrogen_count`](Self::hydrogen_count) and is retained so the
+    /// regression target ordering remains stable across releases.
     #[must_use]
     pub const fn total_hydrogen_count(&self) -> u32 {
         self.total_hydrogen_count
     }
+
+    /// Number of atoms participating in at least one ring (any size,
+    /// any aromaticity).
     #[must_use]
     pub const fn ring_atom_count(&self) -> u32 {
         self.ring_atom_count
     }
+
+    /// Number of bonds participating in at least one ring.
     #[must_use]
     pub const fn ring_bond_count(&self) -> u32 {
         self.ring_bond_count
     }
+
+    /// Number of disconnected molecular fragments in the SMILES string
+    /// (e.g. `CCO.O` yields two components).
     #[must_use]
     pub const fn connected_component_count(&self) -> u32 {
         self.connected_component_count
     }
+
+    /// Number of atoms flagged as aromatic by the SMILES parser (the
+    /// lower-case `c`, `n`, `o`, `s`, etc. tokens).
     #[must_use]
     pub const fn aromatic_atom_count(&self) -> u32 {
         self.aromatic_atom_count

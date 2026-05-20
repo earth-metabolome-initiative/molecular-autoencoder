@@ -94,6 +94,8 @@ pub fn sink_for_path(path: &Path, options: &SinkOptions) -> Result<Box<dyn Encod
     }
 }
 
+/// Recognises the sentinel paths (`-` and `/dev/stdout`) that route
+/// output to standard out instead of a regular file.
 fn is_stdout_path(path: &Path) -> bool {
     path == Path::new("-") || path == Path::new("/dev/stdout")
 }

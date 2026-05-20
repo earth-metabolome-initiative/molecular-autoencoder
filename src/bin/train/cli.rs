@@ -459,11 +459,15 @@ impl Args {
 /// Manifest path and dataset selection resolved from CLI inputs.
 #[derive(Debug, Clone)]
 pub struct ResolvedPaths {
+    /// Final manifest path used to drive shard discovery.
     pub manifest_path: PathBuf,
+    /// Optional cache directory backing dataset downloads.
     pub cache_dir: Option<PathBuf>,
+    /// Dataset source selection (raw paths vs registered dataset name).
     pub source_selection: Option<SourceSelection>,
 }
 
+/// `clap` value parser that accepts strictly positive `usize` values.
 fn positive_usize(value: &str) -> Result<usize, String> {
     let parsed: usize = value
         .parse()
@@ -475,6 +479,7 @@ fn positive_usize(value: &str) -> Result<usize, String> {
     }
 }
 
+/// `clap` value parser that accepts strictly positive `u8` values.
 fn positive_u8(value: &str) -> Result<u8, String> {
     let parsed: u8 = value
         .parse()

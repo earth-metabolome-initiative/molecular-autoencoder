@@ -9,8 +9,11 @@ use crate::{Error, Result, embed::record::MoleculeInput, embed::source::Molecule
 
 /// Delimited reader for `.tsv` / `.csv` inputs.
 pub struct DelimitedSource {
+    /// Underlying CSV reader bound to the input file.
     reader: csv::Reader<File>,
+    /// Zero-based index of the SMILES column resolved from the header.
     smiles_index: usize,
+    /// Reusable per-row buffer to avoid reallocating between records.
     record_buffer: StringRecord,
 }
 

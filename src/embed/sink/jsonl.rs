@@ -16,15 +16,22 @@ use crate::{
 
 /// Line-delimited JSON writer.
 pub struct JsonlSink {
+    /// Buffered output stream pointing at the destination file.
     writer: BufWriter<File>,
 }
 
+/// Per-row JSON layout written by [`JsonlSink`]. One line per row.
 #[derive(Serialize)]
 struct JsonlRow<'a> {
+    /// SMILES carried over from the encoder input.
     smiles: &'a str,
+    /// Counted-Tanimoto reconstruction score.
     count_tanimoto: f32,
+    /// Bit-presence Tanimoto reconstruction score.
     binary_tanimoto: f32,
+    /// Mean-squared error over `log1p(count)` predictions.
     log_mse: f32,
+    /// Latent vector for this row.
     latent: &'a [f32],
 }
 

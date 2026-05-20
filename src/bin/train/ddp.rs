@@ -248,28 +248,48 @@ fn shards_for_peer(
         .collect()
 }
 
+/// Per-worker state passed into [`worker_loop`] when spawning a peer thread.
 struct WorkerCtx<B>
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
+    /// Zero-based peer index inside the distributed group.
     peer_id: u32,
+    /// Total number of peers participating in the run.
     world_size: u32,
+    /// Backend device the worker owns.
     device: B::Device,
+    /// Initial model the worker starts from.
     model: MoleculeAutoencoder<B>,
+    /// Worker-local subset of cached shards.
     shards: Vec<CachedShardInfo>,
+    /// Resolved CLI arguments shared by every worker.
     args: Args,
+    /// Tanimoto ranking runtime config (weight, candidates, epsilon).
     tanimoto_ranking: TanimotoRankingRuntimeConfig,
+    /// Collective backend configuration for cross-peer comms.
     collective_cfg: CollectiveConfig,
+    /// Global stop flag observed across peers (e.g. on Ctrl-C).
     stop_flag: Arc<AtomicBool>,
+    /// Channel used to forward per-batch metrics to the lead process.
     batch_tx: Sender<BatchUpdate>,
+    /// Barrier synchronizing peers at the end of each training epoch.
     train_barrier: Arc<Barrier>,
+    /// Barrier synchronizing peers at the end of each validation pass.
     valid_barrier: Arc<Barrier>,
+    /// Validation-split share expressed in parts per mille.
     validation_per_mille: u16,
+    /// Optional cap on the number of validation batches per epoch.
     max_valid_batches: Option<usize>,
+    /// Checkpoint state the worker resumes from.
     initial_state: CheckpointState,
+    /// Batcher used to assemble samples into tensors.
     batcher: MoleculeAutoencoderBatcher,
 }
 
+/// Per-peer training loop: registers with the collective backend, runs
+/// `train_epoch`/`evaluate` and forwards updates back to the lead via
+/// `batch_tx`.
 fn worker_loop<B>(ctx: WorkerCtx<B>) -> AppResult<()>
 where
     B: AutodiffBackend<FloatElem = f32> + TanimotoMetricBackend,
@@ -381,31 +401,52 @@ where
     Ok(())
 }
 
+/// Lead process state passed into [`lead_loop`] alongside the spawned peers.
 #[allow(clippy::struct_field_names)]
 struct LeadCtx<'a, B>
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
+    /// Total number of peers participating in the run.
     world_size: u32,
+    /// Backend device the lead trains on (peer 0).
     device: B::Device,
+    /// Initial model the lead starts from.
     model: MoleculeAutoencoder<B>,
+    /// Lead-local subset of cached shards.
     shards: Vec<CachedShardInfo>,
+    /// Resolved CLI arguments shared by every peer.
     args: &'a Args,
+    /// Tanimoto ranking runtime config.
     tanimoto_ranking: TanimotoRankingRuntimeConfig,
+    /// Collective backend configuration for cross-peer comms.
     collective_cfg: CollectiveConfig,
+    /// Global stop flag shared with workers.
     stop_flag: Arc<AtomicBool>,
+    /// Channel that delivers per-batch updates from worker peers.
     batch_rx: &'a Receiver<BatchUpdate>,
+    /// Barrier synchronizing peers at the end of each training epoch.
     train_barrier: Arc<Barrier>,
+    /// Barrier synchronizing peers at the end of each validation pass.
     valid_barrier: Arc<Barrier>,
+    /// Validation-split share expressed in parts per mille.
     validation_per_mille: u16,
+    /// Optional cap on the number of validation batches per epoch.
     max_valid_batches: Option<usize>,
+    /// Checkpoint state the lead persists at the end of each epoch.
     state: CheckpointState,
+    /// Batcher used to assemble samples into tensors.
     batcher: MoleculeAutoencoderBatcher,
+    /// Period (in batches) between loader-profile log lines.
     loader_profile_every: usize,
+    /// Recorder used to persist model / optimizer state.
     recorder: &'a DefaultRecorder,
+    /// Live training reporter (TUI or indicatif fallback).
     reporter: &'a mut TrainingReporter,
 }
 
+/// Lead-process training loop: drives `train_epoch` / `evaluate` on peer 0,
+/// drains worker metrics from `batch_rx`, and persists checkpoints.
 fn lead_loop<B>(ctx: LeadCtx<'_, B>) -> AppResult<()>
 where
     B: AutodiffBackend<FloatElem = f32> + TanimotoMetricBackend,

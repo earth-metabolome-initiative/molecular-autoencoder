@@ -11,7 +11,9 @@ use crate::{
 
 /// Writes encoded rows to stdout as TSV.
 pub struct StdoutSink {
+    /// Owned handle to the process stdout stream.
     writer: std::io::Stdout,
+    /// Latent embedding width recorded at `open` time.
     latent_width: Option<usize>,
 }
 
@@ -85,6 +87,8 @@ impl EncodingSink for StdoutSink {
     }
 }
 
+/// Maps a `std::fmt::Error` into the crate's [`Error`] type with a
+/// stdout-specific message so write failures surface uniformly.
 fn stdout_fmt_error(source: std::fmt::Error) -> Error {
     Error::InvalidBatch(format!("stdout format failed: {source}"))
 }

@@ -10,6 +10,8 @@ use molecular_autoencoder::{
 use crate::AppResult;
 use crate::cli::Args;
 
+/// Streams SMILES from the configured source through the encoder and into the
+/// configured sink, emitting per-batch progress to stderr.
 pub fn run<B: Backend<FloatElem = f32>>(args: Args, device: B::Device) -> AppResult<()> {
     if args.batch_size == 0 {
         return Err("batch size must be greater than zero".into());
@@ -57,6 +59,8 @@ pub fn run<B: Backend<FloatElem = f32>>(args: Args, device: B::Device) -> AppRes
     Ok(())
 }
 
+/// Encodes the buffered SMILES batch and writes the resulting rows to the
+/// sink, returning `(encoded, skipped)` counts and clearing the buffer.
 fn flush<B: Backend<FloatElem = f32>>(
     encoder: &mut MoleculeEncoder<B>,
     sink: &mut Box<dyn molecular_autoencoder::EncodingSink>,

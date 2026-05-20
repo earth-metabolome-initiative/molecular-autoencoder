@@ -34,6 +34,9 @@ use crate::{
     compute_fingerprint_targets, features::REGRESSION_TARGET_WIDTH,
 };
 
+/// HTTP fetcher used by the URL / HuggingFace loaders. Behind the
+/// `http` feature gate so non-network builds skip the reqwest +
+/// `sha2` deps entirely.
 #[cfg(feature = "http")]
 mod http_loader {
     use std::path::PathBuf;
@@ -69,6 +72,8 @@ mod http_loader {
         dirs::cache_dir().map(|root| root.join("molecular-autoencoder"))
     }
 
+    /// WASM stub: there is no addressable filesystem in the browser, so the
+    /// disk cache root is unavailable.
     #[cfg(target_arch = "wasm32")]
     pub fn default_cache_root() -> Option<PathBuf> {
         None
@@ -235,11 +240,17 @@ pub struct EncodingRow {
 /// [`MoleculeAutoencoderConfig::ecfp_radius`] so inference matches the
 /// preprocessing that produced the cached shards.
 pub struct MoleculeEncoder<B: Backend> {
+    /// Loaded autoencoder module ready for inference.
     model: MoleculeAutoencoder<B>,
+    /// Configuration deserialised from the checkpoint.
     config: MoleculeAutoencoderConfig,
+    /// Batcher pinned to the model's fingerprint and descriptor widths.
     batcher: MoleculeAutoencoderBatcher,
+    /// Counted-ECFP configuration recovered from the checkpoint.
     ecfp_config: CountedEcfpConfig,
+    /// RDKit-style fingerprint scratch reused across `encode` calls.
     scratch: finge_rs::smiles_support::SmilesRdkitScratch,
+    /// Backend device the model + batcher were initialised on.
     device: B::Device,
 }
 
@@ -574,6 +585,10 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
         Ok(rows)
     }
 
+    /// Parses `smiles` and computes its sparse counted-ECFP sample.
+    /// Returns `None` when SMILES parsing or fingerprint preparation
+    /// fails, letting [`encode`](Self::encode) thread the failure
+    /// through as a `None` slot for that row.
     fn try_build_sample(&mut self, smiles: &str) -> Option<MoleculeAutoencoderSample> {
         let parsed: Smiles = smiles.parse().ok()?;
         let fingerprint =

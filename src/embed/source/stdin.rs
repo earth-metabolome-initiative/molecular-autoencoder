@@ -7,6 +7,7 @@ use super::smi::SmilesLineSource;
 /// Wraps `std::io::stdin()` as a [`MoleculeSource`] with the same
 /// line-by-line SMILES semantics as a `.smi` file.
 pub struct StdinSource {
+    /// Shared `.smi`-style line reader bound to `std::io::stdin()`.
     inner: SmilesLineSource,
 }
 

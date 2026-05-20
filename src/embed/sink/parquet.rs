@@ -25,17 +25,30 @@ use crate::{
 /// Parquet writer that flushes one `RecordBatch` per batch handed to it
 /// from the encoder.
 pub struct ParquetSink {
+    /// Destination file path, retained for error reporting.
     path: std::path::PathBuf,
+    /// Owned `File` handle moved into the Arrow writer on `open`.
     file: Option<File>,
+    /// Compression codec applied to every column chunk.
     compression: Compression,
+    /// Arrow writer initialised on the first call to [`open`](Self::open).
     writer: Option<ArrowWriter<File>>,
+    /// Resolved Arrow schema; `None` until the latent width is known.
     schema: Option<Arc<Schema>>,
+    /// Latent embedding width recorded at `open` time and reused to
+    /// validate per-row writes.
     latent_width: Option<usize>,
+    /// Pending SMILES strings buffered until the next flush.
     pending_smiles: Vec<String>,
+    /// Pending counted-Tanimoto reconstruction scores.
     pending_count_tanimoto: Vec<f32>,
+    /// Pending binary-Tanimoto reconstruction scores.
     pending_binary_tanimoto: Vec<f32>,
+    /// Pending `log1p` MSE reconstruction errors.
     pending_log_mse: Vec<f32>,
+    /// Pending latent vectors, concatenated row-major.
     pending_latent: Vec<f32>,
+    /// Row count at which the pending buffers are flushed to disk.
     flush_threshold: usize,
 }
 
@@ -65,6 +78,9 @@ impl ParquetSink {
         })
     }
 
+    /// Builds an Arrow `RecordBatch` from the currently buffered rows
+    /// and writes it through the underlying Parquet writer. Resets the
+    /// pending buffers afterwards. A no-op when no rows are buffered.
     fn flush_pending(&mut self) -> Result<()> {
         let row_count = self.pending_smiles.len();
         if row_count == 0 {
@@ -198,6 +214,8 @@ impl EncodingSink for ParquetSink {
     }
 }
 
+/// Maps the CLI string for the Parquet compression codec onto an Arrow
+/// [`Compression`] value. Falls back to Snappy when `name` is `None`.
 fn parse_compression(name: Option<&str>) -> Result<Compression> {
     match name {
         None | Some("snappy") => Ok(Compression::SNAPPY),
@@ -210,6 +228,8 @@ fn parse_compression(name: Option<&str>) -> Result<Compression> {
     }
 }
 
+/// Arrow's fixed-size-list schema accepts `i32` lengths, so narrow the
+/// `usize` latent width with an explicit overflow check.
 fn latent_width_to_i32(width: usize) -> Result<i32> {
     i32::try_from(width).map_err(|_| {
         Error::InvalidBatch(format!(

@@ -76,6 +76,8 @@ pub fn prepare_manifest(args: &Args, paths: &ResolvedPaths) -> AppResult<PathBuf
     Ok(manifest_path)
 }
 
+/// Streams the selected dataset through the preprocessor and writes one or
+/// more shard files plus a manifest under `cache_dir`.
 fn preprocess_cache(
     cache_dir: &Path,
     rows_per_shard: usize,
@@ -153,20 +155,33 @@ fn preprocess_cache(
     Ok(())
 }
 
+/// Shared mutable state threaded through every source-specific preprocess
+/// routine.
 struct PreprocessContext<'a> {
+    /// Directory where shard files and the manifest are written.
     cache_dir: &'a Path,
+    /// Directory used to cache raw dataset downloads.
     source_cache_dir: &'a Path,
+    /// Maximum number of rows per shard before flushing.
     rows_per_shard: usize,
+    /// Thread count for the parallel chunk preprocessor.
     preprocess_threads: usize,
+    /// Preprocessing configuration (ECFP / descriptors / filter).
     config: &'a PreprocessingConfig,
+    /// Manifest accumulator updated as each shard is written.
     manifest: &'a mut ShardManifest,
+    /// Current in-flight shard buffer being filled with rows.
     shard: &'a mut SparseMoleculeShard,
+    /// Counter for the next shard filename / index.
     shard_index: &'a mut usize,
+    /// Progress bar used to surface live preprocessing stats.
     progress: &'a PreprocessProgress,
+    /// Total records observed across all sources for the run.
     records_seen_total: &'a mut usize,
 }
 
 impl PreprocessContext<'_> {
+    /// Streams the PubChem dataset through [`Self::preprocess_records`].
     fn preprocess_pubchem_source(&mut self) -> AppResult<()> {
         let source_progress = spinner(format!(
             "opening PubChem records cache at {}",
@@ -185,6 +200,8 @@ impl PreprocessContext<'_> {
         self.preprocess_records("PubChem", records)
     }
 
+    /// Streams the requested ZINC20 chunk range through
+    /// [`Self::preprocess_records`].
     fn preprocess_zinc20_source(&mut self, first_chunk: u8, last_chunk: u8) -> AppResult<()> {
         let dataset = Zinc20Smiles::chunk_range(first_chunk, last_chunk)?;
         let label = format!("ZINC20 chunks {first_chunk}..={last_chunk}");
@@ -202,6 +219,8 @@ impl PreprocessContext<'_> {
         self.preprocess_records(&label, records)
     }
 
+    /// Pulls records from `records`, applies the parallel chunk preprocessor,
+    /// and writes shards as they fill.
     fn preprocess_records<I>(&mut self, dataset_label: &str, records: I) -> AppResult<()>
     where
         I: IntoIterator<Item = molecular_autoencoder::Result<MoleculeRecord>>,
@@ -259,6 +278,8 @@ impl PreprocessContext<'_> {
     }
 }
 
+/// Writes the in-flight shard to disk under `cache_dir` and pushes the
+/// resulting entry into the manifest.
 fn write_preprocessed_shard(
     cache_dir: &Path,
     shard_index: usize,
@@ -272,11 +293,15 @@ fn write_preprocessed_shard(
     Ok(())
 }
 
+/// Indicatif spinner that streams live counters during preprocessing.
 struct PreprocessProgress {
+    /// Underlying spinner driving the live status line.
     bar: ProgressBar,
 }
 
 impl PreprocessProgress {
+    /// Initializes the spinner with the dataset description and a steady
+    /// tick.
     fn new(
         cache_dir: &Path,
         source_selection: SourceSelection,
@@ -293,6 +318,8 @@ impl PreprocessProgress {
         Self { bar }
     }
 
+    /// Updates the spinner with a periodic snapshot of records / rows /
+    /// errors.
     fn record(
         &self,
         dataset_label: &str,
@@ -313,6 +340,7 @@ impl PreprocessProgress {
         }
     }
 
+    /// Updates the spinner message after a shard has been flushed to disk.
     fn shard_written(&self, manifest: &ShardManifest, current_shard_rows: usize) {
         self.bar.set_message(format!(
             "wrote shard={} rows={} errors={} next_shard_rows={}",
@@ -323,6 +351,7 @@ impl PreprocessProgress {
         ));
     }
 
+    /// Finalizes the spinner with the run summary line.
     fn finish(self, records_seen: usize, manifest: &ShardManifest, elapsed: Duration) {
         self.bar.finish_with_message(format!(
             "preprocess_done records_seen={} rows={} skipped={} errors={} shards={} elapsed_sec={:.2}",
@@ -336,6 +365,7 @@ impl PreprocessProgress {
     }
 }
 
+/// Builds an indicatif spinner with the project-standard style and tick rate.
 fn spinner(message: impl Into<String>) -> ProgressBar {
     let bar = ProgressBar::new_spinner();
     bar.set_style(spinner_style());
@@ -344,6 +374,7 @@ fn spinner(message: impl Into<String>) -> ProgressBar {
     bar
 }
 
+/// Shared indicatif spinner template used by every preprocessor spinner.
 fn spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("{spinner:.green} {elapsed_precise} {wide_msg}")
         .unwrap_or_else(|_| ProgressStyle::default_spinner())

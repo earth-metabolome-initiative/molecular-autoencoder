@@ -16,7 +16,9 @@ use crate::{
 
 /// Tab- or comma-separated writer.
 pub struct TsvSink {
+    /// Underlying CSV writer with the configured delimiter.
     writer: csv::Writer<File>,
+    /// Latent embedding width recorded at `open` time.
     latent_width: Option<usize>,
 }
 
@@ -89,6 +91,8 @@ impl EncodingSink for TsvSink {
     }
 }
 
+/// Formats an `f32` with seven significant digits — enough to round-trip
+/// any IEEE-754 single-precision value while staying compact.
 fn format_f32(value: f32) -> String {
     // 7 significant digits round-trips IEEE-754 f32; cheaper than scientific.
     format!("{value:.7}")

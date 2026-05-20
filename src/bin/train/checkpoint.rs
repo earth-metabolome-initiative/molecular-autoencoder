@@ -18,15 +18,20 @@ use crate::{AppResult, invalid_input};
 /// Cached shard reference resolved against a manifest directory.
 #[derive(Debug, Clone)]
 pub struct CachedShardInfo {
+    /// Absolute path to the resolved shard file.
     pub path: PathBuf,
+    /// Number of rows the manifest reports for this shard.
     pub row_count: usize,
 }
 
 /// Persistent training-loop state stored alongside the model checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointState {
+    /// Last epoch that completed (1-based).
     pub completed_epoch: usize,
+    /// Global step counter at the moment the checkpoint was written.
     pub global_step: usize,
+    /// Best validation loss observed so far (used for `--save-best`).
     pub best_validation_loss: Option<f32>,
 }
 
@@ -104,6 +109,7 @@ pub fn read_state_json(path: &Path) -> AppResult<CheckpointState> {
     Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
 }
 
+/// JSON-serializes the [`CheckpointState`] to `path` with pretty formatting.
 fn write_state_json(path: &Path, state: &CheckpointState) -> AppResult<()> {
     let file = std::fs::File::create(path)?;
     serde_json::to_writer_pretty(file, state)?;
