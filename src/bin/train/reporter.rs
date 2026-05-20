@@ -622,3 +622,198 @@ fn bar_style() -> ProgressStyle {
         |style| style.progress_chars("=> "),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_metrics() -> BatchLossMetrics {
+        BatchLossMetrics {
+            loss: 0.5,
+            reconstruction: 0.3,
+            reconstruction_bce: 0.1,
+            descriptors: 0.05,
+            tanimoto_ranking: 0.02,
+            tanimoto_ranking_accuracy: 0.85,
+            count_tanimoto: 0.75,
+            binary_tanimoto: 0.80,
+        }
+    }
+
+    #[test]
+    fn progress_total_clamps_to_one_when_empty() {
+        assert_eq!(progress_total(0, 32, None), 1);
+        assert_eq!(progress_total(0, 32, Some(0)), 1);
+    }
+
+    #[test]
+    fn progress_total_uses_row_count_when_max_batches_is_unset() {
+        assert_eq!(progress_total(1024, 32, None), 1024);
+    }
+
+    #[test]
+    fn progress_total_uses_max_batches_times_batch_size_when_capped() {
+        assert_eq!(progress_total(1024, 32, Some(4)), 128);
+    }
+
+    #[test]
+    fn valid_and_train_row_estimates_partition_row_count() {
+        let row_count = 1_000_000;
+        let permille = 50; // 5 %
+        let valid = valid_row_estimate(row_count, permille);
+        let train = train_row_estimate(row_count, permille);
+        assert_eq!(valid, 50_000);
+        assert_eq!(valid + train, row_count);
+    }
+
+    #[test]
+    fn valid_row_estimate_clamps_per_mille_to_thousand() {
+        // Per-mille above 1000 is impossible but the helper saturates safely.
+        assert_eq!(valid_row_estimate(1000, 2000), 1000);
+    }
+
+    #[test]
+    fn reporter_metric_definitions_cover_every_variant() {
+        for metric in ReporterMetric::ALL {
+            assert!(!metric.name().is_empty());
+            assert!(!metric.description().is_empty());
+            let definition = metric.definition(metric_id(metric));
+            assert_eq!(definition.name, metric.name());
+        }
+    }
+
+    #[test]
+    fn reporter_metric_higher_is_better_flags_only_accuracy_and_tanimoto() {
+        assert!(!ReporterMetric::Loss.higher_is_better());
+        assert!(!ReporterMetric::Reconstruction.higher_is_better());
+        assert!(!ReporterMetric::ReconstructionBce.higher_is_better());
+        assert!(!ReporterMetric::Descriptors.higher_is_better());
+        assert!(!ReporterMetric::TanimotoRanking.higher_is_better());
+        assert!(ReporterMetric::TanimotoRankingAccuracy.higher_is_better());
+        assert!(ReporterMetric::CountTanimoto.higher_is_better());
+        assert!(ReporterMetric::BinaryTanimoto.higher_is_better());
+    }
+
+    #[test]
+    fn metric_state_wraps_value_and_count() {
+        let id = metric_id(ReporterMetric::Loss);
+        let state = metric_state(id, 0.42_f64, 8);
+        match state {
+            MetricState::Numeric(
+                _,
+                NumericEntry::Aggregated {
+                    aggregated_value,
+                    count,
+                },
+            ) => {
+                assert!((aggregated_value - 0.42).abs() < 1.0e-9);
+                assert_eq!(count, 8);
+            }
+            MetricState::Numeric(_, _) => panic!("expected an aggregated numeric entry"),
+            MetricState::Generic(_) => panic!("expected a numeric entry"),
+        }
+    }
+
+    #[test]
+    fn training_progress_threads_processed_and_iteration() {
+        let progress = training_progress(50, 200, 1, 10, 7);
+        let detailed = progress.progress.expect("processed progress present");
+        assert_eq!(detailed.items_processed, 50);
+        assert_eq!(detailed.items_total, 200);
+        assert_eq!(progress.global_progress.items_processed, 1);
+        assert_eq!(progress.global_progress.items_total, 10);
+        assert_eq!(progress.iteration, Some(7));
+    }
+
+    #[test]
+    fn progress_indicators_emit_items_epoch_and_iteration_tags() {
+        let indicators = progress_indicators(10, 100, 2, 5, 42);
+        assert_eq!(indicators.len(), 3);
+        // Tags are part of the public Burn API; assert by destructuring.
+        let mut items = false;
+        let mut epoch = false;
+        let mut iteration = false;
+        for indicator in indicators {
+            match indicator {
+                ProgressType::Detailed { tag, progress } if tag == "Items" => {
+                    assert_eq!(progress.items_processed, 10);
+                    assert_eq!(progress.items_total, 100);
+                    items = true;
+                }
+                ProgressType::Detailed { tag, progress } if tag == "Epoch" => {
+                    assert_eq!(progress.items_processed, 2);
+                    assert_eq!(progress.items_total, 5);
+                    epoch = true;
+                }
+                ProgressType::Value { tag, value } if tag == "Iteration" => {
+                    assert_eq!(value, 42);
+                    iteration = true;
+                }
+                _ => panic!("unexpected progress indicator variant"),
+            }
+        }
+        assert!(items && epoch && iteration);
+    }
+
+    #[test]
+    fn training_reporter_under_tests_falls_back_to_indicatif() {
+        // `cargo test` redirects stdout, so the renderer must be inactive.
+        let reporter = TrainingReporter::new(1024, 100, 32, Some(4), Some(2), None);
+        assert!(!reporter.is_active());
+        assert!(!reporter.should_stop());
+        // Totals come from the helper functions above.
+        assert_eq!(
+            reporter.train_total,
+            progress_total(1024 - 102, 32, Some(4))
+        );
+        assert_eq!(reporter.valid_total, progress_total(102, 32, Some(2)));
+    }
+
+    #[test]
+    fn training_reporter_train_batch_advances_processed_counter() {
+        let mut reporter = TrainingReporter::new(1000, 0, 32, Some(2), Some(1), None);
+        let control = reporter.train_batch(
+            1,
+            5,
+            1,
+            32,
+            Some(fixture_metrics()),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
+        assert!(matches!(control, BatchControl::Continue));
+        assert_eq!(reporter.train_epoch, Some(1));
+        assert_eq!(reporter.train_processed, 32);
+    }
+
+    #[test]
+    fn training_reporter_train_batch_resets_on_new_epoch() {
+        let mut reporter = TrainingReporter::new(1000, 0, 32, Some(4), Some(1), None);
+        reporter.train_batch(1, 5, 1, 32, None, Duration::ZERO, Duration::ZERO);
+        reporter.train_batch(2, 5, 1, 16, None, Duration::ZERO, Duration::ZERO);
+        assert_eq!(reporter.train_epoch, Some(2));
+        assert_eq!(reporter.train_processed, 16);
+    }
+
+    #[test]
+    fn indicatif_train_and_valid_bars_construct_and_finish_without_panic() {
+        let mut bars = IndicatifTrainingBars::new();
+        bars.train_batch(
+            1,
+            5,
+            16,
+            64,
+            Some(fixture_metrics()),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
+        // Repeating the same epoch reuses the bar.
+        bars.train_batch(1, 5, 32, 64, None, Duration::ZERO, Duration::ZERO);
+        // Switching kinds finishes the train bar and starts the valid one.
+        bars.valid_batch(1, 5, 8, 32, Some(fixture_metrics()), 0.5, 0.6);
+        bars.valid_batch(1, 5, 16, 32, None, 0.5, 0.6);
+        bars.finish();
+        // A second finish is a no-op.
+        bars.finish();
+    }
+}
