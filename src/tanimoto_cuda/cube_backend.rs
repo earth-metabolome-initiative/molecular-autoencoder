@@ -18,7 +18,12 @@ where
         counts: FloatTensor<Self>,
         mask: FloatTensor<Self>,
         config: CountedTanimotoRankingKernelConfig,
-    ) -> (IntTensor<Self>, IntTensor<Self>, FloatTensor<Self>) {
+    ) -> (
+        IntTensor<Self>,
+        IntTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
         indices.assert_is_on_same_device(&counts);
         indices.assert_is_on_same_device(&mask);
 
@@ -44,6 +49,7 @@ where
         let candidate_shape = Shape::new([config.batch_items(), candidate_count]);
         let index_shape = Shape::new([config.batch_items()]);
         let gap_shape = Shape::new([config.batch_items()]);
+        let score_shape = Shape::new([config.batch_items(), candidate_count]);
         let candidate_index = empty_device_dtype(
             counts.client.clone(),
             counts.device.clone(),
@@ -62,6 +68,12 @@ where
             gap_shape,
             counts.dtype,
         );
+        let candidate_scores = empty_device_dtype(
+            counts.client.clone(),
+            counts.device.clone(),
+            score_shape,
+            counts.dtype,
+        );
 
         let total_elem = config.batch_items();
         let cube_dim = CubeDim::new(&counts.client, total_elem);
@@ -78,12 +90,18 @@ where
             candidate_index.clone().into_tensor_arg(),
             best_candidate_position.clone().into_tensor_arg(),
             top2_gap.clone().into_tensor_arg(),
+            candidate_scores.clone().into_tensor_arg(),
             config.batch_items() as u32,
             config.candidates_per_anchor() as u32,
             config.seed() as u32,
             config.epsilon() as f32,
         );
 
-        (candidate_index, best_candidate_position, top2_gap)
+        (
+            candidate_index,
+            best_candidate_position,
+            top2_gap,
+            candidate_scores,
+        )
     }
 }

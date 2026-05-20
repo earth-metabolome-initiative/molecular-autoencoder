@@ -23,6 +23,7 @@ pub trait TanimotoMetricBackend: Backend + CountedTanimotoKernelBackend {}
 #[cfg(feature = "cuda")]
 impl<B> TanimotoMetricBackend for B where B: Backend + CountedTanimotoKernelBackend {}
 
+/// Backend trait alias used by training loops to allow CUDA-only metric paths.
 #[cfg(not(feature = "cuda"))]
 pub trait TanimotoMetricBackend: Backend {}
 
@@ -66,7 +67,7 @@ pub fn attach_tanimoto_ranking<B>(
         .seed(seed)
         .build()
         .expect("Tanimoto kernel config is valid");
-    let (candidate_index, best_candidate_position, top2_gap) =
+    let (candidate_index, best_candidate_position, top2_gap, candidate_scores) =
         counted_tanimoto_similarity_ranking_kernel(
             batch.fingerprints.indices.clone(),
             batch.fingerprints.counts.clone(),
@@ -77,9 +78,12 @@ pub fn attach_tanimoto_ranking<B>(
         candidate_index,
         best_candidate_position,
         top2_gap,
+        candidate_scores,
     };
 }
 
+/// No-op stand-in used on non-CUDA backends — the geometry loss path is
+/// CUDA-only today.
 #[cfg(not(feature = "cuda"))]
 pub fn attach_tanimoto_ranking<B>(
     _batch: &mut MoleculeAutoencoderBatch<B>,

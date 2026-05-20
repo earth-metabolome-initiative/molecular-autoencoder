@@ -14,6 +14,11 @@ pub struct TanimotoRankingBatch<B: Backend> {
     pub best_candidate_position: Tensor<B, 1, Int>,
     /// Counted Tanimoto score gap between the best and runner-up candidates.
     pub top2_gap: Tensor<B, 2>,
+    /// Per-candidate counted-Tanimoto score, shaped `[batch, candidates]`,
+    /// in the same column order as `candidate_index`. Surfaced so the
+    /// downstream ranking-quality metrics (MRR / Pearson / Spearman) can
+    /// be correlated against the latent cosine logits.
+    pub candidate_scores: Tensor<B, 2>,
 }
 
 impl<B: Backend> TanimotoRankingBatch<B> {
@@ -31,6 +36,7 @@ impl<B: Backend> TanimotoRankingBatch<B> {
                 device,
             ),
             top2_gap: Tensor::<B, 2>::zeros([batch_size, 1], device),
+            candidate_scores: Tensor::<B, 2>::zeros([batch_size, 2], device),
         }
     }
 }
@@ -43,6 +49,52 @@ pub struct TanimotoRankingOutput<B: Backend> {
     pub valid_pairs: Tensor<B, 1>,
     /// Fraction of valid anchors whose latent nearest candidate matched the metric.
     pub accuracy: Tensor<B, 1>,
+    /// Per-anchor diagnostic tensors carrying enough state for the
+    /// caller to compute MRR / Pearson / Spearman host-side after one
+    /// Transaction round-trip. Cloned through the loss breakdown into
+    /// the training-bin metrics pipeline.
+    pub diagnostics: TanimotoRankingDiagnostics<B>,
+}
+
+/// Per-anchor tensors needed to score ranking quality (MRR, Pearson,
+/// Spearman). All four shape-bearing fields are narrowed to the same
+/// `pair_count` rows so host-side reductions stay aligned.
+#[derive(Debug, Clone)]
+pub struct TanimotoRankingDiagnostics<B: Backend> {
+    /// Latent cosine logits, shape `[pair_count, candidate_count]`.
+    pub latent_logits: Tensor<B, 2>,
+    /// Per-candidate counted-Tanimoto scores, shape
+    /// `[pair_count, candidate_count]`.
+    pub candidate_scores: Tensor<B, 2>,
+    /// Metric-best candidate position per anchor, shape `[pair_count]`.
+    pub best_positions: Tensor<B, 1, Int>,
+    /// `1.0` for each anchor whose metric gap exceeds `min_gap`, `0.0`
+    /// otherwise. Shape `[pair_count]`.
+    pub valid_mask: Tensor<B, 1>,
+    /// Number of anchors that actually contributed to the loss.
+    pub pair_count: usize,
+    /// Number of candidate partners sampled per anchor.
+    pub candidate_count: usize,
+}
+
+impl<B: Backend> TanimotoRankingDiagnostics<B> {
+    /// Empty diagnostics for the zero-loss path. The tensors have
+    /// zero-sized shapes so Transactions can register them but the
+    /// host-side helper short-circuits on `pair_count == 0`.
+    #[must_use]
+    pub fn empty(device: &B::Device) -> Self {
+        Self {
+            latent_logits: Tensor::zeros([0, 0], device),
+            candidate_scores: Tensor::zeros([0, 0], device),
+            best_positions: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(Vec::<i64>::new(), [0]),
+                device,
+            ),
+            valid_mask: Tensor::zeros([0], device),
+            pair_count: 0,
+            candidate_count: 0,
+        }
+    }
 }
 
 /// In-batch softmax ranking objective for counted-fingerprint Tanimoto metric order.
@@ -100,18 +152,27 @@ pub fn tanimoto_ranking_output<B: Backend>(
     let valid_pairs = valid.clone().sum();
     let gap_weights = target_gap * valid.clone();
     let gap_weight_sum = gap_weights.clone().sum().clamp_min(1.0e-6);
-    let predicted_best = logits.argmax(1);
-    let metric_best = batch
-        .best_candidate_position
-        .narrow(0, 0, pair_count)
-        .reshape([pair_count, 1]);
+    let predicted_best = logits.clone().argmax(1);
+    let best_positions = batch.best_candidate_position.narrow(0, 0, pair_count);
+    let metric_best = best_positions.clone().reshape([pair_count, 1]);
     let accuracy = (predicted_best.equal(metric_best).float() * valid.clone()).sum()
         / valid_pairs.clone().clamp_min(1.0);
+
+    let candidate_scores = batch.candidate_scores.narrow(0, 0, pair_count).detach();
+    let valid_mask: Tensor<B, 1> = valid.reshape([pair_count]);
 
     TanimotoRankingOutput {
         loss: (cross_entropy * gap_weights).sum() / gap_weight_sum,
         valid_pairs,
         accuracy,
+        diagnostics: TanimotoRankingDiagnostics {
+            latent_logits: logits.detach(),
+            candidate_scores,
+            best_positions,
+            valid_mask,
+            pair_count,
+            candidate_count,
+        },
     }
 }
 
@@ -142,14 +203,170 @@ pub fn weighted_tanimoto_ranking_output<B: Backend>(
     }
 }
 
+/// Zero-cost ranking output used when the geometry loss is disabled
+/// (weight = 0, batch < 3, or candidate count < 2).
 fn zero_tanimoto_ranking_output<B: Backend>(device: &B::Device) -> TanimotoRankingOutput<B> {
     TanimotoRankingOutput {
         loss: Tensor::zeros([1], device),
         valid_pairs: Tensor::zeros([1], device),
         accuracy: Tensor::zeros([1], device),
+        diagnostics: TanimotoRankingDiagnostics::empty(device),
     }
 }
 
+/// Host-side ranking-quality scalars for the Tanimoto geometry head.
+///
+/// Holds MRR, Pearson and Spearman correlations between the latent
+/// cosine logits and the counted-Tanimoto scores, averaged over the
+/// `pair_count` anchors that contributed to the loss. Surfaced as plain
+/// `f32` scalars because all three reductions are trivial on host and
+/// the rank-based Spearman path is awkward in Burn tensor ops.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TanimotoRankingQuality {
+    /// Mean Reciprocal Rank: per anchor `1 / rank(true_best)` where
+    /// `rank` is the position of the metric best among the latent
+    /// scores sorted descending (1-indexed, ties broken by stable
+    /// ordering — see Spearman note below).
+    pub mrr: f32,
+    /// Per-anchor Pearson correlation between the latent logits and the
+    /// counted-Tanimoto scores, averaged over valid anchors. Range
+    /// `[-1, 1]`; falls back to `0.0` when either vector has zero
+    /// variance (division-by-zero guard).
+    pub pearson: f32,
+    /// Per-anchor Spearman rank correlation, averaged over valid
+    /// anchors. Uses ordinal ranking (each candidate gets a distinct
+    /// rank) since exact ties on counted ECFP Tanimoto are rare at
+    /// typical 4k+ bit widths.
+    pub spearman: f32,
+}
+
+/// Computes the three ranking-quality scalars from already-materialised
+/// host buffers. Returns all-zeros when `pair_count == 0` or no anchor
+/// in `valid_mask` is set.
+///
+/// # Panics
+///
+/// Panics when any input slice is shorter than expected for the
+/// declared `pair_count` / `candidate_count`.
+#[must_use]
+pub fn tanimoto_ranking_quality(
+    latent_logits: &[f32],
+    candidate_scores: &[f32],
+    best_positions: &[i32],
+    valid_mask: &[f32],
+    pair_count: usize,
+    candidate_count: usize,
+) -> TanimotoRankingQuality {
+    if pair_count == 0 || candidate_count == 0 {
+        return TanimotoRankingQuality::default();
+    }
+    assert!(
+        latent_logits.len() >= pair_count * candidate_count,
+        "latent_logits buffer is too short for the declared shape"
+    );
+    assert!(
+        candidate_scores.len() >= pair_count * candidate_count,
+        "candidate_scores buffer is too short for the declared shape"
+    );
+    assert!(
+        best_positions.len() >= pair_count,
+        "best_positions buffer is too short for the declared pair_count"
+    );
+    assert!(
+        valid_mask.len() >= pair_count,
+        "valid_mask buffer is too short for the declared pair_count"
+    );
+
+    let mut mrr_sum = 0.0_f32;
+    let mut pearson_sum = 0.0_f32;
+    let mut spearman_sum = 0.0_f32;
+    let mut valid_count = 0_u32;
+    let mut latent_rank_buf = vec![0_f32; candidate_count];
+    let mut score_rank_buf = vec![0_f32; candidate_count];
+
+    for anchor in 0..pair_count {
+        if valid_mask[anchor] <= 0.0 {
+            continue;
+        }
+        let start = anchor * candidate_count;
+        let latent_row = &latent_logits[start..start + candidate_count];
+        let score_row = &candidate_scores[start..start + candidate_count];
+
+        let best_position = usize::try_from(best_positions[anchor].max(0))
+            .expect("best_position is non-negative")
+            .min(candidate_count - 1);
+        let best_score = latent_row[best_position];
+        let mut strictly_better = 0_usize;
+        for (idx, &value) in latent_row.iter().enumerate() {
+            if idx != best_position && value > best_score {
+                strictly_better += 1;
+            }
+        }
+        let rank = (strictly_better + 1) as f32;
+        mrr_sum += 1.0_f32 / rank;
+
+        pearson_sum += pearson(latent_row, score_row);
+
+        ordinal_ranks(latent_row, &mut latent_rank_buf);
+        ordinal_ranks(score_row, &mut score_rank_buf);
+        spearman_sum += pearson(&latent_rank_buf, &score_rank_buf);
+
+        valid_count += 1;
+    }
+
+    if valid_count == 0 {
+        return TanimotoRankingQuality::default();
+    }
+    let denom = valid_count as f32;
+    TanimotoRankingQuality {
+        mrr: mrr_sum / denom,
+        pearson: pearson_sum / denom,
+        spearman: spearman_sum / denom,
+    }
+}
+
+/// Population Pearson correlation between two equal-length slices.
+/// Returns `0.0` when either side has zero variance.
+fn pearson(left: &[f32], right: &[f32]) -> f32 {
+    debug_assert_eq!(left.len(), right.len());
+    let n = left.len() as f32;
+    let mean_left = left.iter().sum::<f32>() / n;
+    let mean_right = right.iter().sum::<f32>() / n;
+    let mut cov = 0.0_f32;
+    let mut var_left = 0.0_f32;
+    let mut var_right = 0.0_f32;
+    for (&a, &b) in left.iter().zip(right) {
+        let da = a - mean_left;
+        let db = b - mean_right;
+        cov += da * db;
+        var_left += da * da;
+        var_right += db * db;
+    }
+    let denom = (var_left * var_right).sqrt();
+    if denom <= 1.0e-12 { 0.0 } else { cov / denom }
+}
+
+/// Writes the ordinal rank of each `values[i]` into `out[i]`. Ranks
+/// are 1-indexed; ties are broken by index so two equal values get
+/// distinct ranks.
+fn ordinal_ranks(values: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(values.len(), out.len());
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|&i, &j| {
+        values[i]
+            .partial_cmp(&values[j])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(i.cmp(&j))
+    });
+    for (rank, &source_idx) in order.iter().enumerate() {
+        out[source_idx] = (rank + 1) as f32;
+    }
+}
+
+/// Computes the per-row cosine similarity between two `[batch,
+/// candidates, latent]` tensors and reshapes the result to `[batch,
+/// candidates]`. Used to derive the latent logits for the ranking
+/// softmax loss.
 fn row_cosine_similarity_3d<B: Backend>(left: Tensor<B, 3>, right: Tensor<B, 3>) -> Tensor<B, 2> {
     let [batch_size, candidate_count, _latent_width] = left.dims();
     let numerator = (left.clone() * right.clone()).sum_dim(2);
@@ -175,6 +392,7 @@ mod tests {
         assert_eq!(batch.candidate_index.dims(), [3, 2]);
         assert_eq!(batch.best_candidate_position.dims(), [3]);
         assert_eq!(batch.top2_gap.dims(), [3, 1]);
+        assert_eq!(batch.candidate_scores.dims(), [3, 2]);
     }
 
     #[test]
@@ -191,6 +409,7 @@ mod tests {
                 &device,
             ),
             top2_gap: Tensor::<B, 2>::from_data(TensorData::new(vec![0.8_f32], [1, 1]), &device),
+            candidate_scores: Tensor::<B, 2>::zeros([1, 2], &device),
         };
         let reversed_batch = TanimotoRankingBatch {
             candidate_index: Tensor::<B, 2, Int>::from_data(
@@ -202,6 +421,7 @@ mod tests {
                 &device,
             ),
             top2_gap: Tensor::<B, 2>::from_data(TensorData::new(vec![0.8_f32], [1, 1]), &device),
+            candidate_scores: Tensor::<B, 2>::zeros([1, 2], &device),
         };
 
         let preserved =
@@ -228,6 +448,7 @@ mod tests {
                 &device,
             ),
             top2_gap: Tensor::<B, 2>::from_data(TensorData::new(vec![0.001_f32], [1, 1]), &device),
+            candidate_scores: Tensor::<B, 2>::zeros([1, 2], &device),
         };
 
         let output = tanimoto_ranking_output(latent, batch, 1, 0.10, 0.10, 0.01);
@@ -250,6 +471,7 @@ mod tests {
                 &device,
             ),
             top2_gap: Tensor::<B, 2>::from_floats([[0.9], [0.1], [0.0]], &device),
+            candidate_scores: Tensor::<B, 2>::zeros([3, 2], &device),
         };
 
         let loss = tanimoto_ranking_output(latent, batch, 0, 0.5, 0.5, 0.01)
@@ -279,6 +501,7 @@ mod tests {
                 &device,
             ),
             top2_gap: Tensor::<B, 2>::from_floats([[0.9], [0.9], [0.9]], &device),
+            candidate_scores: Tensor::<B, 2>::zeros([3, 2], &device),
         };
 
         let output = tanimoto_ranking_output(latent, batch, 1, 0.5, 0.5, 0.01);
@@ -318,6 +541,7 @@ mod tests {
                 &device,
             ),
             top2_gap: Tensor::<B, 2>::zeros([3, 1], &device),
+            candidate_scores: Tensor::<B, 2>::zeros([3, 1], &device),
         };
         let output = tanimoto_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01);
         assert_eq!(output.loss.into_scalar(), 0.0);
@@ -353,6 +577,7 @@ mod tests {
                 &device,
             ),
             top2_gap: Tensor::<B, 2>::ones([3, 1], &device),
+            candidate_scores: Tensor::<B, 2>::zeros([3, 2], &device),
         };
         let unweighted = tanimoto_ranking_output(latent.clone(), batch.clone(), 0, 0.5, 0.5, 0.01)
             .loss
@@ -361,5 +586,109 @@ mod tests {
             .loss
             .into_scalar();
         assert!((weighted - unweighted * 2.5).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn tanimoto_ranking_quality_handles_empty_pair_count() {
+        let quality = tanimoto_ranking_quality(&[], &[], &[], &[], 0, 4);
+        assert_eq!(quality, TanimotoRankingQuality::default());
+    }
+
+    #[test]
+    fn tanimoto_ranking_quality_perfect_alignment() {
+        // 2 anchors, 4 candidates each. Latent and Tanimoto scores
+        // share the same ordering, so MRR = 1, Pearson = 1, Spearman = 1.
+        let latent_logits = [0.8, 0.6, 0.4, 0.2, 0.1, 0.3, 0.5, 0.7];
+        let candidate_scores = [0.9, 0.7, 0.5, 0.3, 0.2, 0.4, 0.6, 0.8];
+        let best_positions = [0_i32, 3];
+        let valid_mask = [1.0_f32, 1.0];
+        let quality = tanimoto_ranking_quality(
+            &latent_logits,
+            &candidate_scores,
+            &best_positions,
+            &valid_mask,
+            2,
+            4,
+        );
+        assert!((quality.mrr - 1.0).abs() < 1.0e-6);
+        assert!((quality.pearson - 1.0).abs() < 1.0e-5);
+        assert!((quality.spearman - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn tanimoto_ranking_quality_anti_alignment() {
+        // Same data but latent order is reversed → MRR = 1/4,
+        // Pearson = -1, Spearman = -1.
+        let latent_logits = [0.2, 0.4, 0.6, 0.8];
+        let candidate_scores = [0.9, 0.7, 0.5, 0.3];
+        let best_positions = [0_i32];
+        let valid_mask = [1.0_f32];
+        let quality = tanimoto_ranking_quality(
+            &latent_logits,
+            &candidate_scores,
+            &best_positions,
+            &valid_mask,
+            1,
+            4,
+        );
+        assert!((quality.mrr - 0.25).abs() < 1.0e-6);
+        assert!((quality.pearson + 1.0).abs() < 1.0e-5);
+        assert!((quality.spearman + 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn tanimoto_ranking_quality_handles_constant_latent() {
+        // Constant latent → Pearson / Spearman fall back to 0 via the
+        // zero-variance guard. MRR uses the ordinal-sort tie-break (the
+        // metric best sits at index 0 → rank 1 / N candidates).
+        let latent_logits = [0.5_f32; 4];
+        let candidate_scores = [0.9_f32, 0.6, 0.3, 0.1];
+        let best_positions = [0_i32];
+        let valid_mask = [1.0_f32];
+        let quality = tanimoto_ranking_quality(
+            &latent_logits,
+            &candidate_scores,
+            &best_positions,
+            &valid_mask,
+            1,
+            4,
+        );
+        assert_eq!(quality.pearson, 0.0);
+        // Spearman is identical to Pearson on ranks; with a constant
+        // latent vector, ordinal ranks 1..4 vs the candidate-score
+        // ranks are perfectly anti-correlated under our tie-break
+        // (latent ranks ascend by index, scores descend). We just
+        // require a finite value here.
+        assert!(quality.spearman.is_finite());
+        // The best position is index 0; with all latents equal, the
+        // ordinal-stable argmax is index 0, so MRR = 1.
+        assert!((quality.mrr - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn tanimoto_ranking_quality_skips_invalid_anchors() {
+        // Anchor 0 is invalid → only anchor 1 contributes.
+        let latent_logits = [0.0, 0.0, 0.0, 0.0, 0.9, 0.6, 0.3, 0.1];
+        let candidate_scores = [0.0, 0.0, 0.0, 0.0, 0.9, 0.6, 0.3, 0.1];
+        let best_positions = [0_i32, 0];
+        let valid_mask = [0.0_f32, 1.0];
+        let quality = tanimoto_ranking_quality(
+            &latent_logits,
+            &candidate_scores,
+            &best_positions,
+            &valid_mask,
+            2,
+            4,
+        );
+        assert!((quality.mrr - 1.0).abs() < 1.0e-6);
+        assert!((quality.pearson - 1.0).abs() < 1.0e-5);
+        assert!((quality.spearman - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn tanimoto_ranking_quality_returns_zero_when_no_anchor_is_valid() {
+        let quality =
+            tanimoto_ranking_quality(&[0.0_f32; 4], &[0.0_f32; 4], &[0_i32], &[0.0_f32], 1, 4);
+        assert_eq!(quality, TanimotoRankingQuality::default());
     }
 }

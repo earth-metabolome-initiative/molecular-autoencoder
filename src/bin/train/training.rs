@@ -36,15 +36,22 @@ use crate::{
 /// Aggregate metrics collected over a single training epoch.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EpochSummary {
+    /// Number of batches processed.
     pub batches: usize,
+    /// Number of batches that contributed to `loss_sum`.
     pub loss_batches: usize,
+    /// Total examples seen.
     pub examples: usize,
+    /// Sum of per-batch loss scalars (only over `loss_batches`).
     pub loss_sum: f64,
+    /// Cumulative time spent waiting on the dataloader.
     pub data_time: Duration,
+    /// Cumulative time spent in the forward + backward + optimizer step.
     pub step_time: Duration,
 }
 
 impl EpochSummary {
+    /// Adds one batch's contribution to the running totals.
     fn record(
         &mut self,
         examples: usize,
@@ -62,6 +69,8 @@ impl EpochSummary {
         self.step_time += step_time;
     }
 
+    /// Mean per-batch loss over the batches that produced a sampled
+    /// loss scalar. Returns `0.0` when no batch was sampled.
     pub fn mean_loss(self) -> f32 {
         if self.loss_batches == 0 {
             0.0
@@ -74,17 +83,26 @@ impl EpochSummary {
 /// Aggregate metrics collected over a single validation pass.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EvaluationSummary {
+    /// Number of validation batches processed.
     pub batches: usize,
+    /// Number of batches that contributed a loss scalar.
     pub loss_batches: usize,
+    /// Total validation examples seen.
     pub examples: usize,
+    /// Sum of per-batch validation loss scalars.
     pub loss_sum: f64,
+    /// Sum of per-batch counted-Tanimoto reconstruction scores.
     pub count_tanimoto_sum: f64,
+    /// Sum of per-batch binary-Tanimoto reconstruction scores.
     pub binary_tanimoto_sum: f64,
+    /// Cumulative dataloader wait time across validation batches.
     pub data_time: Duration,
+    /// Cumulative forward-only step time across validation batches.
     pub step_time: Duration,
 }
 
 impl EvaluationSummary {
+    /// Adds one validation batch's contribution to the running totals.
     fn record(
         &mut self,
         examples: usize,
@@ -106,6 +124,7 @@ impl EvaluationSummary {
         self.step_time += step_time;
     }
 
+    /// Mean validation loss over sampled batches.
     pub fn mean_loss(self) -> f32 {
         if self.loss_batches == 0 {
             0.0
@@ -114,6 +133,7 @@ impl EvaluationSummary {
         }
     }
 
+    /// Mean per-batch counted-Tanimoto reconstruction score.
     pub fn mean_count_tanimoto(self) -> f32 {
         if self.batches == 0 {
             0.0
@@ -122,6 +142,7 @@ impl EvaluationSummary {
         }
     }
 
+    /// Mean per-batch binary-Tanimoto reconstruction score.
     pub fn mean_binary_tanimoto(self) -> f32 {
         if self.batches == 0 {
             0.0
@@ -134,24 +155,39 @@ impl EvaluationSummary {
 /// Payload routed from a worker peer to the lead peer's training reporter.
 #[derive(Debug, Clone)]
 pub struct TrainBatchPayload {
+    /// Epoch index (1-based) the batch belongs to.
     pub epoch: usize,
+    /// Total epochs in the training run.
     pub epoch_total: usize,
+    /// Monotonic global step counter after this batch.
     pub global_step: usize,
+    /// Number of examples in the batch.
     pub batch_size: usize,
+    /// Sampled loss / accuracy / quality scalars, when this batch was
+    /// chosen by `should_sample_metrics`.
     pub metrics: Option<BatchLossMetrics>,
+    /// Time spent waiting on the dataloader.
     pub data_time: Duration,
+    /// Forward + backward + optimizer step time.
     pub step_time: Duration,
 }
 
 /// Payload routed from a worker peer to the lead peer's validation reporter.
 #[derive(Debug, Clone)]
 pub struct ValidBatchPayload {
+    /// Epoch index this validation batch belongs to.
     pub epoch: usize,
+    /// Total epochs in the training run.
     pub epoch_total: usize,
+    /// Validation batch index within the epoch.
     pub batch_index: usize,
+    /// Number of validation examples in the batch.
     pub batch_size: usize,
+    /// Sampled loss / accuracy / quality scalars, when sampled.
     pub metrics: Option<BatchLossMetrics>,
+    /// Per-batch counted-Tanimoto reconstruction score.
     pub count_tanimoto: f32,
+    /// Per-batch binary-Tanimoto reconstruction score.
     pub binary_tanimoto: f32,
 }
 
@@ -172,21 +208,34 @@ pub enum BatchUpdate {
 /// Routes batch-level metrics either to the local reporter (lead peer, peer 0)
 /// or to an mpsc channel drained by peer 0 (worker peers).
 pub enum BatchSink<'a> {
+    /// Peer 0 routes metrics straight into the in-process reporter.
     Lead {
+        /// Borrowed mutable reporter used to render TUI / indicatif
+        /// progress for both this peer's batches and any drained
+        /// worker-peer updates.
         reporter: &'a mut TrainingReporter,
+        /// Shared atomic flag toggled when the renderer requests an
+        /// early stop (e.g. Ctrl-C).
         stop_flag: Arc<AtomicBool>,
         /// Channel drained between own batches to surface worker peers'
         /// metrics on the lead reporter. `None` in single-GPU runs.
         receiver: Option<&'a Receiver<BatchUpdate>>,
     },
+    /// Non-lead peer forwards its batch updates over an mpsc channel
+    /// owned by peer 0.
     #[cfg_attr(not(feature = "multi-gpu"), allow(dead_code))]
     Worker {
+        /// Sender half drained by the lead peer.
         tx: Sender<BatchUpdate>,
+        /// Shared stop flag toggled when the lead reporter requests an
+        /// early stop.
         stop_flag: Arc<AtomicBool>,
     },
 }
 
 impl BatchSink<'_> {
+    /// Routes a freshly-completed training batch to either the local
+    /// reporter (lead peer) or the worker→lead channel.
     fn train_batch(&mut self, payload: TrainBatchPayload) -> BatchControl {
         match self {
             Self::Lead {
@@ -211,6 +260,7 @@ impl BatchSink<'_> {
         }
     }
 
+    /// Validation counterpart of [`Self::train_batch`].
     fn valid_batch(&mut self, payload: ValidBatchPayload) -> BatchControl {
         match self {
             Self::Lead {
@@ -236,6 +286,8 @@ impl BatchSink<'_> {
     }
 }
 
+/// Renders one training batch through the reporter and propagates any
+/// requested stop into the shared atomic flag.
 fn forward_train(
     reporter: &mut TrainingReporter,
     stop_flag: &AtomicBool,
@@ -256,6 +308,8 @@ fn forward_train(
     control
 }
 
+/// Renders one validation batch through the reporter and propagates
+/// any requested stop into the shared atomic flag.
 fn forward_valid(
     reporter: &mut TrainingReporter,
     stop_flag: &AtomicBool,
@@ -302,35 +356,63 @@ fn drain_worker_updates(
 
 /// Per-epoch training context owned by the run loop or per-worker DDP loop.
 pub struct TrainEpochContext<'a, B: Backend> {
+    /// Per-peer slice of the cached shards iterator.
     pub shards: &'a [CachedShardInfo],
+    /// Pre-built batcher pinned to the model's fingerprint shape.
     pub batcher: MoleculeAutoencoderBatcher,
+    /// Backend device this peer is training on.
     pub device: &'a B::Device,
+    /// Runtime view of the Tanimoto geometry hyperparameters.
     pub tanimoto_ranking: TanimotoRankingRuntimeConfig,
+    /// Parsed CLI arguments.
     pub args: &'a Args,
+    /// Loader-profile flush interval (`0` disables profiling).
     pub loader_profile_every: usize,
+    /// Per-mille validation split fraction.
     pub validation_per_mille: u16,
+    /// Mutable checkpoint state updated as batches complete.
     pub state: &'a mut CheckpointState,
+    /// Batch-update sink: in-process reporter on peer 0, mpsc sender
+    /// on worker peers.
     pub sink: BatchSink<'a>,
+    /// Epoch index (1-based).
     pub epoch: usize,
+    /// Local peer identifier (0 = lead).
     pub peer_id: u32,
+    /// Total DDP peer count.
     pub world_size: u32,
 }
 
 /// Per-validation context owned by the run loop or per-worker DDP loop.
 pub struct EvaluationContext<'a, B: Backend> {
+    /// Per-peer slice of the cached shards iterator.
     pub shards: &'a [CachedShardInfo],
+    /// Batcher pinned to the model's fingerprint shape.
     pub batcher: MoleculeAutoencoderBatcher,
+    /// Backend device for the validation pass.
     pub device: &'a B::Device,
+    /// Validation batch size.
     pub batch_size: usize,
+    /// Optional cap on the number of validation batches per epoch.
     pub max_batches: Option<usize>,
+    /// Number of host-side dataloader worker threads.
     pub loader_workers: usize,
+    /// Device prefetch depth (`0` keeps everything on the host
+    /// thread).
     pub device_prefetch_batches: usize,
+    /// Loader-profile flush interval (`0` disables profiling).
     pub loader_profile_every: usize,
+    /// Runtime view of the Tanimoto geometry hyperparameters.
     pub tanimoto_ranking: TanimotoRankingRuntimeConfig,
+    /// Per-mille validation split fraction.
     pub validation_per_mille: u16,
+    /// Batch-update sink.
     pub sink: BatchSink<'a>,
+    /// Epoch index (1-based).
     pub epoch: usize,
+    /// Total epochs in the training run.
     pub epoch_total: usize,
+    /// Local peer identifier.
     pub peer_id: u32,
 }
 
@@ -578,6 +660,9 @@ where
         .map_err(|err| invalid_input(format!("gradient all-reduce failed: {err:?}")))
 }
 
+/// Single-peer no-op variant of [`all_reduce_mean`] used when the
+/// `multi-gpu` feature is disabled. Preserves the signature so the hot
+/// path stays cfg-agnostic.
 #[cfg(not(feature = "multi-gpu"))]
 #[allow(
     clippy::extra_unused_type_parameters,

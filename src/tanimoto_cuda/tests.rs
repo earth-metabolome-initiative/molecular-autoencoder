@@ -67,7 +67,7 @@ fn ranking_kernel_matches_cpu_counted_tanimoto_reference() {
         .build()
         .expect("kernel config is valid");
 
-    let (candidate_index, best_candidate_position, top2_gap) =
+    let (candidate_index, best_candidate_position, top2_gap, candidate_scores) =
         counted_tanimoto_similarity_ranking_kernel(
             BurnTensor::<TestBackend, 2, burn::tensor::Int>::from_data(
                 TensorData::new(indices_data.clone(), [row_count, width]),
@@ -96,6 +96,10 @@ fn ranking_kernel_matches_cpu_counted_tanimoto_reference() {
         .into_data()
         .to_vec::<f32>()
         .expect("top-2 gaps should be f32");
+    let candidate_scores = candidate_scores
+        .into_data()
+        .to_vec::<f32>()
+        .expect("candidate scores should be f32");
 
     let candidate_count = config.effective_candidates_per_anchor();
     for anchor in 0..row_count {
@@ -128,6 +132,104 @@ fn ranking_kernel_matches_cpu_counted_tanimoto_reference() {
                     "anchor {anchor}: candidates must be unique"
                 );
             }
+        }
+        let actual_scores = &candidate_scores[start..start + candidate_count];
+        for (position, (actual, expected_score)) in actual_scores
+            .iter()
+            .zip(expected.candidate_scores.iter())
+            .enumerate()
+        {
+            assert!(
+                (actual - expected_score).abs() < 1.0e-5,
+                "anchor {anchor} candidate {position}: backend={actual} reference={expected_score}",
+            );
+        }
+    }
+}
+
+#[cfg(feature = "ndarray")]
+#[test]
+fn ndarray_kernel_matches_cpu_reference() {
+    use burn::backend::NdArray;
+    use burn::backend::ndarray::NdArrayDevice;
+
+    type NdBackend = NdArray<f32, i64>;
+    let device = NdArrayDevice::default();
+    let indices_data: Vec<i64> = vec![
+        1, 3, 0, //
+        1, 3, 0, //
+        2, 0, 0, //
+        1, 4, 0, //
+        3, 4, 0, //
+    ];
+    let counts_data: Vec<f32> = vec![
+        2.0, 1.0, 0.0, //
+        2.0, 1.0, 0.0, //
+        5.0, 0.0, 0.0, //
+        1.0, 1.0, 0.0, //
+        1.0, 2.0, 0.0, //
+    ];
+    let mask_data: Vec<f32> = vec![
+        1.0, 1.0, 0.0, //
+        1.0, 1.0, 0.0, //
+        1.0, 0.0, 0.0, //
+        1.0, 1.0, 0.0, //
+        1.0, 1.0, 0.0, //
+    ];
+    let row_count = 5;
+    let width = 3;
+    // The NdArray helper consumes i32 host indices but the CPU reference
+    // we compare against (`ranking_reference`) takes the same slice.
+    let cpu_indices: Vec<i32> = indices_data.iter().map(|v| *v as i32).collect();
+    let rows = SparseRows {
+        indices: &cpu_indices,
+        counts: &counts_data,
+        mask: &mask_data,
+        width,
+    };
+    let config = CountedTanimotoRankingKernelConfig::builder()
+        .batch_items(row_count)
+        .candidates_per_anchor(4)
+        .seed(12_345)
+        .epsilon(1.0e-8)
+        .build()
+        .expect("kernel config is valid");
+
+    let (_candidate_index, _best_position, _top2_gap, candidate_scores) =
+        counted_tanimoto_similarity_ranking_kernel(
+            BurnTensor::<NdBackend, 2, burn::tensor::Int>::from_data(
+                TensorData::new(indices_data.clone(), [row_count, width]),
+                &device,
+            ),
+            BurnTensor::<NdBackend, 2>::from_data(
+                TensorData::new(counts_data.clone(), [row_count, width]),
+                &device,
+            ),
+            BurnTensor::<NdBackend, 2>::from_data(
+                TensorData::new(mask_data.clone(), [row_count, width]),
+                &device,
+            ),
+            config,
+        );
+
+    let scores = candidate_scores
+        .into_data()
+        .to_vec::<f32>()
+        .expect("candidate scores should be f32");
+    let candidate_count = config.effective_candidates_per_anchor();
+    for anchor in 0..row_count {
+        let expected = ranking_reference(&rows, anchor, config);
+        let start = anchor * candidate_count;
+        let actual = &scores[start..start + candidate_count];
+        for (position, (a, e)) in actual
+            .iter()
+            .zip(expected.candidate_scores.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() < 1.0e-5,
+                "anchor {anchor} candidate {position}: ndarray={a} reference={e}",
+            );
         }
     }
 }

@@ -26,19 +26,33 @@ use super::api::CountedTanimotoRankingKernelConfig;
 /// ranking helper. Storage is row-major: row `r` occupies
 /// `[r * width, (r + 1) * width)` in each of `indices`, `counts`, `mask`.
 pub struct SparseRows<'a> {
+    /// Row-major sparse fingerprint indices.
     pub indices: &'a [i32],
+    /// Row-major sparse fingerprint counts (aligned with `indices`).
     pub counts: &'a [f32],
+    /// Row-major sparse fingerprint mask (1.0 = active bin, 0.0 = pad).
     pub mask: &'a [f32],
+    /// Padded sparse-axis width shared by `indices`, `counts`, `mask`.
     pub width: usize,
 }
 
 /// Per-anchor result: the sampled candidate row indices, the position of
-/// the best-scoring candidate within that list, and the top-1/top-2 score
-/// gap clamped to `[0, 1]`.
+/// the best-scoring candidate within that list, the top-1/top-2 score
+/// gap clamped to `[0, 1]`, and every candidate's counted-Tanimoto score
+/// in the same order as `candidate_indices`. The score vector is what
+/// the ranking-quality metrics (Pearson / Spearman) line up against the
+/// latent cosine logits.
 pub struct RankingReference {
+    /// Candidate row indices sampled for this anchor.
     pub candidate_indices: Vec<i32>,
+    /// Position of the best-scoring candidate within the list.
     pub best_candidate_position: usize,
+    /// Clamped gap between the best and second-best counted Tanimoto
+    /// scores.
     pub top2_gap: f32,
+    /// Per-candidate counted Tanimoto score, aligned with
+    /// `candidate_indices`.
+    pub candidate_scores: Vec<f32>,
 }
 
 /// Computes the per-anchor ranking labels.
@@ -71,11 +85,12 @@ pub fn ranking_reference(
             stride = 1;
         }
     }
-    let mut candidate_indices = Vec::new();
+    let candidates = config.effective_candidates_per_anchor();
+    let mut candidate_indices = Vec::with_capacity(candidates);
+    let mut candidate_scores = Vec::with_capacity(candidates);
     let mut best_candidate_position = 0;
     let mut best_score = f32::NEG_INFINITY;
     let mut second_best_score = f32::NEG_INFINITY;
-    let candidates = config.effective_candidates_per_anchor();
 
     for candidate_position in 0..candidates {
         let mut local_partner =
@@ -85,6 +100,7 @@ pub fn ranking_reference(
         }
         candidate_indices.push(i32::try_from(local_partner).expect("partner index fits in i32"));
         let score = counted_tanimoto(rows, anchor, local_partner);
+        candidate_scores.push(score);
         if score > best_score {
             second_best_score = best_score;
             best_score = score;
@@ -98,9 +114,14 @@ pub fn ranking_reference(
         candidate_indices,
         best_candidate_position,
         top2_gap: (best_score - second_best_score).clamp(0.0, 1.0),
+        candidate_scores,
     }
 }
 
+/// Greatest common divisor via Euclid's algorithm. Used to ensure the
+/// stride that walks through partner slots is coprime with the slot
+/// count, so candidate sampling cycles through every partner exactly
+/// once.
 fn gcd(mut left: u32, mut right: u32) -> u32 {
     while right != 0 {
         let remainder = left % right;
@@ -110,6 +131,9 @@ fn gcd(mut left: u32, mut right: u32) -> u32 {
     left
 }
 
+/// Counted Tanimoto similarity between two rows of a `SparseRows`
+/// view. Walks the sparse index sequences in lockstep, computing
+/// `sum(min) / sum(max)` over aligned bins.
 fn counted_tanimoto(rows: &SparseRows<'_>, left: usize, right: usize) -> f32 {
     let mut left_total = 0.0;
     let mut right_total = 0.0;

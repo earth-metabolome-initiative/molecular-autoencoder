@@ -6,20 +6,41 @@ use burn::{
     prelude::*,
     tensor::{TensorData, Transaction},
 };
-use molecular_autoencoder::{DataSplit, MoleculeLossBreakdown};
+use molecular_autoencoder::{DataSplit, MoleculeLossBreakdown, tanimoto_ranking_quality};
 
 use crate::{AppResult, dataloader::BatchLoadProfile, invalid_input};
 
 /// Scalar loss components captured from a single training/eval batch.
 #[derive(Debug, Clone, Copy)]
 pub struct BatchLossMetrics {
+    /// Weighted total loss (sum of every active component).
     pub loss: f32,
+    /// Reconstruction (log-count Huber) loss.
     pub reconstruction: f32,
+    /// Bit-presence BCE auxiliary on the reconstruction head.
     pub reconstruction_bce: f32,
+    /// Descriptor regression loss.
     pub descriptors: f32,
+    /// Tanimoto ranking softmax-CE geometry loss.
     pub tanimoto_ranking: f32,
+    /// Fraction of anchors whose latent argmax matches the metric-best
+    /// candidate.
     pub tanimoto_ranking_accuracy: f32,
+    /// Mean reciprocal rank: per-anchor `1 / rank(true_best_in_latent)`,
+    /// averaged over anchors with a positive metric gap. Higher is better.
+    pub tanimoto_ranking_mrr: f32,
+    /// Per-anchor Pearson correlation between latent cosine logits and
+    /// counted-Tanimoto scores, averaged over valid anchors. Range
+    /// `[-1, 1]`; higher is better.
+    pub tanimoto_ranking_pearson: f32,
+    /// Per-anchor Spearman rank correlation, averaged over valid
+    /// anchors. Range `[-1, 1]`; higher is better.
+    pub tanimoto_ranking_spearman: f32,
+    /// Counted-fingerprint Tanimoto similarity between reconstruction and
+    /// target.
     pub count_tanimoto: f32,
+    /// Binary-fingerprint Tanimoto similarity between reconstruction and
+    /// target.
     pub binary_tanimoto: f32,
 }
 
@@ -46,6 +67,9 @@ pub fn loss_metrics<B>(
 where
     B: Backend<FloatElem = f32>,
 {
+    let diagnostics = &losses.tanimoto_diagnostics;
+    let pair_count = diagnostics.pair_count;
+    let candidate_count = diagnostics.candidate_count;
     let data = Transaction::default()
         .register(loss)
         .register(losses.reconstruction.clone())
@@ -55,14 +79,19 @@ where
         .register(losses.tanimoto_ranking_accuracy.clone())
         .register(count_tanimoto)
         .register(binary_tanimoto)
+        .register(diagnostics.latent_logits.clone())
+        .register(diagnostics.candidate_scores.clone())
+        .register(diagnostics.best_positions.clone().float())
+        .register(diagnostics.valid_mask.clone())
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read training metrics: {source}")))?;
-    if data.len() != 8 {
+    if data.len() != 12 {
         return Err(invalid_input(format!(
-            "training metrics transaction returned {} tensors instead of 8",
+            "training metrics transaction returned {} tensors instead of 12",
             data.len()
         )));
     }
+    let quality = ranking_quality_from_data(&data[8..12], pair_count, candidate_count)?;
     Ok(BatchLossMetrics {
         loss: scalar_data(&data[0], "loss")?,
         reconstruction: scalar_data(&data[1], "reconstruction loss")?,
@@ -70,6 +99,9 @@ where
         descriptors: scalar_data(&data[3], "descriptor loss")?,
         tanimoto_ranking: scalar_data(&data[4], "Tanimoto geometry loss")?,
         tanimoto_ranking_accuracy: scalar_data(&data[5], "Tanimoto geometry accuracy")?,
+        tanimoto_ranking_mrr: quality.mrr,
+        tanimoto_ranking_pearson: quality.pearson,
+        tanimoto_ranking_spearman: quality.spearman,
         count_tanimoto: scalar_data(&data[6], "count Tanimoto")?,
         binary_tanimoto: scalar_data(&data[7], "binary Tanimoto")?,
     })
@@ -86,6 +118,9 @@ pub fn validation_metrics<B>(
 where
     B: Backend<FloatElem = f32>,
 {
+    let diagnostics = &losses.tanimoto_diagnostics;
+    let pair_count = diagnostics.pair_count;
+    let candidate_count = diagnostics.candidate_count;
     let data = Transaction::default()
         .register(loss)
         .register(losses.reconstruction.clone())
@@ -95,16 +130,21 @@ where
         .register(losses.tanimoto_ranking_accuracy.clone())
         .register(count_tanimoto)
         .register(binary_tanimoto)
+        .register(diagnostics.latent_logits.clone())
+        .register(diagnostics.candidate_scores.clone())
+        .register(diagnostics.best_positions.clone().float())
+        .register(diagnostics.valid_mask.clone())
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read validation metrics: {source}")))?;
-    if data.len() != 8 {
+    if data.len() != 12 {
         return Err(invalid_input(format!(
-            "validation metrics transaction returned {} tensors instead of 8",
+            "validation metrics transaction returned {} tensors instead of 12",
             data.len()
         )));
     }
     let count_tanimoto = scalar_data(&data[6], "count Tanimoto")?;
     let binary_tanimoto = scalar_data(&data[7], "binary Tanimoto")?;
+    let quality = ranking_quality_from_data(&data[8..12], pair_count, candidate_count)?;
     Ok((
         BatchLossMetrics {
             loss: scalar_data(&data[0], "loss")?,
@@ -113,6 +153,9 @@ where
             descriptors: scalar_data(&data[3], "descriptor loss")?,
             tanimoto_ranking: scalar_data(&data[4], "Tanimoto geometry loss")?,
             tanimoto_ranking_accuracy: scalar_data(&data[5], "Tanimoto geometry accuracy")?,
+            tanimoto_ranking_mrr: quality.mrr,
+            tanimoto_ranking_pearson: quality.pearson,
+            tanimoto_ranking_spearman: quality.spearman,
             count_tanimoto,
             binary_tanimoto,
         },
@@ -121,6 +164,54 @@ where
     ))
 }
 
+/// Extracts the ranking-quality scalars from the trailing four
+/// Transaction slots produced by [`loss_metrics`] /
+/// [`validation_metrics`]. Slot order is `[latent_logits,
+/// candidate_scores, best_positions_as_float, valid_mask]`.
+fn ranking_quality_from_data(
+    slots: &[TensorData],
+    pair_count: usize,
+    candidate_count: usize,
+) -> AppResult<molecular_autoencoder::TanimotoRankingQuality> {
+    assert_eq!(
+        slots.len(),
+        4,
+        "ranking quality slot window must carry exactly 4 entries"
+    );
+    if pair_count == 0 || candidate_count == 0 {
+        return Ok(molecular_autoencoder::TanimotoRankingQuality::default());
+    }
+    let latent_logits = slots[0]
+        .as_slice::<f32>()
+        .map_err(|source| invalid_input(format!("latent logits tensor not f32: {source}")))?;
+    let candidate_scores = slots[1]
+        .as_slice::<f32>()
+        .map_err(|source| invalid_input(format!("candidate scores tensor not f32: {source}")))?;
+    // `best_positions` was registered as a float-cast of the int tensor so
+    // the Transaction returns it under a uniform dtype; we round back to
+    // integers host-side.
+    let best_positions_f32 = slots[2]
+        .as_slice::<f32>()
+        .map_err(|source| invalid_input(format!("best positions tensor not f32: {source}")))?;
+    let best_positions: Vec<i32> = best_positions_f32
+        .iter()
+        .map(|value| value.round() as i32)
+        .collect();
+    let valid_mask = slots[3]
+        .as_slice::<f32>()
+        .map_err(|source| invalid_input(format!("valid mask tensor not f32: {source}")))?;
+    Ok(tanimoto_ranking_quality(
+        latent_logits,
+        candidate_scores,
+        &best_positions,
+        valid_mask,
+        pair_count,
+        candidate_count,
+    ))
+}
+
+/// Unwraps a single-element `f32` scalar from a `TensorData` slot, returning
+/// a labeled error on dtype / shape mismatch.
 fn scalar_data(data: &TensorData, label: &str) -> AppResult<f32> {
     let values = data
         .as_slice::<f32>()
@@ -151,20 +242,29 @@ pub fn millis_per_batch(duration: Duration, batches: usize) -> f64 {
 
 /// Periodically logs aggregate dataloader timing per phase.
 pub struct LoaderProfileReporter {
+    /// Phase tag (`"train"` / `"valid"`) included in every log line.
     phase: &'static str,
+    /// Flush summary after this many batches; `0` disables logging.
     every: usize,
+    /// Accumulated counters / durations since the last flush.
     summary: LoaderProfileSummary,
 }
 
+/// Running totals aggregated across the current reporter window.
 #[derive(Debug, Clone, Copy, Default)]
 struct LoaderProfileSummary {
+    /// Batches accumulated in the current window.
     batches: usize,
+    /// Rows accumulated in the current window.
     rows: usize,
+    /// Wall time the consumer waited for batches in the current window.
     wait: Duration,
+    /// Producer-side per-stage timing accumulators.
     profile: BatchLoadProfile,
 }
 
 impl LoaderProfileReporter {
+    /// Creates a reporter that flushes a profile line every `every` batches.
     pub fn new(phase: &'static str, every: usize) -> Self {
         Self {
             phase,
@@ -173,6 +273,7 @@ impl LoaderProfileReporter {
         }
     }
 
+    /// Records a single batch's timing, flushing if the window is full.
     pub fn record(&mut self, wait: Duration, rows: usize, profile: BatchLoadProfile) {
         if self.every == 0 {
             return;
@@ -193,6 +294,7 @@ impl LoaderProfileReporter {
         }
     }
 
+    /// Emits a `loader_profile` stderr line and resets the running summary.
     fn flush(&mut self) {
         if self.summary.batches == 0 {
             return;

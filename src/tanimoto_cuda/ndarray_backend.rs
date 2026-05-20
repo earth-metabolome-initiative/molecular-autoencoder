@@ -33,7 +33,12 @@ where
         counts: FloatTensor<Self>,
         mask: FloatTensor<Self>,
         config: CountedTanimotoRankingKernelConfig,
-    ) -> (IntTensor<Self>, IntTensor<Self>, FloatTensor<Self>) {
+    ) -> (
+        IntTensor<Self>,
+        IntTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
         let indices_tensor: Tensor<Self, 2, Int> = Tensor::from_primitive(indices);
         let counts_tensor: Tensor<Self, 2> = Tensor::from_primitive(TensorPrimitive::Float(counts));
         let mask_tensor: Tensor<Self, 2> = Tensor::from_primitive(TensorPrimitive::Float(mask));
@@ -79,6 +84,7 @@ where
         let mut candidate_index_buf = Vec::with_capacity(config.batch_items() * candidate_count);
         let mut best_position_buf = Vec::with_capacity(config.batch_items());
         let mut top2_gap_buf = Vec::with_capacity(config.batch_items());
+        let mut candidate_score_buf = Vec::with_capacity(config.batch_items() * candidate_count);
 
         for anchor in 0..config.batch_items() {
             let result = ranking_reference(&rows, anchor, config);
@@ -88,6 +94,7 @@ where
                     .expect("best candidate position fits in i64"),
             );
             top2_gap_buf.push(result.top2_gap);
+            candidate_score_buf.extend(result.candidate_scores);
         }
 
         let candidate_index = Tensor::<Self, 2, Int>::from_data(
@@ -106,7 +113,18 @@ where
         )
         .into_primitive()
         .tensor();
+        let candidate_scores = Tensor::<Self, 2>::from_data(
+            TensorData::new(candidate_score_buf, [config.batch_items(), candidate_count]),
+            &device,
+        )
+        .into_primitive()
+        .tensor();
 
-        (candidate_index, best_candidate_position, top2_gap)
+        (
+            candidate_index,
+            best_candidate_position,
+            top2_gap,
+            candidate_scores,
+        )
     }
 }

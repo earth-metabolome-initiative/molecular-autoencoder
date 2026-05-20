@@ -16,7 +16,7 @@ use crate::{
     batch::{MoleculeAutoencoderBatch, SparseFingerprintBatch},
     features::REGRESSION_TARGET_WIDTH,
     fingerprints::{DEFAULT_ECFP_RADIUS, DEFAULT_ECFP_SIZE},
-    ranking::weighted_tanimoto_ranking_output,
+    ranking::{TanimotoRankingDiagnostics, weighted_tanimoto_ranking_output},
 };
 
 /// Default latent embedding width for the v1 architecture.
@@ -81,38 +81,48 @@ pub const DEFAULT_BCE_NONZERO_WEIGHT: f64 = 1.0;
 // `const`, so these tiny shim fns exist solely so deserializers can default
 // missing JSON fields. Their bodies must stay in sync with the public consts
 // above; do not edit one without the other.
+
+/// Serde fallback for the descriptor-head loss weight.
 const fn default_descriptor_weight() -> f64 {
     DEFAULT_DESCRIPTOR_WEIGHT
 }
 
+/// Serde fallback for the Tanimoto ranking loss weight.
 const fn default_tanimoto_ranking_weight() -> f64 {
     DEFAULT_TANIMOTO_RANKING_WEIGHT
 }
 
+/// Serde fallback for the latent-noise standard deviation.
 const fn default_latent_noise_std() -> f64 {
     DEFAULT_LATENT_NOISE_STD
 }
 
+/// Serde fallback for the latent cosine-logit temperature.
 const fn default_tanimoto_ranking_latent_temperature() -> f64 {
     DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE
 }
 
+/// Serde fallback for the metric-side temperature kept for diagnostics.
 const fn default_tanimoto_ranking_metric_temperature() -> f64 {
     DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE
 }
 
+/// Serde fallback for the counted-ECFP radius hyperparameter.
 const fn default_ecfp_radius() -> u8 {
     DEFAULT_ECFP_RADIUS
 }
 
+/// Serde fallback for the bit-presence BCE term weight.
 const fn default_bce_weight() -> f64 {
     DEFAULT_BCE_WEIGHT
 }
 
+/// Serde fallback for the zero-target BCE per-position weight.
 const fn default_bce_zero_weight() -> f64 {
     DEFAULT_BCE_ZERO_WEIGHT
 }
 
+/// Serde fallback for the active-bin BCE per-position weight.
 const fn default_bce_nonzero_weight() -> f64 {
     DEFAULT_BCE_NONZERO_WEIGHT
 }
@@ -120,8 +130,13 @@ const fn default_bce_nonzero_weight() -> f64 {
 /// Encoder model configuration. Construct via [`EncoderConfig::builder`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncoderConfig {
+    /// Width of the dense input vector fed to the first encoder layer
+    /// (equals the counted ECFP fingerprint size).
     input_width: usize,
+    /// Width of each ReLU-activated hidden layer between input and
+    /// latent. Must be non-empty.
     hidden_widths: Vec<usize>,
+    /// Width of the latent embedding produced by the final linear layer.
     latent_width: usize,
 }
 
@@ -174,8 +189,11 @@ impl EncoderConfig {
 /// Fluent builder for [`EncoderConfig`].
 #[derive(Debug, Clone)]
 pub struct EncoderConfigBuilder {
+    /// Pending input width; `None` until [`Self::input_width`] is called.
     input_width: Option<usize>,
+    /// Pending hidden layer widths; `None` until set.
     hidden_widths: Option<Vec<usize>>,
+    /// Pending latent width; `None` until set.
     latent_width: Option<usize>,
 }
 
@@ -265,8 +283,13 @@ impl EncoderConfigBuilder {
 /// Decoder model configuration. Construct via [`DecoderConfig::builder`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecoderConfig {
+    /// Width of the latent embedding fed to the first decoder layer.
     latent_width: usize,
+    /// Width of each ReLU-activated hidden layer between latent and
+    /// output. May be empty (linear projection from latent to output).
     hidden_widths: Vec<usize>,
+    /// Reconstructed log-count width emitted by the decoder; equals the
+    /// counted ECFP fingerprint size.
     output_width: usize,
 }
 
@@ -315,8 +338,11 @@ impl DecoderConfig {
 /// Fluent builder for [`DecoderConfig`].
 #[derive(Debug, Clone)]
 pub struct DecoderConfigBuilder {
+    /// Pending latent width; `None` until [`Self::latent_width`] is called.
     latent_width: Option<usize>,
+    /// Pending hidden layer widths; `None` defaults to an empty Vec.
     hidden_widths: Option<Vec<usize>>,
+    /// Pending output width; `None` until [`Self::output_width`] is called.
     output_width: Option<usize>,
 }
 
@@ -400,13 +426,20 @@ impl DecoderConfigBuilder {
 /// [`ReconstructionLossConfig::builder`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ReconstructionLossConfig {
+    /// Huber transition point in `log1p(count)` space.
     beta: f64,
+    /// Per-position weight for zero-count target bins.
     zero_weight: f64,
+    /// Per-position weight for nonzero-count target bins.
     nonzero_weight: f64,
+    /// Total weight for the auxiliary bit-presence BCE-with-logits term;
+    /// `0.0` disables the BCE branch entirely.
     #[serde(default = "default_bce_weight")]
     bce_weight: f64,
+    /// Per-position weight applied to inactive bins inside the BCE term.
     #[serde(default = "default_bce_zero_weight")]
     bce_zero_weight: f64,
+    /// Per-position weight applied to active bins inside the BCE term.
     #[serde(default = "default_bce_nonzero_weight")]
     bce_nonzero_weight: f64,
 }
@@ -467,11 +500,17 @@ impl ReconstructionLossConfig {
 /// Fluent builder for [`ReconstructionLossConfig`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReconstructionLossConfigBuilder {
+    /// Pending Huber transition point.
     beta: f64,
+    /// Pending zero-bin weight.
     zero_weight: f64,
+    /// Pending nonzero-bin weight.
     nonzero_weight: f64,
+    /// Pending overall BCE term weight.
     bce_weight: f64,
+    /// Pending per-position BCE weight for inactive bins.
     bce_zero_weight: f64,
+    /// Pending per-position BCE weight for active bins.
     bce_nonzero_weight: f64,
 }
 
@@ -579,8 +618,10 @@ impl ReconstructionLossConfigBuilder {
 /// Auxiliary side-task weights. Construct via [`AuxiliaryLossWeights::builder`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AuxiliaryLossWeights {
+    /// Weight applied to the scalar descriptor regression side task.
     #[serde(default = "default_descriptor_weight")]
     descriptors: f64,
+    /// Weight applied to the latent Tanimoto geometry side task.
     #[serde(default = "default_tanimoto_ranking_weight")]
     tanimoto_ranking: f64,
 }
@@ -617,7 +658,9 @@ impl AuxiliaryLossWeights {
 /// Fluent builder for [`AuxiliaryLossWeights`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AuxiliaryLossWeightsBuilder {
+    /// Pending descriptor regression weight.
     descriptors: f64,
+    /// Pending latent Tanimoto geometry weight.
     tanimoto_ranking: f64,
 }
 
@@ -679,16 +722,26 @@ impl AuxiliaryLossWeightsBuilder {
 /// Construct via [`TanimotoRankingConfig::builder`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TanimotoRankingConfig {
+    /// Temperature divisor applied to the latent cosine logits before
+    /// the softmax. Older configs surface this as `margin`; the aliases
+    /// are kept for backwards compatibility.
     #[serde(
         default = "default_tanimoto_ranking_latent_temperature",
         alias = "margin",
         alias = "tanimoto_ranking_margin"
     )]
     latent_temperature: f64,
+    /// Compatibility temperature retained for diagnostics; unused by
+    /// the current softmax loss.
     #[serde(default = "default_tanimoto_ranking_metric_temperature")]
     metric_temperature: f64,
+    /// Minimum counted-Tanimoto top-1 / top-2 gap an anchor must clear
+    /// to contribute to the loss.
     min_gap: f64,
+    /// Random candidate partners sampled per anchor by the GPU kernel.
     candidates_per_anchor: usize,
+    /// Maximum anchors used per batch by the geometry loss; `0` uses
+    /// every row.
     pairs_per_batch: usize,
 }
 
@@ -741,10 +794,15 @@ impl TanimotoRankingConfig {
 /// Fluent builder for [`TanimotoRankingConfig`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TanimotoRankingConfigBuilder {
+    /// Pending latent cosine-logit temperature.
     latent_temperature: f64,
+    /// Pending compatibility metric temperature.
     metric_temperature: f64,
+    /// Pending minimum metric gap.
     min_gap: f64,
+    /// Pending candidate partners per anchor.
     candidates_per_anchor: usize,
+    /// Pending maximum anchors per batch (`0` for all).
     pairs_per_batch: usize,
 }
 
@@ -850,11 +908,19 @@ impl TanimotoRankingConfigBuilder {
 /// loops can pass a single value around without re-reading the model config.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TanimotoRankingRuntimeConfig {
+    /// Weight applied to the Tanimoto geometry loss component.
     weight: f64,
+    /// Temperature divisor for the latent cosine-similarity logits.
     latent_temperature: f64,
+    /// Compatibility temperature kept for diagnostics; unused by the
+    /// current softmax loss.
     metric_temperature: f64,
+    /// Minimum top-1 / top-2 metric gap required for an anchor to
+    /// contribute to the loss.
     min_gap: f64,
+    /// Random candidate partners sampled per anchor by the GPU kernel.
     candidates_per_anchor: usize,
+    /// Maximum anchors used per batch; `0` uses every row.
     pairs_per_batch: usize,
 }
 
@@ -900,15 +966,25 @@ impl TanimotoRankingRuntimeConfig {
 /// [`MoleculeAutoencoderConfig::builder`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoleculeAutoencoderConfig {
+    /// Encoder MLP shape (fingerprint → latent).
     encoder: EncoderConfig,
+    /// Decoder MLP shape (latent → reconstructed fingerprint).
     decoder: DecoderConfig,
+    /// Width of the scalar descriptor regression side head.
     descriptor_width: usize,
+    /// Per-bin reconstruction loss parameters (Huber β + BCE knobs).
     reconstruction_loss: ReconstructionLossConfig,
+    /// Side-task weights bundled together for clarity.
     auxiliary_weights: AuxiliaryLossWeights,
+    /// Hyperparameters for the latent Tanimoto geometry loss.
     #[serde(default)]
     tanimoto_ranking: TanimotoRankingConfig,
+    /// Standard deviation of the Gaussian noise injected into the
+    /// decoder-side latent during training (`0.0` disables denoising).
     #[serde(default = "default_latent_noise_std")]
     latent_noise_std: f64,
+    /// ECFP radius used by the preprocessing pipeline (must match the
+    /// shards being trained on).
     #[serde(default = "default_ecfp_radius")]
     ecfp_radius: u8,
 }
@@ -1200,20 +1276,37 @@ impl Default for MoleculeAutoencoderConfig {
 /// [`MoleculeAutoencoderConfig::validate`] before returning it.
 #[derive(Debug, Clone)]
 pub struct MoleculeAutoencoderConfigBuilder {
+    /// Counted ECFP fingerprint width that the encoder reads in.
     fingerprint_size: usize,
+    /// Width of the latent embedding produced by the encoder.
     latent_width: usize,
+    /// Hidden-layer widths shared by the encoder and (mirrored) the
+    /// decoder.
     hidden_widths: Vec<usize>,
+    /// Weight applied to the descriptor regression side task.
     descriptor_weight: f64,
+    /// Weight applied to the latent Tanimoto geometry side task.
     tanimoto_ranking_weight: f64,
+    /// Standard deviation of the Gaussian noise injected into the
+    /// decoder-side latent at training time.
     latent_noise_std: f64,
+    /// Temperature divisor for latent cosine logits in the ranking loss.
     latent_temperature: f64,
+    /// Compatibility temperature retained for diagnostics.
     metric_temperature: f64,
+    /// Minimum metric gap an anchor must clear to contribute.
     min_gap: f64,
+    /// Random candidate partners sampled per anchor.
     candidates_per_anchor: usize,
+    /// Maximum anchors used per batch by the geometry loss.
     pairs_per_batch: usize,
+    /// ECFP radius matching the cached preprocessing pipeline.
     ecfp_radius: u8,
+    /// Auxiliary bit-presence BCE term weight.
     bce_weight: f64,
+    /// Per-position BCE weight for inactive bins.
     bce_zero_weight: f64,
+    /// Per-position BCE weight for active bins.
     bce_nonzero_weight: f64,
 }
 
@@ -1402,9 +1495,13 @@ impl MoleculeAutoencoderConfigBuilder {
 /// Encoder module.
 #[derive(Module, Debug)]
 pub struct Encoder<B: Backend> {
+    /// Sparse-aware input projection.
     input: SparseInputLinear<B>,
+    /// Stacked hidden ReLU-activated linear layers.
     layers: Vec<Linear<B>>,
+    /// Final linear projection into the latent space.
     latent: Linear<B>,
+    /// Shared ReLU activation reused across hidden layers.
     activation: Relu,
 }
 
@@ -1431,6 +1528,7 @@ impl<B: Backend> Encoder<B> {
 /// Linear input projection for padded sparse counted fingerprints.
 #[derive(Module, Debug)]
 pub struct SparseInputLinear<B: Backend> {
+    /// Underlying dense linear layer (`xW + b`).
     linear: Linear<B>,
 }
 
@@ -1449,8 +1547,11 @@ impl<B: Backend> SparseInputLinear<B> {
 /// Decoder module.
 #[derive(Module, Debug)]
 pub struct Decoder<B: Backend> {
+    /// Stacked hidden ReLU-activated linear layers.
     layers: Vec<Linear<B>>,
+    /// Final linear projection back to the reconstruction width.
     output: Linear<B>,
+    /// Shared ReLU activation reused across hidden layers.
     activation: Relu,
 }
 
@@ -1492,6 +1593,11 @@ pub struct MoleculeLossBreakdown<B: Backend> {
     pub tanimoto_ranking_accuracy: Tensor<B, 1>,
     /// Number of valid anchors contributing to the Tanimoto geometry loss.
     pub tanimoto_ranking_pairs: Tensor<B, 1>,
+    /// Per-anchor tensors the metric pipeline scores host-side to
+    /// compute MRR / Pearson / Spearman after the next Transaction
+    /// round-trip. Empty (zero-sized shapes) when the ranking loss is
+    /// disabled or the batch is too small to contribute.
+    pub tanimoto_diagnostics: TanimotoRankingDiagnostics<B>,
 }
 
 impl<B: Backend> MoleculeLossBreakdown<B> {
@@ -1507,25 +1613,47 @@ impl<B: Backend> MoleculeLossBreakdown<B> {
 /// Dense counted-fingerprint molecular autoencoder.
 #[derive(Module, Debug)]
 pub struct MoleculeAutoencoder<B: Backend> {
+    /// Encoder branch (fingerprint → latent).
     encoder: Encoder<B>,
+    /// Decoder branch (latent → reconstructed log-count fingerprint).
     decoder: Decoder<B>,
+    /// Side head producing scalar descriptor regression predictions
+    /// from the latent.
     descriptor_head: Linear<B>,
+    /// Huber transition point in `log1p(count)` space.
     reconstruction_beta: f64,
+    /// Per-position weight for zero-count target bins.
     zero_weight: f64,
+    /// Per-position weight for nonzero-count target bins.
     nonzero_weight: f64,
+    /// Total weight for the auxiliary BCE-with-logits bit-presence term.
     bce_weight: f64,
+    /// Per-position BCE weight for inactive bins.
     bce_zero_weight: f64,
+    /// Per-position BCE weight for active bins.
     bce_nonzero_weight: f64,
+    /// Side-task weight for the descriptor regression head.
     descriptor_weight: f64,
+    /// Side-task weight for the latent Tanimoto geometry head.
     tanimoto_ranking_weight: f64,
+    /// Temperature divisor for latent cosine logits inside the ranking
+    /// loss.
     tanimoto_ranking_latent_temperature: f64,
+    /// Compatibility temperature retained for diagnostics.
     tanimoto_ranking_metric_temperature: f64,
+    /// Minimum metric gap required for an anchor to contribute.
     tanimoto_ranking_min_gap: f64,
+    /// Maximum anchors used per batch by the geometry loss.
     tanimoto_ranking_pairs_per_batch: usize,
+    /// Standard deviation of the Gaussian noise injected into the
+    /// decoder-side latent at training time.
     latent_noise_std: f64,
 }
 
 impl<B: Backend> MoleculeAutoencoder<B> {
+    /// Reconstructs the per-bin reconstruction-loss config from the
+    /// scalar fields stored on the module (Burn modules can't hold
+    /// nested config structs directly).
     fn reconstruction_loss_config(&self) -> ReconstructionLossConfig {
         ReconstructionLossConfig {
             beta: self.reconstruction_beta,
@@ -1636,6 +1764,7 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             tanimoto_ranking: tanimoto.loss,
             tanimoto_ranking_accuracy: tanimoto.accuracy,
             tanimoto_ranking_pairs: tanimoto.valid_pairs,
+            tanimoto_diagnostics: tanimoto.diagnostics,
         }
     }
 }
@@ -1672,6 +1801,8 @@ pub fn apply_latent_noise<B: Backend>(latent: Tensor<B, 2>, std_fraction: f64) -
     latent + noise * scale
 }
 
+/// Element-wise Huber loss given a precomputed `delta = |ẑ - z|`:
+/// quadratic for `delta <= beta`, linear otherwise.
 fn huber_from_delta<B: Backend>(delta: Tensor<B, 2>, beta: f64) -> Tensor<B, 2> {
     let quadratic = delta.clone().powf_scalar(2.0) * (0.5 / beta);
     let linear = delta.clone() - (0.5 * beta);
@@ -1699,6 +1830,8 @@ pub fn weighted_log_count_huber_loss<B: Backend>(
     (huber * weights).mean()
 }
 
+/// Numerically stable element-wise softplus used by the BCE
+/// reconstruction branch.
 fn softplus<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
     // Numerically stable softplus: max(x, 0) + log(1 + exp(-|x|)).
     let neg_abs = x.clone().abs() * -1.0;

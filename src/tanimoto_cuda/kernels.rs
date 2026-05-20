@@ -1,5 +1,8 @@
 use burn_cubecl::cubecl::prelude::*;
 
+/// CubeCL `#[cube]` kernel that scores `candidates_per_anchor` partners
+/// per anchor and writes their indices, the best-position label, the
+/// top-2 score gap, and the full per-candidate Tanimoto score vector.
 #[allow(clippy::comparison_chain)]
 #[cube(launch)]
 pub(super) fn counted_tanimoto_similarity_ranking_forward<F: Float, I: Int>(
@@ -9,6 +12,7 @@ pub(super) fn counted_tanimoto_similarity_ranking_forward<F: Float, I: Int>(
     candidate_index: &mut Tensor<I>,
     best_candidate_position: &mut Tensor<I>,
     top2_gap: &mut Tensor<F>,
+    candidate_scores: &mut Tensor<F>,
     batch_items: u32,
     candidates_per_anchor: u32,
     seed: u32,
@@ -78,6 +82,8 @@ pub(super) fn counted_tanimoto_similarity_ranking_forward<F: Float, I: Int>(
 
         let score =
             sparse_count_tanimoto_score_rows(indices, counts, mask, anchor, local_partner, eps);
+        candidate_scores[anchor * candidate_scores.stride(0)
+            + candidate_position * candidate_scores.stride(1)] = score;
         if score > best_score {
             second_best_score = best_score;
             best_score = score;
@@ -91,6 +97,9 @@ pub(super) fn counted_tanimoto_similarity_ranking_forward<F: Float, I: Int>(
     top2_gap[anchor] = (best_score - second_best_score).max(zero).min(one);
 }
 
+/// Device-side counted Tanimoto similarity between two rows of the
+/// sparse fingerprint batch, mirroring the host-side
+/// [`super::cpu::counted_tanimoto`] formula bit-for-bit.
 #[cube]
 fn sparse_count_tanimoto_score_rows<F: Float, I: Int>(
     indices: &Tensor<I>,

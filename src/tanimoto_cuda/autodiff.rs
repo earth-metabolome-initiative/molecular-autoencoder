@@ -16,7 +16,12 @@ where
         counts: FloatTensor<Self>,
         mask: FloatTensor<Self>,
         config: CountedTanimotoRankingKernelConfig,
-    ) -> (IntTensor<Self>, IntTensor<Self>, FloatTensor<Self>) {
+    ) -> (
+        IntTensor<Self>,
+        IntTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
         #[derive(Debug)]
         struct NoGradientBackward;
 
@@ -35,41 +40,44 @@ where
             }
         }
 
-        match NoGradientBackward
+        // The two float outputs (top2_gap and candidate_scores) are
+        // metric-side artifacts: gradients should not flow through them
+        // because they're derived from the metric fingerprints rather
+        // than the latent embeddings the autodiff graph cares about.
+        // We wrap both as autodiff-tracked nodes with a no-op backward
+        // so callers can still hand them to downstream tensor ops
+        // without losing the graph; their gradients are simply dropped.
+        let prep_a = NoGradientBackward
             .prepare::<C>([counts.node.clone(), mask.node.clone()])
             .compute_bound()
-            .stateful()
-        {
-            OpsKind::Tracked(prep) => {
-                let (candidate_index, best_candidate_position, top2_gap) =
-                    B::counted_tanimoto_similarity_ranking_kernel(
-                        indices.clone(),
-                        counts.primitive.clone(),
-                        mask.primitive.clone(),
-                        config,
-                    );
+            .stateful();
+        let prep_b = NoGradientBackward
+            .prepare::<C>([counts.node.clone(), mask.node.clone()])
+            .compute_bound()
+            .stateful();
 
-                (
-                    candidate_index,
-                    best_candidate_position,
-                    prep.finish((), top2_gap),
-                )
-            }
-            OpsKind::UnTracked(prep) => {
-                let (candidate_index, best_candidate_position, top2_gap) =
-                    B::counted_tanimoto_similarity_ranking_kernel(
-                        indices,
-                        counts.primitive,
-                        mask.primitive,
-                        config,
-                    );
+        let (candidate_index, best_candidate_position, top2_gap, candidate_scores) =
+            B::counted_tanimoto_similarity_ranking_kernel(
+                indices,
+                counts.primitive,
+                mask.primitive,
+                config,
+            );
 
-                (
-                    candidate_index,
-                    best_candidate_position,
-                    prep.finish(top2_gap),
-                )
-            }
-        }
+        let top2_gap = match prep_a {
+            OpsKind::Tracked(prep) => prep.finish((), top2_gap),
+            OpsKind::UnTracked(prep) => prep.finish(top2_gap),
+        };
+        let candidate_scores = match prep_b {
+            OpsKind::Tracked(prep) => prep.finish((), candidate_scores),
+            OpsKind::UnTracked(prep) => prep.finish(candidate_scores),
+        };
+
+        (
+            candidate_index,
+            best_candidate_position,
+            top2_gap,
+            candidate_scores,
+        )
     }
 }

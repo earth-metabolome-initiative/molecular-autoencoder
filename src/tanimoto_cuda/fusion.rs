@@ -19,7 +19,12 @@ where
         counts: FloatTensor<Self>,
         mask: FloatTensor<Self>,
         config: CountedTanimotoRankingKernelConfig,
-    ) -> (IntTensor<Self>, IntTensor<Self>, FloatTensor<Self>) {
+    ) -> (
+        IntTensor<Self>,
+        IntTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
         let [index_rows, index_width] = indices.shape.dims();
         let [count_rows, count_width] = counts.shape.dims();
         let [mask_rows, mask_width] = mask.shape.dims();
@@ -44,6 +49,7 @@ where
         let candidate_shape = Shape::new([config.batch_items(), candidate_count]);
         let index_shape = Shape::new([config.batch_items()]);
         let gap_shape = Shape::new([config.batch_items()]);
+        let score_shape = Shape::new([config.batch_items(), candidate_count]);
         let candidate_index = TensorIr::uninit(
             client.create_empty_handle(),
             candidate_shape,
@@ -55,10 +61,17 @@ where
             B::IntElem::dtype(),
         );
         let top2_gap = TensorIr::uninit(client.create_empty_handle(), gap_shape, counts.dtype);
+        let candidate_scores =
+            TensorIr::uninit(client.create_empty_handle(), score_shape, counts.dtype);
         let desc = CustomOpIr::new(
             "counted_tanimoto_similarity_ranking_forward",
             &[indices.into_ir(), counts.into_ir(), mask.into_ir()],
-            &[candidate_index, best_candidate_position, top2_gap],
+            &[
+                candidate_index,
+                best_candidate_position,
+                top2_gap,
+                candidate_scores,
+            ],
         );
 
         let mut outputs = client.register(
@@ -70,6 +83,9 @@ where
                 backend: PhantomData,
             },
         );
+        let candidate_scores = outputs
+            .pop()
+            .expect("Tanimoto geometry custom op has candidate-scores output");
         let top2_gap = outputs
             .pop()
             .expect("Tanimoto geometry custom op has top-2 gap output");
@@ -80,15 +96,26 @@ where
             .pop()
             .expect("Tanimoto geometry custom op has candidate-index output");
 
-        (candidate_index, best_candidate_position, top2_gap)
+        (
+            candidate_index,
+            best_candidate_position,
+            top2_gap,
+            candidate_scores,
+        )
     }
 }
 
+/// Fusion `Operation` shim that re-executes the counted-Tanimoto ranking
+/// kernel via the inner backend when Burn's fusion runtime decides to flush
+/// the recorded ops.
 #[cfg(feature = "cuda-fusion")]
 #[derive(Debug)]
 struct CountedTanimotoRankingFusionForward<B: FusionBackend> {
+    /// Fusion-IR descriptor mapping the recorded inputs/outputs to handles.
     desc: CustomOpIr,
+    /// Kernel configuration captured at record time and replayed verbatim.
     config: CountedTanimotoRankingKernelConfig,
+    /// Phantom binding tying the operation to the inner fusion backend.
     backend: PhantomData<B>,
 }
 
@@ -98,8 +125,8 @@ where
     B: FusionBackend + CountedTanimotoKernelBackend + Send + Sync,
 {
     fn execute(&self, handles: &mut burn_ir::HandleContainer<B::Handle>) {
-        let (inputs, outputs) = self.desc.as_fixed::<3, 3>();
-        let (candidate_index, best_candidate_position, top2_gap) =
+        let (inputs, outputs) = self.desc.as_fixed::<3, 4>();
+        let (candidate_index, best_candidate_position, top2_gap, candidate_scores) =
             B::counted_tanimoto_similarity_ranking_kernel(
                 handles.get_int_tensor::<B>(&inputs[0]),
                 handles.get_float_tensor::<B>(&inputs[1]),
@@ -110,5 +137,6 @@ where
         handles.register_int_tensor::<B>(&outputs[0].id, candidate_index);
         handles.register_int_tensor::<B>(&outputs[1].id, best_candidate_position);
         handles.register_float_tensor::<B>(&outputs[2].id, top2_gap);
+        handles.register_float_tensor::<B>(&outputs[3].id, candidate_scores);
     }
 }

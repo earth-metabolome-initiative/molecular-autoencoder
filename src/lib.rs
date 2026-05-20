@@ -68,7 +68,8 @@ pub use model::{
     weighted_sparse_log_count_huber_loss,
 };
 pub use ranking::{
-    TanimotoRankingBatch, TanimotoRankingOutput, tanimoto_ranking_output,
+    TanimotoRankingBatch, TanimotoRankingDiagnostics, TanimotoRankingOutput,
+    TanimotoRankingQuality, tanimoto_ranking_output, tanimoto_ranking_quality,
     weighted_tanimoto_ranking_output,
 };
 #[cfg(feature = "train")]

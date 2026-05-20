@@ -3,6 +3,7 @@
 use burn::{backend::NdArray, prelude::*, tensor::Transaction, train::metric::ItemLazy};
 
 use crate::model::MoleculeLossBreakdown;
+use crate::ranking::TanimotoRankingDiagnostics;
 
 /// Autoencoder output adapted for Burn training loops.
 pub struct MoleculeAutoencoderTrainingOutput<B: Backend> {
@@ -62,6 +63,11 @@ impl<B: Backend> ItemLazy for MoleculeAutoencoderTrainingOutput<B> {
                 tanimoto_ranking: Tensor::from_data(tanimoto_ranking, device),
                 tanimoto_ranking_accuracy: Tensor::from_data(tanimoto_accuracy, device),
                 tanimoto_ranking_pairs: Tensor::from_data(tanimoto_pairs, device),
+                // The sync output is consumed by Burn's MetricEntry
+                // display path, which only ever reads the scalar loss
+                // tensors. Empty diagnostics keep the type-level
+                // contract without paying for additional registers.
+                tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(device),
             },
         }
     }
@@ -79,6 +85,9 @@ impl<B: Backend> MoleculeTrainingMetricsExt<B> for MoleculeAutoencoderTrainingOu
     }
 }
 
+/// Burn `TrainStep` / `InferenceStep` adapters that pull the model
+/// forward, build the loss breakdown, and wrap them in the training
+/// output shape Burn's learner expects.
 mod train_impl {
     use burn::{
         tensor::backend::AutodiffBackend,
@@ -172,6 +181,7 @@ mod tests {
             tanimoto_ranking: scalar::<B>(0.4, &device),
             tanimoto_ranking_accuracy: scalar::<B>(0.5, &device),
             tanimoto_ranking_pairs: scalar::<B>(2.0, &device),
+            tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(&device),
         };
 
         let output = MoleculeAutoencoderTrainingOutput::new(reconstruction, losses);
@@ -193,6 +203,7 @@ mod tests {
                 tanimoto_ranking: scalar::<B>(0.4, &device),
                 tanimoto_ranking_accuracy: scalar::<B>(0.5, &device),
                 tanimoto_ranking_pairs: scalar::<B>(2.0, &device),
+                tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(&device),
             },
         )
         .sync();

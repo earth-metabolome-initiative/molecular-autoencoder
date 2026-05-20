@@ -26,19 +26,33 @@ use crate::{AppResult, dataloader::BatchControl, metrics::BatchLossMetrics};
 /// Bundles the Burn TUI renderer with an indicatif fallback so the same call
 /// sites work in both interactive and CI/log environments.
 pub struct TrainingReporter {
+    /// Burn TUI renderer when stdout is a terminal.
     renderer: Option<Box<dyn MetricsRenderer>>,
+    /// Indicatif progress bars used when stdout is not a terminal.
     bars: Option<IndicatifTrainingBars>,
+    /// Burn-side cancellation handle propagated to renderer + run loop.
     interrupter: Interrupter,
+    /// Pre-allocated metric IDs for each named gauge.
     metric_ids: ReporterMetricIds,
+    /// Total training rows expected this run.
     train_total: usize,
+    /// Total validation rows expected this run.
     valid_total: usize,
+    /// Cumulative training rows processed so far (within the active
+    /// epoch).
     train_processed: usize,
+    /// Cumulative validation rows processed within the active epoch.
     valid_processed: usize,
+    /// Currently active training epoch, used to detect epoch
+    /// boundaries.
     train_epoch: Option<usize>,
+    /// Currently active validation epoch, used to detect epoch
+    /// boundaries.
     valid_epoch: Option<usize>,
 }
 
 impl TrainingReporter {
+    /// Builds a reporter sized for the upcoming run.
     pub fn new(
         row_count: usize,
         validation_per_mille: u16,
@@ -86,14 +100,19 @@ impl TrainingReporter {
         }
     }
 
+    /// Returns whether the Burn TUI renderer is the active surface.
     pub fn is_active(&self) -> bool {
         self.renderer.is_some()
     }
 
+    /// Returns whether the user has requested cancellation (Ctrl-C
+    /// caught by the renderer's interrupter).
     pub fn should_stop(&self) -> bool {
         self.interrupter.should_stop()
     }
 
+    /// Records one training batch on the renderer and indicatif
+    /// fallback. Returns whether the loop should continue or stop.
     #[allow(clippy::too_many_arguments)]
     pub fn train_batch(
         &mut self,
@@ -147,6 +166,21 @@ impl TrainingReporter {
                     examples,
                 ));
                 renderer.update_train(metric_state(
+                    self.metric_ids.tanimoto_ranking_mrr.clone(),
+                    metrics.tanimoto_ranking_mrr,
+                    examples,
+                ));
+                renderer.update_train(metric_state(
+                    self.metric_ids.tanimoto_ranking_pearson.clone(),
+                    metrics.tanimoto_ranking_pearson,
+                    examples,
+                ));
+                renderer.update_train(metric_state(
+                    self.metric_ids.tanimoto_ranking_spearman.clone(),
+                    metrics.tanimoto_ranking_spearman,
+                    examples,
+                ));
+                renderer.update_train(metric_state(
                     self.metric_ids.count_tanimoto.clone(),
                     metrics.count_tanimoto,
                     examples,
@@ -193,6 +227,8 @@ impl TrainingReporter {
         }
     }
 
+    /// Records one validation batch on the renderer and indicatif
+    /// fallback. Returns whether the loop should continue or stop.
     #[allow(clippy::too_many_arguments)]
     pub fn valid_batch(
         &mut self,
@@ -245,6 +281,21 @@ impl TrainingReporter {
                     metrics.tanimoto_ranking_accuracy,
                     examples,
                 ));
+                renderer.update_valid(metric_state(
+                    self.metric_ids.tanimoto_ranking_mrr.clone(),
+                    metrics.tanimoto_ranking_mrr,
+                    examples,
+                ));
+                renderer.update_valid(metric_state(
+                    self.metric_ids.tanimoto_ranking_pearson.clone(),
+                    metrics.tanimoto_ranking_pearson,
+                    examples,
+                ));
+                renderer.update_valid(metric_state(
+                    self.metric_ids.tanimoto_ranking_spearman.clone(),
+                    metrics.tanimoto_ranking_spearman,
+                    examples,
+                ));
             }
             renderer.update_valid(metric_state(
                 self.metric_ids.count_tanimoto.clone(),
@@ -292,6 +343,8 @@ impl TrainingReporter {
         }
     }
 
+    /// Tells the renderer and indicatif bars that the run is over so
+    /// they can clear their on-screen state.
     pub fn finish(&mut self) -> AppResult<()> {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.on_train_end(None)?;
@@ -303,24 +356,37 @@ impl TrainingReporter {
     }
 }
 
+/// Indicatif-based renderer fallback used when stdout is not a TTY.
 struct IndicatifTrainingBars {
+    /// Active progress bar; recreated whenever the
+    /// (phase, epoch) pair changes.
     bar: Option<ProgressBar>,
+    /// Phase tag associated with `bar`; `None` when no bar is active.
     phase: Option<ProgressPhase>,
 }
 
+/// Lightweight tag identifying which (phase, epoch) the current bar
+/// belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProgressPhase {
+    /// Train or validation phase tag.
     kind: ProgressKind,
+    /// Epoch index (1-based).
     epoch: usize,
 }
 
+/// Phase identifier for a single indicatif progress bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProgressKind {
+    /// Training phase.
     Train,
+    /// Validation phase.
     Valid,
 }
 
 impl IndicatifTrainingBars {
+    /// Constructs an empty progress-bar group; the first batch call
+    /// will allocate a fresh bar.
     fn new() -> Self {
         Self {
             bar: None,
@@ -329,6 +395,7 @@ impl IndicatifTrainingBars {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Renders one training batch on the indicatif bar.
     fn train_batch(
         &mut self,
         epoch: usize,
@@ -345,13 +412,16 @@ impl IndicatifTrainingBars {
         let step_ms = step_time.as_secs_f64() * 1000.0;
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} count_tan={:.4} bin_tan={:.4} data_ms={data_ms:.1} step_ms={step_ms:.1}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan={:.4} bin_tan={:.4} data_ms={data_ms:.1} step_ms={step_ms:.1}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.reconstruction_bce,
                 metrics.descriptors,
                 metrics.tanimoto_ranking,
                 metrics.tanimoto_ranking_accuracy,
+                metrics.tanimoto_ranking_mrr,
+                metrics.tanimoto_ranking_pearson,
+                metrics.tanimoto_ranking_spearman,
                 metrics.count_tanimoto,
                 metrics.binary_tanimoto,
             )),
@@ -359,6 +429,7 @@ impl IndicatifTrainingBars {
         }
     }
 
+    /// Renders one validation batch on the indicatif bar.
     #[allow(clippy::too_many_arguments)]
     fn valid_batch(
         &mut self,
@@ -374,13 +445,16 @@ impl IndicatifTrainingBars {
         bar.set_position(processed as u64);
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} count_tan={count_tanimoto:.4} bin_tan={binary_tanimoto:.4}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan={count_tanimoto:.4} bin_tan={binary_tanimoto:.4}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.reconstruction_bce,
                 metrics.descriptors,
                 metrics.tanimoto_ranking,
                 metrics.tanimoto_ranking_accuracy,
+                metrics.tanimoto_ranking_mrr,
+                metrics.tanimoto_ranking_pearson,
+                metrics.tanimoto_ranking_spearman,
             )),
             None => {
                 bar.set_message(format!(
@@ -390,6 +464,8 @@ impl IndicatifTrainingBars {
         }
     }
 
+    /// Finalises whichever bar is currently active and clears the
+    /// phase tracker.
     fn finish(&mut self) {
         if let Some(bar) = self.bar.take() {
             bar.finish_and_clear();
@@ -397,6 +473,8 @@ impl IndicatifTrainingBars {
         self.phase = None;
     }
 
+    /// Returns the active progress bar, allocating a fresh one when
+    /// the requested phase / epoch differs from the current one.
     fn phase_bar(
         &mut self,
         kind: ProgressKind,
@@ -424,30 +502,50 @@ impl IndicatifTrainingBars {
     }
 }
 
+/// Named gauges surfaced on the renderer / indicatif fallback.
 #[derive(Debug, Clone, Copy)]
 enum ReporterMetric {
+    /// Total weighted loss.
     Loss,
+    /// Counted ECFP reconstruction Huber loss.
     Reconstruction,
+    /// Bit-presence BCE auxiliary loss.
     ReconstructionBce,
+    /// Descriptor regression side-task loss.
     Descriptors,
+    /// Latent Tanimoto geometry softmax CE loss.
     TanimotoRanking,
+    /// Best-candidate accuracy for the geometry head.
     TanimotoRankingAccuracy,
+    /// Mean reciprocal rank for the geometry head.
+    TanimotoRankingMrr,
+    /// Per-anchor Pearson correlation for the geometry head.
+    TanimotoRankingPearson,
+    /// Per-anchor Spearman rank correlation for the geometry head.
+    TanimotoRankingSpearman,
+    /// Counted-Tanimoto reconstruction quality metric.
     CountTanimoto,
+    /// Binary-Tanimoto reconstruction quality metric.
     BinaryTanimoto,
 }
 
 impl ReporterMetric {
-    const ALL: [Self; 8] = [
+    /// All gauges in the canonical order the reporter renders them.
+    const ALL: [Self; 11] = [
         Self::Loss,
         Self::Reconstruction,
         Self::ReconstructionBce,
         Self::Descriptors,
         Self::TanimotoRanking,
         Self::TanimotoRankingAccuracy,
+        Self::TanimotoRankingMrr,
+        Self::TanimotoRankingPearson,
+        Self::TanimotoRankingSpearman,
         Self::CountTanimoto,
         Self::BinaryTanimoto,
     ];
 
+    /// Short human-readable label for the gauge.
     const fn name(self) -> &'static str {
         match self {
             Self::Loss => "Loss",
@@ -456,11 +554,15 @@ impl ReporterMetric {
             Self::Descriptors => "Descriptor Loss",
             Self::TanimotoRanking => "Tanimoto Geometry Loss",
             Self::TanimotoRankingAccuracy => "Tanimoto Geometry Accuracy",
+            Self::TanimotoRankingMrr => "Tanimoto Ranking MRR",
+            Self::TanimotoRankingPearson => "Tanimoto Ranking Pearson",
+            Self::TanimotoRankingSpearman => "Tanimoto Ranking Spearman",
             Self::CountTanimoto => "Count Tanimoto",
             Self::BinaryTanimoto => "Binary Tanimoto",
         }
     }
 
+    /// Long-form description shown in the TUI side panel.
     const fn description(self) -> &'static str {
         match self {
             Self::Loss => "weighted total loss",
@@ -471,18 +573,36 @@ impl ReporterMetric {
             Self::TanimotoRankingAccuracy => {
                 "latent best-candidate accuracy for sampled Tanimoto sets"
             }
+            Self::TanimotoRankingMrr => {
+                "mean reciprocal rank of the true best candidate in the latent-sorted order"
+            }
+            Self::TanimotoRankingPearson => {
+                "per-anchor Pearson correlation between latent cosine logits and Tanimoto scores"
+            }
+            Self::TanimotoRankingSpearman => {
+                "per-anchor Spearman rank correlation between latent cosine logits and Tanimoto scores"
+            }
             Self::CountTanimoto => "counted fingerprint Tanimoto reconstruction metric",
             Self::BinaryTanimoto => "binary fingerprint Tanimoto reconstruction metric",
         }
     }
 
+    /// Whether higher values indicate better quality (used by Burn's
+    /// renderer to colour gauges).
     const fn higher_is_better(self) -> bool {
         matches!(
             self,
-            Self::CountTanimoto | Self::BinaryTanimoto | Self::TanimotoRankingAccuracy
+            Self::CountTanimoto
+                | Self::BinaryTanimoto
+                | Self::TanimotoRankingAccuracy
+                | Self::TanimotoRankingMrr
+                | Self::TanimotoRankingPearson
+                | Self::TanimotoRankingSpearman
         )
     }
 
+    /// Builds the Burn `MetricDefinition` for this gauge from its
+    /// name, description, and polarity.
     fn definition(self, metric_id: MetricId) -> MetricDefinition {
         MetricDefinition {
             metric_id,
@@ -497,18 +617,35 @@ impl ReporterMetric {
     }
 }
 
+/// Pre-allocated [`MetricId`] handles for every gauge so the renderer
+/// can update them without cloning the underlying `Arc<String>`.
 struct ReporterMetricIds {
+    /// Metric ID for the weighted total loss.
     loss: MetricId,
+    /// Metric ID for the reconstruction Huber loss.
     reconstruction: MetricId,
+    /// Metric ID for the bit-presence BCE loss.
     reconstruction_bce: MetricId,
+    /// Metric ID for the descriptor regression loss.
     descriptors: MetricId,
+    /// Metric ID for the Tanimoto geometry softmax CE loss.
     tanimoto_ranking: MetricId,
+    /// Metric ID for the Tanimoto geometry accuracy gauge.
     tanimoto_ranking_accuracy: MetricId,
+    /// Metric ID for the Tanimoto ranking MRR gauge.
+    tanimoto_ranking_mrr: MetricId,
+    /// Metric ID for the Tanimoto ranking Pearson gauge.
+    tanimoto_ranking_pearson: MetricId,
+    /// Metric ID for the Tanimoto ranking Spearman gauge.
+    tanimoto_ranking_spearman: MetricId,
+    /// Metric ID for the counted-Tanimoto reconstruction gauge.
     count_tanimoto: MetricId,
+    /// Metric ID for the binary-Tanimoto reconstruction gauge.
     binary_tanimoto: MetricId,
 }
 
 impl ReporterMetricIds {
+    /// Constructs a fresh ID for every gauge.
     fn new() -> Self {
         Self {
             loss: metric_id(ReporterMetric::Loss),
@@ -517,11 +654,15 @@ impl ReporterMetricIds {
             descriptors: metric_id(ReporterMetric::Descriptors),
             tanimoto_ranking: metric_id(ReporterMetric::TanimotoRanking),
             tanimoto_ranking_accuracy: metric_id(ReporterMetric::TanimotoRankingAccuracy),
+            tanimoto_ranking_mrr: metric_id(ReporterMetric::TanimotoRankingMrr),
+            tanimoto_ranking_pearson: metric_id(ReporterMetric::TanimotoRankingPearson),
+            tanimoto_ranking_spearman: metric_id(ReporterMetric::TanimotoRankingSpearman),
             count_tanimoto: metric_id(ReporterMetric::CountTanimoto),
             binary_tanimoto: metric_id(ReporterMetric::BinaryTanimoto),
         }
     }
 
+    /// Maps an enum variant to its pre-allocated metric ID.
     fn id(&self, metric: ReporterMetric) -> MetricId {
         match metric {
             ReporterMetric::Loss => self.loss.clone(),
@@ -530,16 +671,22 @@ impl ReporterMetricIds {
             ReporterMetric::Descriptors => self.descriptors.clone(),
             ReporterMetric::TanimotoRanking => self.tanimoto_ranking.clone(),
             ReporterMetric::TanimotoRankingAccuracy => self.tanimoto_ranking_accuracy.clone(),
+            ReporterMetric::TanimotoRankingMrr => self.tanimoto_ranking_mrr.clone(),
+            ReporterMetric::TanimotoRankingPearson => self.tanimoto_ranking_pearson.clone(),
+            ReporterMetric::TanimotoRankingSpearman => self.tanimoto_ranking_spearman.clone(),
             ReporterMetric::CountTanimoto => self.count_tanimoto.clone(),
             ReporterMetric::BinaryTanimoto => self.binary_tanimoto.clone(),
         }
     }
 }
 
+/// Allocates a Burn [`MetricId`] keyed on the gauge's display name.
 fn metric_id(metric: ReporterMetric) -> MetricId {
     MetricId::new(std::sync::Arc::new(metric.name().to_string()))
 }
 
+/// Wraps an `f32` / `f64` scalar plus its example count into the
+/// Burn renderer's `MetricState` shape.
 fn metric_state(metric_id: MetricId, value: impl Into<f64>, count: usize) -> MetricState {
     let value = value.into();
     let numeric = NumericEntry::Aggregated {
@@ -550,6 +697,8 @@ fn metric_state(metric_id: MetricId, value: impl Into<f64>, count: usize) -> Met
     MetricState::Numeric(MetricEntry::new(metric_id, serialized), numeric)
 }
 
+/// Builds the Burn renderer's `TrainingProgress` payload — local
+/// batch progress, global epoch progress, and the current iteration.
 fn training_progress(
     processed: usize,
     total: usize,
@@ -570,6 +719,8 @@ fn training_progress(
     }
 }
 
+/// Builds the indicator tags (items / epoch / iteration) the TUI
+/// renders alongside the main progress bar.
 fn progress_indicators(
     processed: usize,
     total: usize,
@@ -599,20 +750,26 @@ fn progress_indicators(
     ]
 }
 
+/// Returns the bar `len` target: `max_batches * batch_size` when set, else
+/// `row_count`, clamped to at least one so empty datasets still render.
 fn progress_total(row_count: usize, batch_size: usize, max_batches: Option<usize>) -> usize {
     max_batches
         .map_or(row_count, |batches| batches.saturating_mul(batch_size))
         .max(1)
 }
 
+/// Estimated number of validation rows for a split-per-mille setting.
 fn valid_row_estimate(row_count: usize, validation_per_mille: u16) -> usize {
     row_count.saturating_mul(usize::from(validation_per_mille.min(1000))) / 1000
 }
 
+/// Estimated number of training rows after subtracting the validation split.
 fn train_row_estimate(row_count: usize, validation_per_mille: u16) -> usize {
     row_count.saturating_sub(valid_row_estimate(row_count, validation_per_mille))
 }
 
+/// Shared `indicatif` template used by every progress bar in the fallback
+/// reporter.
 fn bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
         "{prefix:.bold} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {wide_msg}",
@@ -635,6 +792,9 @@ mod tests {
             descriptors: 0.05,
             tanimoto_ranking: 0.02,
             tanimoto_ranking_accuracy: 0.85,
+            tanimoto_ranking_mrr: 0.6,
+            tanimoto_ranking_pearson: 0.4,
+            tanimoto_ranking_spearman: 0.45,
             count_tanimoto: 0.75,
             binary_tanimoto: 0.80,
         }
