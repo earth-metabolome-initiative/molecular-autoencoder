@@ -31,3 +31,14 @@ impl MoleculeSource for StdinSource {
         self.inner.next()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_constructor_is_a_stdinsource() {
+        let _ = StdinSource::default();
+        let _ = StdinSource::new();
+    }
+}

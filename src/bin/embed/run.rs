@@ -80,3 +80,75 @@ fn flush<B: Backend<FloatElem = f32>>(
     buffer.clear();
     Ok((written, skipped))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use molecular_autoencoder::MoleculeAutoencoderConfig;
+
+    type B = burn::backend::NdArray<f32, i64>;
+
+    fn write_checkpoint(dir: &std::path::Path) {
+        use burn::module::Module;
+        use burn::record::DefaultRecorder;
+
+        let config = MoleculeAutoencoderConfig::symmetric(4096, 16, vec![32]);
+        config
+            .save_json(dir.join("model-config.json"))
+            .expect("save config");
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let model = config.init::<B>(&device);
+        model
+            .save_file(dir.join("model"), &DefaultRecorder::default())
+            .expect("save model");
+    }
+
+    #[test]
+    fn run_end_to_end_smi_to_tsv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ckpt = dir.path().join("ckpt");
+        std::fs::create_dir_all(&ckpt).expect("ckpt dir");
+        write_checkpoint(&ckpt);
+
+        let input = dir.path().join("inputs.smi");
+        // Include one bogus SMILES so the flush() skip branch is exercised.
+        std::fs::write(&input, "CCO\nnot-a-smiles\nc1ccccc1\n").expect("write smi");
+        let output = dir.path().join("out.tsv");
+
+        let args = crate::cli::Args::try_parse_from([
+            "embed",
+            input.to_str().expect("utf-8"),
+            output.to_str().expect("utf-8"),
+            "--checkpoint",
+            ckpt.to_str().expect("utf-8"),
+            "--batch-size",
+            "2",
+        ])
+        .expect("parse");
+
+        run::<B>(args, burn::backend::ndarray::NdArrayDevice::default()).expect("run");
+
+        let text = std::fs::read_to_string(&output).expect("read tsv");
+        // Header + two surviving rows (third skipped).
+        assert_eq!(text.lines().count(), 1 + 2);
+    }
+
+    #[test]
+    fn run_rejects_zero_batch_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out.tsv");
+        let mut args = crate::cli::Args::try_parse_from([
+            "embed",
+            dir.path().to_str().expect("utf-8"),
+            out.to_str().expect("utf-8"),
+            "--checkpoint",
+            dir.path().to_str().expect("utf-8"),
+        ])
+        .expect("parse");
+        args.batch_size = 0;
+        let err = run::<B>(args, burn::backend::ndarray::NdArrayDevice::default())
+            .expect_err("zero batch must be rejected");
+        assert!(err.to_string().contains("batch size"));
+    }
+}
