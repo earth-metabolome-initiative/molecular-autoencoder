@@ -30,16 +30,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check
-        run: cargo check --locked --no-default-features --features std,ndarray,train,tui,datasets,embed,embed-mgf,embed-parquet --all-targets
+        run: cargo check --locked --no-default-features --features std,ndarray,train,tui,datasets,embed,embed-mgf,embed-parquet,http,huggingface --all-targets
 
       - name: Clippy
-        run: cargo clippy --locked --no-default-features --features std,ndarray,train,tui,datasets,embed,embed-mgf,embed-parquet --all-targets -- -D warnings
+        run: cargo clippy --locked --no-default-features --features std,ndarray,train,tui,datasets,embed,embed-mgf,embed-parquet,http,huggingface --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked --no-default-features --features std,ndarray,train,datasets,embed,embed-mgf,embed-parquet --all-targets
+        run: cargo test --locked --no-default-features --features std,ndarray,train,datasets,embed,embed-mgf,embed-parquet,http,huggingface --all-targets
 
       - name: Documentation
-        run: cargo doc --locked --no-default-features --features std,ndarray,train,datasets,embed,embed-mgf,embed-parquet --no-deps
+        run: cargo doc --locked --no-default-features --features std,ndarray,train,datasets,embed,embed-mgf,embed-parquet,http,huggingface --no-deps
 
   cuda:
     name: CUDA type-check
@@ -109,7 +109,7 @@ jobs:
       - name: Generate coverage
         run: >-
           cargo tarpaulin --engine llvm --locked --no-default-features
-          --features std,ndarray,train,datasets,embed,embed-mgf,embed-parquet,cubecl-cpu
+          --features std,ndarray,train,datasets,embed,embed-mgf,embed-parquet,cubecl-cpu,http,huggingface
           --all-targets --out Xml --output-dir coverage
 
       - name: Upload coverage to Codecov
@@ -120,3 +120,31 @@ jobs:
           flags: rust
           name: rust-coverage
           fail_ci_if_error: true
+
+  wasm:
+    name: wasm32 build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+
+      - name: Check inference core compiles to wasm32
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features std,ndarray
+
+      - name: Check wasm32 with http + huggingface loaders
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features std,ndarray,http,huggingface
+
+      - name: Clippy wasm32 lib
+        run: cargo clippy --locked --target wasm32-unknown-unknown --no-default-features --features std,ndarray,http,huggingface --lib -- -D warnings
