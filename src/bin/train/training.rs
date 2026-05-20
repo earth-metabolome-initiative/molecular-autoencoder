@@ -594,3 +594,406 @@ where
 {
     Ok(grads)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::Autodiff;
+    use burn::data::dataloader::batcher::Batcher;
+    use burn::module::AutodiffModule;
+    use burn::optim::AdamConfig;
+    use clap::Parser;
+    use molecular_autoencoder::{
+        DataSplit, FingerprintTargets, MoleculeAutoencoderConfig, SparseMoleculeShard,
+        features::REGRESSION_TARGET_WIDTH,
+    };
+    use std::sync::mpsc;
+
+    use crate::cli::Args;
+    use crate::reporter::TrainingReporter;
+
+    type TestBackend = Autodiff<burn::backend::NdArray<f32, i64>>;
+
+    const FINGERPRINT_WIDTH: usize = 256;
+    const HIDDEN_WIDTH: usize = 16;
+    const LATENT_WIDTH: usize = 8;
+
+    fn fixture_args() -> Args {
+        let mut args = Args::try_parse_from(["train", "ignored", "ignored"]).expect("parse");
+        args.batch_size = 2;
+        args.loader_workers = 0;
+        args.device_prefetch_batches = 0;
+        args.max_train_batches = Some(2);
+        args.metric_every = 1;
+        // Disable Tanimoto ranking — it needs a CUDA kernel.
+        args.tanimoto_ranking_weight = 0.0;
+        args.descriptor_weight = 0.05;
+        args.epochs = 1;
+        args
+    }
+
+    fn write_fixture_shard(dir: &std::path::Path) -> CachedShardInfo {
+        let mut shard = SparseMoleculeShard::new(FINGERPRINT_WIDTH, REGRESSION_TARGET_WIDTH);
+        for (cid, indices, split) in [
+            (1_u64, vec![3_u16, 11], DataSplit::Train),
+            (2, vec![5_u16, 17], DataSplit::Train),
+            (3, vec![1_u16, 23], DataSplit::Train),
+            (4, vec![7_u16, 29], DataSplit::Validation),
+            (5, vec![9_u16, 31], DataSplit::Validation),
+        ] {
+            let fingerprint = FingerprintTargets::new(
+                indices.clone(),
+                vec![1_u16; indices.len()],
+                FINGERPRINT_WIDTH,
+            )
+            .expect("valid fingerprint");
+            shard
+                .push(cid, &fingerprint, &[0.0; REGRESSION_TARGET_WIDTH], split)
+                .expect("push row");
+        }
+        let path = dir.join("shard-00000.maeshard");
+        shard.write_to_path(&path).expect("write shard");
+        CachedShardInfo {
+            path,
+            row_count: shard.len(),
+        }
+    }
+
+    fn build_model_and_optimizer() -> (
+        MoleculeAutoencoder<TestBackend>,
+        impl Optimizer<MoleculeAutoencoder<TestBackend>, TestBackend>,
+    ) {
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let config = MoleculeAutoencoderConfig::symmetric(
+            FINGERPRINT_WIDTH,
+            LATENT_WIDTH,
+            vec![HIDDEN_WIDTH],
+        );
+        let model = config.init::<TestBackend>(&device);
+        let optimizer = AdamConfig::new().init::<TestBackend, MoleculeAutoencoder<TestBackend>>();
+        (model, optimizer)
+    }
+
+    fn fixture_reporter() -> TrainingReporter {
+        TrainingReporter::new(5, 400, 2, Some(2), Some(2), None)
+    }
+
+    #[test]
+    fn train_epoch_completes_one_pass_and_updates_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shard = write_fixture_shard(dir.path());
+        let shards = vec![shard];
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(FINGERPRINT_WIDTH, REGRESSION_TARGET_WIDTH);
+        let args = fixture_args();
+        let (model, mut optimizer) = build_model_and_optimizer();
+        let mut state = CheckpointState {
+            completed_epoch: 0,
+            global_step: 0,
+            best_validation_loss: None,
+        };
+        let mut reporter = fixture_reporter();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let (next_model, summary) = train_epoch(
+            model,
+            &mut optimizer,
+            TrainEpochContext {
+                shards: &shards,
+                batcher,
+                device: &device,
+                tanimoto_ranking: TanimotoRankingRuntimeConfig::default(),
+                args: &args,
+                loader_profile_every: 0,
+                validation_per_mille: 400,
+                state: &mut state,
+                sink: BatchSink::Lead {
+                    reporter: &mut reporter,
+                    stop_flag: stop_flag.clone(),
+                    receiver: None,
+                },
+                epoch: 1,
+                peer_id: 0,
+                world_size: 1,
+            },
+        )
+        .expect("train epoch");
+
+        assert!(summary.batches >= 1, "should run at least one batch");
+        assert_eq!(state.global_step, summary.batches);
+        assert!(summary.mean_loss().is_finite());
+        // Smoke: model is returned and can serve another forward call.
+        let inference = next_model.valid();
+        let batch = batcher.batch(
+            vec![molecular_autoencoder::MoleculeAutoencoderSample {
+                cid: 99,
+                fingerprint_indices: vec![3, 11],
+                fingerprint_counts: vec![1, 1],
+                descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+            }],
+            &device,
+        );
+        let out = inference.forward(&batch.fingerprints);
+        let latent_data = out.latent.to_data();
+        let latent = latent_data.as_slice::<f32>().expect("latent f32");
+        assert!(latent.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn train_epoch_with_loader_workers_exercises_threaded_dataloader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shard = write_fixture_shard(dir.path());
+        let shards = vec![shard];
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(FINGERPRINT_WIDTH, REGRESSION_TARGET_WIDTH);
+        let mut args = fixture_args();
+        // Drive the multi-threaded dataloader + device prefetch paths.
+        args.loader_workers = 1;
+        args.device_prefetch_batches = 1;
+        args.loader_profile_every = 1;
+        let (model, mut optimizer) = build_model_and_optimizer();
+        let mut state = CheckpointState {
+            completed_epoch: 0,
+            global_step: 0,
+            best_validation_loss: None,
+        };
+        let mut reporter = fixture_reporter();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let (_next_model, summary) = train_epoch(
+            model,
+            &mut optimizer,
+            TrainEpochContext {
+                shards: &shards,
+                batcher,
+                device: &device,
+                tanimoto_ranking: TanimotoRankingRuntimeConfig::default(),
+                args: &args,
+                loader_profile_every: 1,
+                validation_per_mille: 400,
+                state: &mut state,
+                sink: BatchSink::Lead {
+                    reporter: &mut reporter,
+                    stop_flag: stop_flag.clone(),
+                    receiver: None,
+                },
+                epoch: 1,
+                peer_id: 0,
+                world_size: 1,
+            },
+        )
+        .expect("threaded train_epoch");
+        assert!(summary.batches >= 1);
+    }
+
+    #[test]
+    fn evaluate_returns_summary_for_validation_split() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shard = write_fixture_shard(dir.path());
+        let shards = vec![shard];
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(FINGERPRINT_WIDTH, REGRESSION_TARGET_WIDTH);
+        let args = fixture_args();
+        let (model, _optimizer) = build_model_and_optimizer();
+        let mut reporter = fixture_reporter();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let inference = model.valid();
+        let summary = evaluate(
+            &inference,
+            EvaluationContext {
+                shards: &shards,
+                batcher,
+                device: &device,
+                batch_size: args.batch_size,
+                max_batches: Some(args.max_valid_batches),
+                loader_workers: 0,
+                device_prefetch_batches: 0,
+                loader_profile_every: 0,
+                tanimoto_ranking: TanimotoRankingRuntimeConfig::default(),
+                validation_per_mille: 400,
+                sink: BatchSink::Lead {
+                    reporter: &mut reporter,
+                    stop_flag: stop_flag.clone(),
+                    receiver: None,
+                },
+                epoch: 1,
+                epoch_total: 1,
+                peer_id: 0,
+            },
+        )
+        .expect("evaluate")
+        .expect("validation produced at least one batch");
+
+        assert!(summary.batches >= 1);
+        assert!(summary.mean_loss().is_finite());
+        assert!((0.0..=1.0).contains(&summary.mean_count_tanimoto()));
+        assert!((0.0..=1.0).contains(&summary.mean_binary_tanimoto()));
+    }
+
+    #[test]
+    fn epoch_summary_record_and_mean_loss_aggregate_correctly() {
+        let mut summary = EpochSummary::default();
+        summary.record(
+            8,
+            Some(0.4),
+            Duration::from_millis(2),
+            Duration::from_millis(3),
+        );
+        summary.record(4, None, Duration::from_millis(1), Duration::from_millis(2));
+        summary.record(
+            2,
+            Some(0.8),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(summary.batches, 3);
+        assert_eq!(summary.examples, 14);
+        assert_eq!(summary.loss_batches, 2);
+        assert!((summary.mean_loss() - 0.6).abs() < 1.0e-6);
+        assert_eq!(summary.data_time, Duration::from_millis(4));
+        assert_eq!(summary.step_time, Duration::from_millis(6));
+    }
+
+    #[test]
+    fn epoch_summary_mean_loss_is_zero_with_no_loss_batches() {
+        let mut summary = EpochSummary::default();
+        summary.record(4, None, Duration::ZERO, Duration::ZERO);
+        assert_eq!(summary.mean_loss(), 0.0);
+    }
+
+    #[test]
+    fn evaluation_summary_means_handle_zero_batches() {
+        let summary = EvaluationSummary::default();
+        assert_eq!(summary.mean_loss(), 0.0);
+        assert_eq!(summary.mean_count_tanimoto(), 0.0);
+        assert_eq!(summary.mean_binary_tanimoto(), 0.0);
+    }
+
+    #[test]
+    fn evaluation_summary_aggregates_loss_and_tanimoto() {
+        let mut summary = EvaluationSummary::default();
+        summary.record(
+            4,
+            Some(0.3),
+            0.8,
+            0.7,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
+        summary.record(
+            4,
+            Some(0.5),
+            0.6,
+            0.5,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
+        assert_eq!(summary.batches, 2);
+        assert!((summary.mean_loss() - 0.4).abs() < 1.0e-6);
+        assert!((summary.mean_count_tanimoto() - 0.7).abs() < 1.0e-6);
+        assert!((summary.mean_binary_tanimoto() - 0.6).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn batch_sink_worker_path_dispatches_train_and_valid_messages() {
+        let (tx, rx) = mpsc::channel::<BatchUpdate>();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let mut sink = BatchSink::Worker {
+            tx,
+            stop_flag: stop_flag.clone(),
+        };
+        let train_payload = TrainBatchPayload {
+            epoch: 1,
+            epoch_total: 1,
+            global_step: 1,
+            batch_size: 2,
+            metrics: None,
+            data_time: Duration::ZERO,
+            step_time: Duration::ZERO,
+        };
+        let valid_payload = ValidBatchPayload {
+            epoch: 1,
+            epoch_total: 1,
+            batch_index: 1,
+            batch_size: 2,
+            metrics: None,
+            count_tanimoto: 0.5,
+            binary_tanimoto: 0.4,
+        };
+        assert!(matches!(
+            sink.train_batch(train_payload),
+            BatchControl::Continue
+        ));
+        assert!(matches!(
+            sink.valid_batch(valid_payload),
+            BatchControl::Continue
+        ));
+        // The receiver should have got both messages.
+        assert!(matches!(
+            rx.recv().expect("train msg"),
+            BatchUpdate::Train(_)
+        ));
+        assert!(matches!(
+            rx.recv().expect("valid msg"),
+            BatchUpdate::Valid(_)
+        ));
+
+        // Setting the stop flag causes the next batch to return Stop.
+        stop_flag.store(true, Ordering::Release);
+        let payload = TrainBatchPayload {
+            epoch: 1,
+            epoch_total: 1,
+            global_step: 1,
+            batch_size: 2,
+            metrics: None,
+            data_time: Duration::ZERO,
+            step_time: Duration::ZERO,
+        };
+        assert!(matches!(sink.train_batch(payload), BatchControl::Stop));
+    }
+
+    #[test]
+    fn drain_worker_updates_forwards_pending_messages_to_reporter() {
+        let (tx, rx) = mpsc::channel::<BatchUpdate>();
+        let mut reporter = fixture_reporter();
+        let stop_flag = AtomicBool::new(false);
+        tx.send(BatchUpdate::Train(TrainBatchPayload {
+            epoch: 1,
+            epoch_total: 1,
+            global_step: 1,
+            batch_size: 2,
+            metrics: None,
+            data_time: Duration::ZERO,
+            step_time: Duration::ZERO,
+        }))
+        .expect("send train");
+        tx.send(BatchUpdate::Valid(ValidBatchPayload {
+            epoch: 1,
+            epoch_total: 1,
+            batch_index: 1,
+            batch_size: 2,
+            metrics: None,
+            count_tanimoto: 0.3,
+            binary_tanimoto: 0.4,
+        }))
+        .expect("send valid");
+        tx.send(BatchUpdate::TrainEpochComplete)
+            .expect("send sentinel");
+        drop(tx);
+        drain_worker_updates(&mut reporter, &stop_flag, &rx);
+        // No assertion — this test ensures the drain handles all three
+        // variants and the disconnected-channel case without panic.
+    }
+
+    #[test]
+    fn all_reduce_mean_is_identity_for_world_size_one() {
+        // The single-GPU short-circuit returns the input grads unchanged.
+        // We can't easily construct a non-empty GradientsParams here, but
+        // we can verify the cfg-off path on an empty value compiles + runs.
+        let grads = GradientsParams::new();
+        let result = all_reduce_mean::<TestBackend>(grads, 0, 1).expect("identity");
+        assert_eq!(result.len(), 0);
+    }
+}
