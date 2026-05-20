@@ -186,3 +186,101 @@ pub fn counted_tanimoto_similarity_ranking_kernel<B: CountedTanimotoKernelBacken
             .reshape([config.batch_items(), 1]),
     )
 }
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    #[test]
+    fn build_without_batch_items_is_rejected() {
+        let err = CountedTanimotoRankingKernelConfig::builder()
+            .build()
+            .expect_err("missing batch_items must fail");
+        assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn nan_epsilon_is_rejected() {
+        let err = CountedTanimotoRankingKernelConfig::builder()
+            .batch_items(4)
+            .epsilon(f64::NAN)
+            .build()
+            .expect_err("NaN epsilon must fail");
+        assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn negative_epsilon_is_rejected() {
+        let err = CountedTanimotoRankingKernelConfig::builder()
+            .batch_items(4)
+            .epsilon(-1.0e-9)
+            .build()
+            .expect_err("non-positive epsilon must fail");
+        assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn zero_epsilon_is_rejected() {
+        let err = CountedTanimotoRankingKernelConfig::builder()
+            .batch_items(4)
+            .epsilon(0.0)
+            .build()
+            .expect_err("zero epsilon must fail");
+        assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn single_candidate_per_anchor_is_rejected() {
+        let err = CountedTanimotoRankingKernelConfig::builder()
+            .batch_items(4)
+            .candidates_per_anchor(1)
+            .build()
+            .expect_err("candidates_per_anchor < 2 must fail");
+        assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn build_preserves_all_fields() {
+        let config = CountedTanimotoRankingKernelConfig::builder()
+            .batch_items(16)
+            .candidates_per_anchor(8)
+            .seed(0xdead_beef)
+            .epsilon(1.0e-6)
+            .build()
+            .expect("valid builder must produce a config");
+        assert_eq!(config.batch_items(), 16);
+        assert_eq!(config.candidates_per_anchor(), 8);
+        assert_eq!(config.seed(), 0xdead_beef);
+        assert!((config.epsilon() - 1.0e-6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn effective_candidates_saturates_to_batch_minus_one() {
+        let config = CountedTanimotoRankingKernelConfig::builder()
+            .batch_items(3)
+            .candidates_per_anchor(8)
+            .build()
+            .expect("batch_items=3 is valid");
+        assert_eq!(config.effective_candidates_per_anchor(), 2);
+    }
+
+    #[test]
+    fn effective_candidates_clamps_to_at_least_two_when_possible() {
+        let config = CountedTanimotoRankingKernelConfig::builder()
+            .batch_items(8)
+            .candidates_per_anchor(2)
+            .build()
+            .expect("min candidates is valid");
+        assert_eq!(config.effective_candidates_per_anchor(), 2);
+    }
+
+    #[test]
+    fn effective_candidates_is_zero_for_singleton_batch() {
+        let config = CountedTanimotoRankingKernelConfig::builder()
+            .batch_items(1)
+            .candidates_per_anchor(4)
+            .build()
+            .expect("batch_items=1 is technically valid for the builder");
+        assert_eq!(config.effective_candidates_per_anchor(), 0);
+    }
+}
