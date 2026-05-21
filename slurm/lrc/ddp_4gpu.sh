@@ -101,7 +101,6 @@ echo "Checkpoints:  $CHECKPOINT_DIR"
     "$CHECKPOINT_DIR" \
     --cuda-devices 0,1,2,3 \
     --epochs 20 \
-    --batch-size 16384 \
     "$@"
 
 echo "Done:         $(date -Iseconds)"
