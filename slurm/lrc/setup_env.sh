@@ -113,50 +113,64 @@ load_cluster_modules() {
 }
 
 install_nccl_wheel() {
-    # cudarc 0.19.4 dlopens libnccl.so.2 and requires symbols (ncclAlltoAll)
+    # cudarc 0.19.4 dlopens NCCL by name and requires symbols (ncclAlltoAll)
     # added in NCCL 2.19. The Lawrencium cuda/12.2.1 module ships no NCCL,
-    # and nvhpc/23.11 only ships 2.18.5. We grab the manylinux2014 wheel
+    # and nvhpc/23.11 only ships 2.18.5. Grab the manylinux2014 wheel
     # nvidia-nccl-cu12 publishes (currently 2.21+) and unpack it under
-    # $HOME so neither the cluster admins nor a recompile is needed.
-    if [ -f "$NCCL_LIB_DIR/libnccl.so.2" ]; then
-        echo "NCCL already installed: $(ls "$NCCL_LIB_DIR"/libnccl.so.2*)"
-        return
+    # $HOME so neither cluster admins nor a recompile is needed.
+    #
+    # Two independent symlink concerns to handle:
+    #   1. SONAME: some wheels ship libnccl.so.2.<x.y> and not the
+    #      libnccl.so.2 SONAME symlink. Create it if missing.
+    #   2. dlopen name: cudarc 0.19.4's search list contains
+    #      "libnccl.so" (unversioned), "libnccl.so.12", "libnccl.so.1",
+    #      etc. but NOT "libnccl.so.2", so even a correct SONAME file
+    #      is invisible without the unversioned symlink.
+    if [ ! -f "$NCCL_LIB_DIR/libnccl.so.2" ]; then
+        echo "Installing nvidia-nccl-cu12 wheel under $NCCL_INSTALL_DIR"
+        if command -v module > /dev/null 2>&1; then
+            module load "$MINIFORGE_MODULE"
+        fi
+        if ! command -v pip > /dev/null 2>&1; then
+            echo "ERROR: pip not in PATH after 'module load $MINIFORGE_MODULE'."
+            exit 1
+        fi
+        mkdir -p "$NCCL_INSTALL_DIR/wheels"
+        pip download --no-deps --only-binary :all: \
+            --platform manylinux2014_x86_64 \
+            --python-version 3.10 \
+            --dest "$NCCL_INSTALL_DIR/wheels" \
+            nvidia-nccl-cu12
+        (
+            cd "$NCCL_INSTALL_DIR"
+            unzip -o wheels/nvidia_nccl_cu12-*.whl
+        )
+        if command -v module > /dev/null 2>&1; then
+            module unload "$MINIFORGE_MODULE" 2>/dev/null || true
+        fi
+    else
+        echo "NCCL libdir already populated: $NCCL_LIB_DIR"
     fi
-    echo "Installing nvidia-nccl-cu12 wheel under $NCCL_INSTALL_DIR"
-    # miniforge3 just gives us pip; the cluster's python module is fine too.
-    if command -v module > /dev/null 2>&1; then
-        module load "$MINIFORGE_MODULE"
-    fi
-    if ! command -v pip > /dev/null 2>&1; then
-        echo "ERROR: pip not in PATH after 'module load $MINIFORGE_MODULE'."
-        exit 1
-    fi
-    mkdir -p "$NCCL_INSTALL_DIR/wheels"
-    pip download --no-deps --only-binary :all: \
-        --platform manylinux2014_x86_64 \
-        --python-version 3.10 \
-        --dest "$NCCL_INSTALL_DIR/wheels" \
-        nvidia-nccl-cu12
-    (
-        cd "$NCCL_INSTALL_DIR"
-        # The wheel is a zip; unzip is part of base Rocky 8.
-        unzip -o wheels/nvidia_nccl_cu12-*.whl
-    )
-    # Some wheels ship libnccl.so.<x.y.z> without the libnccl.so.2 SONAME
-    # symlink. Recreate it if so.
+
+    # SONAME symlink (libnccl.so.2 -> libnccl.so.<x.y.z>) if the wheel
+    # shipped only the versioned file.
     if [ ! -e "$NCCL_LIB_DIR/libnccl.so.2" ]; then
         real_so="$(find "$NCCL_LIB_DIR" -maxdepth 1 -name 'libnccl.so.2.*' -printf '%f\n' | head -1)"
         if [ -z "$real_so" ]; then
-            echo "ERROR: wheel did not contain libnccl.so.2.*"
+            echo "ERROR: wheel did not contain libnccl.so.2 or libnccl.so.2.*"
             exit 1
         fi
         ln -sf "$real_so" "$NCCL_LIB_DIR/libnccl.so.2"
-        ln -sf "libnccl.so.2" "$NCCL_LIB_DIR/libnccl.so"
     fi
+
+    # Unversioned symlink for cudarc's dlopen search list. Always ensure
+    # it exists, independent of whether we just installed the wheel.
+    if [ ! -e "$NCCL_LIB_DIR/libnccl.so" ]; then
+        ln -sf libnccl.so.2 "$NCCL_LIB_DIR/libnccl.so"
+        echo "Created libnccl.so -> libnccl.so.2 in $NCCL_LIB_DIR"
+    fi
+
     ls -la "$NCCL_LIB_DIR"
-    if command -v module > /dev/null 2>&1; then
-        module unload "$MINIFORGE_MODULE" 2>/dev/null || true
-    fi
 }
 
 link_scratch_directory() {
