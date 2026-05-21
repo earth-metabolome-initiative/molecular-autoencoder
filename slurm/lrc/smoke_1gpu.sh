@@ -45,6 +45,20 @@ module purge
 module load "$GCC_MODULE" "$CUDA_MODULE"
 load_user_cargo_environment
 
+# cubecl-cuda reads CUDA_PATH specifically; the Lmod cuda module only
+# sets CUDA_HOME / CUDA_ROOT. Derive CUDA_PATH from nvcc's location so it
+# tracks whichever cuda module is loaded.
+if [ -z "${CUDA_PATH:-}" ]; then
+    nvcc_path="$(command -v nvcc)"
+    if [ -z "$nvcc_path" ]; then
+        echo "ERROR: nvcc not in PATH after 'module load $CUDA_MODULE'."
+        exit 1
+    fi
+    CUDA_PATH="$(dirname "$(dirname "$nvcc_path")")"
+    export CUDA_PATH
+fi
+echo "CUDA_PATH:    $CUDA_PATH"
+
 cd "$REPO_DIR"
 
 BINARY="$TARGET_DIR/release/train"
