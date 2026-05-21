@@ -121,6 +121,28 @@ jobs:
           name: rust-coverage
           fail_ci_if_error: true
 
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Lint slurm/**/*.sh
+        run: |
+          shopt -s globstar nullglob
+          files=(slurm/**/*.sh)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No shell scripts found under slurm/, nothing to lint."
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          shellcheck --severity=style --external-sources "${files[@]}"
+
   wasm:
     name: wasm32 build
     runs-on: ubuntu-latest
