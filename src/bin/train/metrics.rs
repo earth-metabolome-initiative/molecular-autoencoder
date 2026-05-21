@@ -6,7 +6,9 @@ use burn::{
     prelude::*,
     tensor::{TensorData, Transaction},
 };
-use molecular_autoencoder::{DataSplit, MoleculeLossBreakdown, tanimoto_ranking_quality};
+use molecular_autoencoder::{
+    DataSplit, MoleculeLossBreakdown, tanimoto_ranking_quality, violation_classification_quality,
+};
 
 use crate::{AppResult, dataloader::BatchLoadProfile, invalid_input};
 
@@ -42,6 +44,20 @@ pub struct BatchLossMetrics {
     /// Binary-fingerprint Tanimoto similarity between reconstruction and
     /// target.
     pub binary_tanimoto: f32,
+    /// Mean multi-label BCE-with-logits between the violation classifier
+    /// head and the per-sample [`finge_rs::ViolationLabel`] bitset.
+    pub violation_bce: f32,
+    /// Macro-averaged Matthews correlation coefficient across the eight
+    /// violation classes. Each class is thresholded at `logit > 0` and
+    /// scored independently; the per-class MCCs are averaged. Range
+    /// `[-1, 1]`; higher is better. Falls back to `0.0` when no class
+    /// in the batch has both positive and negative samples (the
+    /// standard `sklearn`-style degenerate-case convention).
+    pub violation_mcc: f32,
+    /// Fraction of `(sample, class)` cells where the thresholded
+    /// violation prediction matches the target bit, averaged over the
+    /// flattened `batch * 8` matrix.
+    pub violation_accuracy: f32,
 }
 
 /// Returns `"train"` or `"valid"` for the given split.
@@ -70,6 +86,9 @@ where
     let diagnostics = &losses.tanimoto_diagnostics;
     let pair_count = diagnostics.pair_count;
     let candidate_count = diagnostics.candidate_count;
+    let violation_diagnostics = &losses.violation_diagnostics;
+    let violation_batch = violation_diagnostics.batch_size;
+    let violation_classes = violation_diagnostics.class_count;
     let data = Transaction::default()
         .register(loss)
         .register(losses.reconstruction.clone())
@@ -79,19 +98,24 @@ where
         .register(losses.tanimoto_ranking_accuracy.clone())
         .register(count_tanimoto)
         .register(binary_tanimoto)
+        .register(losses.violation_bce.clone())
         .register(diagnostics.latent_logits.clone())
         .register(diagnostics.candidate_scores.clone())
         .register(diagnostics.best_positions.clone().float())
         .register(diagnostics.valid_mask.clone())
+        .register(violation_diagnostics.logits.clone())
+        .register(violation_diagnostics.targets.clone())
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read training metrics: {source}")))?;
-    if data.len() != 12 {
+    if data.len() != 15 {
         return Err(invalid_input(format!(
-            "training metrics transaction returned {} tensors instead of 12",
+            "training metrics transaction returned {} tensors instead of 15",
             data.len()
         )));
     }
-    let quality = ranking_quality_from_data(&data[8..12], pair_count, candidate_count)?;
+    let quality = ranking_quality_from_data(&data[9..13], pair_count, candidate_count)?;
+    let violation_quality =
+        violation_quality_from_data(&data[13..15], violation_batch, violation_classes)?;
     Ok(BatchLossMetrics {
         loss: scalar_data(&data[0], "loss")?,
         reconstruction: scalar_data(&data[1], "reconstruction loss")?,
@@ -104,6 +128,9 @@ where
         tanimoto_ranking_spearman: quality.spearman,
         count_tanimoto: scalar_data(&data[6], "count Tanimoto")?,
         binary_tanimoto: scalar_data(&data[7], "binary Tanimoto")?,
+        violation_bce: scalar_data(&data[8], "violation BCE loss")?,
+        violation_mcc: violation_quality.mcc_macro,
+        violation_accuracy: violation_quality.accuracy,
     })
 }
 
@@ -121,6 +148,9 @@ where
     let diagnostics = &losses.tanimoto_diagnostics;
     let pair_count = diagnostics.pair_count;
     let candidate_count = diagnostics.candidate_count;
+    let violation_diagnostics = &losses.violation_diagnostics;
+    let violation_batch = violation_diagnostics.batch_size;
+    let violation_classes = violation_diagnostics.class_count;
     let data = Transaction::default()
         .register(loss)
         .register(losses.reconstruction.clone())
@@ -130,21 +160,26 @@ where
         .register(losses.tanimoto_ranking_accuracy.clone())
         .register(count_tanimoto)
         .register(binary_tanimoto)
+        .register(losses.violation_bce.clone())
         .register(diagnostics.latent_logits.clone())
         .register(diagnostics.candidate_scores.clone())
         .register(diagnostics.best_positions.clone().float())
         .register(diagnostics.valid_mask.clone())
+        .register(violation_diagnostics.logits.clone())
+        .register(violation_diagnostics.targets.clone())
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read validation metrics: {source}")))?;
-    if data.len() != 12 {
+    if data.len() != 15 {
         return Err(invalid_input(format!(
-            "validation metrics transaction returned {} tensors instead of 12",
+            "validation metrics transaction returned {} tensors instead of 15",
             data.len()
         )));
     }
     let count_tanimoto = scalar_data(&data[6], "count Tanimoto")?;
     let binary_tanimoto = scalar_data(&data[7], "binary Tanimoto")?;
-    let quality = ranking_quality_from_data(&data[8..12], pair_count, candidate_count)?;
+    let quality = ranking_quality_from_data(&data[9..13], pair_count, candidate_count)?;
+    let violation_quality =
+        violation_quality_from_data(&data[13..15], violation_batch, violation_classes)?;
     Ok((
         BatchLossMetrics {
             loss: scalar_data(&data[0], "loss")?,
@@ -158,9 +193,42 @@ where
             tanimoto_ranking_spearman: quality.spearman,
             count_tanimoto,
             binary_tanimoto,
+            violation_bce: scalar_data(&data[8], "violation BCE loss")?,
+            violation_mcc: violation_quality.mcc_macro,
+            violation_accuracy: violation_quality.accuracy,
         },
         count_tanimoto,
         binary_tanimoto,
+    ))
+}
+
+/// Extracts the violation-classification quality scalars from the
+/// trailing two Transaction slots. Slot order is `[logits, targets]`,
+/// both `[batch * class_count]` row-major float buffers.
+fn violation_quality_from_data(
+    slots: &[TensorData],
+    batch_size: usize,
+    class_count: usize,
+) -> AppResult<molecular_autoencoder::ViolationClassificationQuality> {
+    assert_eq!(
+        slots.len(),
+        2,
+        "violation quality slot window must carry exactly 2 entries"
+    );
+    if batch_size == 0 || class_count == 0 {
+        return Ok(molecular_autoencoder::ViolationClassificationQuality::default());
+    }
+    let logits = slots[0]
+        .as_slice::<f32>()
+        .map_err(|source| invalid_input(format!("violation logits tensor not f32: {source}")))?;
+    let targets = slots[1]
+        .as_slice::<f32>()
+        .map_err(|source| invalid_input(format!("violation targets tensor not f32: {source}")))?;
+    Ok(violation_classification_quality(
+        logits,
+        targets,
+        batch_size,
+        class_count,
     ))
 }
 

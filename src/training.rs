@@ -3,7 +3,7 @@
 use burn::{backend::NdArray, prelude::*, tensor::Transaction, train::metric::ItemLazy};
 
 use crate::model::MoleculeLossBreakdown;
-use crate::ranking::TanimotoRankingDiagnostics;
+use crate::ranking::{TanimotoRankingDiagnostics, ViolationDiagnostics};
 
 /// Autoencoder output adapted for Burn training loops.
 pub struct MoleculeAutoencoderTrainingOutput<B: Backend> {
@@ -40,6 +40,7 @@ impl<B: Backend> ItemLazy for MoleculeAutoencoderTrainingOutput<B> {
             tanimoto_ranking,
             tanimoto_accuracy,
             tanimoto_pairs,
+            violation_bce,
         ] = Transaction::default()
             .register(self.loss)
             .register(self.losses.reconstruction)
@@ -48,6 +49,7 @@ impl<B: Backend> ItemLazy for MoleculeAutoencoderTrainingOutput<B> {
             .register(self.losses.tanimoto_ranking)
             .register(self.losses.tanimoto_ranking_accuracy)
             .register(self.losses.tanimoto_ranking_pairs)
+            .register(self.losses.violation_bce)
             .execute()
             .try_into()
             .expect("correct number of tensor data items");
@@ -68,6 +70,8 @@ impl<B: Backend> ItemLazy for MoleculeAutoencoderTrainingOutput<B> {
                 // tensors. Empty diagnostics keep the type-level
                 // contract without paying for additional registers.
                 tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(device),
+                violation_bce: Tensor::from_data(violation_bce, device),
+                violation_diagnostics: ViolationDiagnostics::empty(device),
             },
         }
     }
@@ -106,14 +110,22 @@ mod train_impl {
         fn step(&self, batch: MoleculeAutoencoderBatch<B>) -> TrainOutput<Self::Output> {
             let crate::batch::MoleculeAutoencoderBatch {
                 fingerprints,
+                target_fingerprints,
                 descriptor_targets,
+                violation_targets,
                 tanimoto_ranking,
                 ..
             } = batch;
             let output = self.forward_with_decoder_latent_noise(&fingerprints, true);
             let reconstruction = output.reconstructed_log_counts.clone();
-            let losses =
-                self.loss_from_output(output, fingerprints, descriptor_targets, tanimoto_ranking);
+            let losses = self.loss_from_output(
+                output,
+                fingerprints,
+                target_fingerprints,
+                descriptor_targets,
+                tanimoto_ranking,
+                violation_targets,
+            );
             let item = MoleculeAutoencoderTrainingOutput::new(reconstruction, losses);
 
             TrainOutput::new(self, item.loss.clone().backward(), item)
@@ -127,14 +139,22 @@ mod train_impl {
         fn step(&self, batch: MoleculeAutoencoderBatch<B>) -> Self::Output {
             let crate::batch::MoleculeAutoencoderBatch {
                 fingerprints,
+                target_fingerprints,
                 descriptor_targets,
+                violation_targets,
                 tanimoto_ranking,
                 ..
             } = batch;
             let output = self.forward(&fingerprints);
             let reconstruction = output.reconstructed_log_counts.clone();
-            let losses =
-                self.loss_from_output(output, fingerprints, descriptor_targets, tanimoto_ranking);
+            let losses = self.loss_from_output(
+                output,
+                fingerprints,
+                target_fingerprints,
+                descriptor_targets,
+                tanimoto_ranking,
+                violation_targets,
+            );
 
             MoleculeAutoencoderTrainingOutput::new(reconstruction, losses)
         }
@@ -162,6 +182,7 @@ mod tests {
             fingerprint_indices: vec![1, 3],
             fingerprint_counts: vec![2, 1],
             descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+            ..Default::default()
         }
     }
 
@@ -182,12 +203,14 @@ mod tests {
             tanimoto_ranking_accuracy: scalar::<B>(0.5, &device),
             tanimoto_ranking_pairs: scalar::<B>(2.0, &device),
             tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(&device),
+            violation_bce: scalar::<B>(0.1, &device),
+            violation_diagnostics: ViolationDiagnostics::empty(&device),
         };
 
         let output = MoleculeAutoencoderTrainingOutput::new(reconstruction, losses);
 
-        assert!((output.loss.clone().into_scalar() - 1.9).abs() < 1.0e-6);
-        assert!((output.total_loss().into_scalar() - 1.9).abs() < 1.0e-6);
+        assert!((output.loss.clone().into_scalar() - 2.0).abs() < 1.0e-6);
+        assert!((output.total_loss().into_scalar() - 2.0).abs() < 1.0e-6);
     }
 
     #[test]
@@ -204,17 +227,20 @@ mod tests {
                 tanimoto_ranking_accuracy: scalar::<B>(0.5, &device),
                 tanimoto_ranking_pairs: scalar::<B>(2.0, &device),
                 tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(&device),
+                violation_bce: scalar::<B>(0.1, &device),
+                violation_diagnostics: ViolationDiagnostics::empty(&device),
             },
         )
         .sync();
 
-        assert!((output.loss.into_scalar() - 1.9).abs() < 1.0e-6);
+        assert!((output.loss.into_scalar() - 2.0).abs() < 1.0e-6);
         assert!((output.losses.reconstruction.into_scalar() - 1.0).abs() < 1.0e-6);
         assert!((output.losses.reconstruction_bce.into_scalar() - 0.3).abs() < 1.0e-6);
         assert!((output.losses.descriptors.into_scalar() - 0.2).abs() < 1.0e-6);
         assert!((output.losses.tanimoto_ranking.into_scalar() - 0.4).abs() < 1.0e-6);
         assert!((output.losses.tanimoto_ranking_accuracy.into_scalar() - 0.5).abs() < 1.0e-6);
         assert!((output.losses.tanimoto_ranking_pairs.into_scalar() - 2.0).abs() < 1.0e-6);
+        assert!((output.losses.violation_bce.into_scalar() - 0.1).abs() < 1.0e-6);
     }
 
     #[test]

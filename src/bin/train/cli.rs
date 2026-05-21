@@ -6,10 +6,11 @@ use clap::{Parser, ValueEnum};
 use molecular_autoencoder::{
     DEFAULT_BCE_NONZERO_WEIGHT, DEFAULT_BCE_WEIGHT, DEFAULT_BCE_ZERO_WEIGHT,
     DEFAULT_DESCRIPTOR_WEIGHT, DEFAULT_ECFP_RADIUS, DEFAULT_HIDDEN_WIDTHS,
-    DEFAULT_LATENT_NOISE_STD, DEFAULT_LATENT_WIDTH, DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
-    DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE,
-    DEFAULT_TANIMOTO_RANKING_MIN_GAP, DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
-    DEFAULT_TANIMOTO_RANKING_WEIGHT, MoleculeAutoencoderConfig, SmilesQualityFilter,
+    DEFAULT_LATENT_NOISE_STD, DEFAULT_LATENT_WIDTH, DEFAULT_NEGATIVES_PER_POSITIVE,
+    DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR, DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE,
+    DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_MIN_GAP,
+    DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH, DEFAULT_TANIMOTO_RANKING_WEIGHT,
+    DEFAULT_VIOLATION_WEIGHT, MoleculeAutoencoderConfig, SmilesQualityFilter,
 };
 
 use crate::{AppResult, invalid_input};
@@ -243,6 +244,17 @@ pub struct Args {
     #[arg(long, default_value_t = DEFAULT_TANIMOTO_RANKING_WEIGHT)]
     pub tanimoto_ranking_weight: f64,
 
+    /// Multi-label violation-classification loss weight (latent head).
+    #[arg(long, default_value_t = DEFAULT_VIOLATION_WEIGHT)]
+    pub violation_weight: f64,
+
+    /// Average number of `MutatorMix`-generated negative rows the
+    /// preprocessor emits per source positive (fractional values use a
+    /// per-record Bernoulli draw). Has no effect on training runs that
+    /// reuse an already-preprocessed shard manifest.
+    #[arg(long, default_value_t = DEFAULT_NEGATIVES_PER_POSITIVE)]
+    pub negatives_per_positive: f32,
+
     /// Latent cosine-logit temperature (alias: --tanimoto-ranking-margin).
     #[arg(long, alias = "tanimoto-ranking-margin", default_value_t = DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE)]
     pub tanimoto_ranking_latent_temperature: f64,
@@ -413,6 +425,7 @@ impl Args {
             .hidden_widths(self.hidden_widths.clone())
             .descriptor_weight(self.descriptor_weight)
             .tanimoto_ranking_weight(self.tanimoto_ranking_weight)
+            .violation_weight(self.violation_weight)
             .latent_noise_std(self.latent_noise_std)
             .tanimoto_ranking_latent_temperature(self.tanimoto_ranking_latent_temperature)
             .tanimoto_ranking_metric_temperature(self.tanimoto_ranking_metric_temperature)

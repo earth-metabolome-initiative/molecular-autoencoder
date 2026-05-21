@@ -27,16 +27,16 @@ pub use batch::{
 };
 #[cfg(feature = "std")]
 pub use batch::{MoleculeAutoencoderHostBatch, MoleculeBatchBuildProfile};
+pub use data::{
+    DEFAULT_NEGATIVES_PER_POSITIVE, DataSplit, MoleculeRecord, MoleculeShardRow, MoleculeTargets,
+    PreprocessingConfig, PreprocessingConfigBuilder, SHARD_MANIFEST_VERSION, ShardManifest,
+    ShardManifestEntry, SparseMoleculeShard, preprocess_record,
+};
 #[cfg(feature = "datasets")]
 pub use data::{
     DEFAULT_PREPROCESS_CHUNK_ROWS, DEFAULT_PREPROCESS_THREADS, DEFAULT_ROWS_PER_SHARD,
     DatasetPreprocessOptions, DatasetPreprocessOptionsBuilder, PreprocessedDatasetChunk,
     molecule_records_from_smiles_dataset, preprocess_dataset_record_chunks,
-};
-pub use data::{
-    DataSplit, MoleculeRecord, MoleculeShardRow, MoleculeTargets, PreprocessingConfig,
-    PreprocessingConfigBuilder, SHARD_MANIFEST_VERSION, ShardManifest, ShardManifestEntry,
-    SparseMoleculeShard, preprocess_record,
 };
 pub use error::{Error, Result};
 pub use features::{
@@ -45,7 +45,8 @@ pub use features::{
 };
 pub use fingerprints::{
     CountedEcfpConfig, CountedEcfpConfigBuilder, DEFAULT_ECFP_RADIUS, DEFAULT_ECFP_SIZE,
-    FingerprintTargets, compute_fingerprint_targets,
+    FingerprintTargets, VIOLATION_CLASS_COUNT, compute_fingerprint_targets,
+    compute_negative_fingerprint_targets,
 };
 pub use metrics::{
     CountReconstructionMetrics, batch_binary_tanimoto, batch_count_tanimoto,
@@ -59,17 +60,18 @@ pub use model::{
     DEFAULT_RECONSTRUCTION_NONZERO_WEIGHT, DEFAULT_RECONSTRUCTION_ZERO_WEIGHT,
     DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR, DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE,
     DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_MIN_GAP,
-    DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH, DEFAULT_TANIMOTO_RANKING_WEIGHT, Decoder,
-    DecoderConfig, DecoderConfigBuilder, Encoder, EncoderConfig, EncoderConfigBuilder,
-    MoleculeAutoencoder, MoleculeAutoencoderConfig, MoleculeAutoencoderConfigBuilder,
-    MoleculeAutoencoderOutput, MoleculeLossBreakdown, ReconstructionLossConfig,
-    ReconstructionLossConfigBuilder, TanimotoRankingConfig, TanimotoRankingConfigBuilder,
-    TanimotoRankingRuntimeConfig, apply_latent_noise, weighted_sparse_log_count_bce_loss,
-    weighted_sparse_log_count_huber_loss,
+    DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH, DEFAULT_TANIMOTO_RANKING_WEIGHT,
+    DEFAULT_VIOLATION_WEIGHT, Decoder, DecoderConfig, DecoderConfigBuilder, Encoder, EncoderConfig,
+    EncoderConfigBuilder, MoleculeAutoencoder, MoleculeAutoencoderConfig,
+    MoleculeAutoencoderConfigBuilder, MoleculeAutoencoderOutput, MoleculeLossBreakdown,
+    ReconstructionLossConfig, ReconstructionLossConfigBuilder, TanimotoRankingConfig,
+    TanimotoRankingConfigBuilder, TanimotoRankingRuntimeConfig, apply_latent_noise,
+    weighted_sparse_log_count_bce_loss, weighted_sparse_log_count_huber_loss,
 };
 pub use ranking::{
     TanimotoRankingBatch, TanimotoRankingDiagnostics, TanimotoRankingOutput,
-    TanimotoRankingQuality, tanimoto_ranking_output, tanimoto_ranking_quality,
+    TanimotoRankingQuality, ViolationClassificationQuality, ViolationDiagnostics,
+    tanimoto_ranking_output, tanimoto_ranking_quality, violation_classification_quality,
     weighted_tanimoto_ranking_output,
 };
 #[cfg(feature = "train")]

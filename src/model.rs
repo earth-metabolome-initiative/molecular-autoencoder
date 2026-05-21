@@ -615,6 +615,14 @@ impl ReconstructionLossConfigBuilder {
     }
 }
 
+/// Default weight applied to the violation-classification side task.
+pub const DEFAULT_VIOLATION_WEIGHT: f64 = 0.5;
+
+/// Serde fallback for the violation-classification loss weight.
+const fn default_violation_weight() -> f64 {
+    DEFAULT_VIOLATION_WEIGHT
+}
+
 /// Auxiliary side-task weights. Construct via [`AuxiliaryLossWeights::builder`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AuxiliaryLossWeights {
@@ -624,6 +632,10 @@ pub struct AuxiliaryLossWeights {
     /// Weight applied to the latent Tanimoto geometry side task.
     #[serde(default = "default_tanimoto_ranking_weight")]
     tanimoto_ranking: f64,
+    /// Weight applied to the multi-label violation-classification side
+    /// task that reads from the latent embedding.
+    #[serde(default = "default_violation_weight")]
+    violation: f64,
 }
 
 impl Default for AuxiliaryLossWeights {
@@ -653,6 +665,12 @@ impl AuxiliaryLossWeights {
     pub const fn tanimoto_ranking(&self) -> f64 {
         self.tanimoto_ranking
     }
+
+    /// Weight for the multi-label violation-classification side task.
+    #[must_use]
+    pub const fn violation(&self) -> f64 {
+        self.violation
+    }
 }
 
 /// Fluent builder for [`AuxiliaryLossWeights`].
@@ -662,6 +680,8 @@ pub struct AuxiliaryLossWeightsBuilder {
     descriptors: f64,
     /// Pending latent Tanimoto geometry weight.
     tanimoto_ranking: f64,
+    /// Pending violation-classification weight.
+    violation: f64,
 }
 
 impl Default for AuxiliaryLossWeightsBuilder {
@@ -677,6 +697,7 @@ impl AuxiliaryLossWeightsBuilder {
         Self {
             descriptors: DEFAULT_DESCRIPTOR_WEIGHT,
             tanimoto_ranking: DEFAULT_TANIMOTO_RANKING_WEIGHT,
+            violation: DEFAULT_VIOLATION_WEIGHT,
         }
     }
 
@@ -694,16 +715,24 @@ impl AuxiliaryLossWeightsBuilder {
         self
     }
 
+    /// Sets the violation-classification loss weight.
+    #[must_use]
+    pub const fn violation(mut self, value: f64) -> Self {
+        self.violation = value;
+        self
+    }
+
     /// Validates and builds the immutable [`AuxiliaryLossWeights`].
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ConfigInvalid`] when either weight is negative or
+    /// Returns [`Error::ConfigInvalid`] when any weight is negative or
     /// non-finite.
     pub fn build(self) -> Result<AuxiliaryLossWeights> {
         for (label, value) in [
             ("descriptors", self.descriptors),
             ("tanimoto_ranking", self.tanimoto_ranking),
+            ("violation", self.violation),
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(Error::ConfigInvalid {
@@ -714,6 +743,7 @@ impl AuxiliaryLossWeightsBuilder {
         Ok(AuxiliaryLossWeights {
             descriptors: self.descriptors,
             tanimoto_ranking: self.tanimoto_ranking,
+            violation: self.violation,
         })
     }
 }
@@ -1245,6 +1275,11 @@ impl MoleculeAutoencoderConfig {
             decoder: self.decoder.init(device),
             descriptor_head: LinearConfig::new(self.encoder.latent_width, self.descriptor_width)
                 .init(device),
+            violation_head: LinearConfig::new(
+                self.encoder.latent_width,
+                crate::fingerprints::VIOLATION_CLASS_COUNT,
+            )
+            .init(device),
             reconstruction_beta: self.reconstruction_loss.beta,
             zero_weight: self.reconstruction_loss.zero_weight,
             nonzero_weight: self.reconstruction_loss.nonzero_weight,
@@ -1253,6 +1288,7 @@ impl MoleculeAutoencoderConfig {
             bce_nonzero_weight: self.reconstruction_loss.bce_nonzero_weight,
             descriptor_weight: self.auxiliary_weights.descriptors,
             tanimoto_ranking_weight: self.auxiliary_weights.tanimoto_ranking,
+            violation_weight: self.auxiliary_weights.violation,
             tanimoto_ranking_latent_temperature: self.tanimoto_ranking.latent_temperature,
             tanimoto_ranking_metric_temperature: self.tanimoto_ranking.metric_temperature,
             tanimoto_ranking_min_gap: self.tanimoto_ranking.min_gap,
@@ -1287,6 +1323,9 @@ pub struct MoleculeAutoencoderConfigBuilder {
     descriptor_weight: f64,
     /// Weight applied to the latent Tanimoto geometry side task.
     tanimoto_ranking_weight: f64,
+    /// Weight applied to the multi-label violation-classification side
+    /// task on top of the latent embedding.
+    violation_weight: f64,
     /// Standard deviation of the Gaussian noise injected into the
     /// decoder-side latent at training time.
     latent_noise_std: f64,
@@ -1326,6 +1365,7 @@ impl MoleculeAutoencoderConfigBuilder {
             hidden_widths: DEFAULT_HIDDEN_WIDTHS.to_vec(),
             descriptor_weight: DEFAULT_DESCRIPTOR_WEIGHT,
             tanimoto_ranking_weight: DEFAULT_TANIMOTO_RANKING_WEIGHT,
+            violation_weight: DEFAULT_VIOLATION_WEIGHT,
             latent_noise_std: DEFAULT_LATENT_NOISE_STD,
             latent_temperature: DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE,
             metric_temperature: DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE,
@@ -1371,6 +1411,13 @@ impl MoleculeAutoencoderConfigBuilder {
     #[must_use]
     pub const fn tanimoto_ranking_weight(mut self, value: f64) -> Self {
         self.tanimoto_ranking_weight = value;
+        self
+    }
+
+    /// Sets the multi-label violation-classification loss weight.
+    #[must_use]
+    pub const fn violation_weight(mut self, value: f64) -> Self {
+        self.violation_weight = value;
         self
     }
 
@@ -1476,6 +1523,7 @@ impl MoleculeAutoencoderConfigBuilder {
             auxiliary_weights: AuxiliaryLossWeights {
                 descriptors: self.descriptor_weight,
                 tanimoto_ranking: self.tanimoto_ranking_weight,
+                violation: self.violation_weight,
             },
             tanimoto_ranking: TanimotoRankingConfig {
                 latent_temperature: self.latent_temperature,
@@ -1574,6 +1622,11 @@ pub struct MoleculeAutoencoderOutput<B: Backend> {
     pub reconstructed_log_counts: Tensor<B, 2>,
     /// Scalar descriptor predictions.
     pub descriptor_predictions: Tensor<B, 2>,
+    /// Multi-label violation-classification logits with shape
+    /// `[batch, 8]`. Sigmoid + BCE against the per-sample violation
+    /// bitset trains the encoder to surface chemistry-validity signals
+    /// on the latent.
+    pub violation_logits: Tensor<B, 2>,
 }
 
 /// Weighted loss components.
@@ -1598,6 +1651,15 @@ pub struct MoleculeLossBreakdown<B: Backend> {
     /// round-trip. Empty (zero-sized shapes) when the ranking loss is
     /// disabled or the batch is too small to contribute.
     pub tanimoto_diagnostics: TanimotoRankingDiagnostics<B>,
+    /// Weighted multi-label BCE-with-logits loss between
+    /// [`MoleculeAutoencoderOutput::violation_logits`] and the
+    /// per-sample [`finge_rs::ViolationClass`] bitset.
+    pub violation_bce: Tensor<B, 1>,
+    /// Raw violation-classifier logits + targets staged for host-side
+    /// classification-quality scoring (macro-MCC, accuracy) after the
+    /// next Transaction round-trip. Empty shapes when the head is
+    /// disabled or the batch is too small to contribute.
+    pub violation_diagnostics: crate::ranking::ViolationDiagnostics<B>,
 }
 
 impl<B: Backend> MoleculeLossBreakdown<B> {
@@ -1607,6 +1669,7 @@ impl<B: Backend> MoleculeLossBreakdown<B> {
             + self.reconstruction_bce.clone()
             + self.descriptors.clone()
             + self.tanimoto_ranking.clone()
+            + self.violation_bce.clone()
     }
 }
 
@@ -1620,6 +1683,10 @@ pub struct MoleculeAutoencoder<B: Backend> {
     /// Side head producing scalar descriptor regression predictions
     /// from the latent.
     descriptor_head: Linear<B>,
+    /// Multi-label violation-classification head reading from the
+    /// latent. Output shape is `[batch, 8]`; trained with BCE-with-
+    /// logits against the per-sample violation bitset.
+    violation_head: Linear<B>,
     /// Huber transition point in `log1p(count)` space.
     reconstruction_beta: f64,
     /// Per-position weight for zero-count target bins.
@@ -1636,6 +1703,8 @@ pub struct MoleculeAutoencoder<B: Backend> {
     descriptor_weight: f64,
     /// Side-task weight for the latent Tanimoto geometry head.
     tanimoto_ranking_weight: f64,
+    /// Side-task weight for the multi-label violation classifier.
+    violation_weight: f64,
     /// Temperature divisor for latent cosine logits inside the ranking
     /// loss.
     tanimoto_ranking_latent_temperature: f64,
@@ -1688,6 +1757,7 @@ impl<B: Backend> MoleculeAutoencoder<B> {
         MoleculeAutoencoderOutput {
             reconstructed_log_counts: self.decoder.forward(decoder_latent),
             descriptor_predictions: self.descriptor_head.forward(latent.clone()),
+            violation_logits: self.violation_head.forward(latent.clone()),
             latent,
         }
     }
@@ -1698,6 +1768,7 @@ impl<B: Backend> MoleculeAutoencoder<B> {
         MoleculeAutoencoderOutput {
             reconstructed_log_counts: self.decoder.forward(latent.clone()),
             descriptor_predictions: self.descriptor_head.forward(latent.clone()),
+            violation_logits: self.violation_head.forward(latent.clone()),
             latent,
         }
     }
@@ -1706,28 +1777,47 @@ impl<B: Backend> MoleculeAutoencoder<B> {
     pub fn loss(&self, batch: MoleculeAutoencoderBatch<B>) -> MoleculeLossBreakdown<B> {
         let MoleculeAutoencoderBatch {
             fingerprints,
+            target_fingerprints,
             descriptor_targets,
+            violation_targets,
             tanimoto_ranking,
             ..
         } = batch;
         let output = self.forward(&fingerprints);
-        self.loss_from_output(output, fingerprints, descriptor_targets, tanimoto_ranking)
+        self.loss_from_output(
+            output,
+            fingerprints,
+            target_fingerprints,
+            descriptor_targets,
+            tanimoto_ranking,
+            violation_targets,
+        )
     }
 
     /// Computes all weighted losses from a precomputed model output.
+    ///
+    /// `target_fingerprints` is the decoder reconstruction target. For
+    /// positive rows this batch is row-identical to `fingerprints`; for
+    /// negative rows it carries the source positive's fingerprint
+    /// (denoising / correction framing), so the decoder is trained to
+    /// map invalid inputs back onto valid chemistry. `violation_targets`
+    /// is a multi-hot `[batch, 8]` float matrix expanded from each
+    /// sample's [`finge_rs::ViolationLabel`] bitset.
     pub fn loss_from_output(
         &self,
         output: MoleculeAutoencoderOutput<B>,
         fingerprints: SparseFingerprintBatch<B>,
+        target_fingerprints: SparseFingerprintBatch<B>,
         descriptor_targets: Tensor<B, 2>,
         tanimoto_ranking: crate::ranking::TanimotoRankingBatch<B>,
+        violation_targets: Tensor<B, 2>,
     ) -> MoleculeLossBreakdown<B> {
         let device = output.reconstructed_log_counts.device();
         let latent = output.latent;
         let reconstruction_bce = if self.bce_weight > 0.0 {
             weighted_sparse_log_count_bce_loss(
                 output.reconstructed_log_counts.clone(),
-                &fingerprints,
+                &target_fingerprints,
                 self.bce_zero_weight,
                 self.bce_nonzero_weight,
             ) * self.bce_weight
@@ -1736,9 +1826,11 @@ impl<B: Backend> MoleculeAutoencoder<B> {
         };
         let reconstruction = weighted_sparse_log_count_huber_loss(
             output.reconstructed_log_counts,
-            fingerprints,
+            target_fingerprints,
             self.reconstruction_loss_config(),
         );
+        let _ = fingerprints; // retained for symmetry; unused once recon
+        // is computed against the decoder target.
         let descriptors = if self.descriptor_weight > 0.0 {
             (output.descriptor_predictions - descriptor_targets)
                 .powf_scalar(2.0)
@@ -1756,6 +1848,20 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             self.tanimoto_ranking_min_gap,
             self.tanimoto_ranking_weight,
         );
+        let violation_logits = output.violation_logits;
+        let violation_dims = violation_logits.dims();
+        let violation_diagnostics = crate::ranking::ViolationDiagnostics {
+            logits: violation_logits.clone(),
+            targets: violation_targets.clone(),
+            batch_size: violation_dims[0],
+            class_count: violation_dims[1],
+        };
+        let violation_bce = if self.violation_weight > 0.0 {
+            sigmoid_binary_cross_entropy(violation_logits, violation_targets)
+                * self.violation_weight
+        } else {
+            Tensor::zeros([1], &device)
+        };
 
         MoleculeLossBreakdown {
             reconstruction,
@@ -1765,8 +1871,28 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             tanimoto_ranking_accuracy: tanimoto.accuracy,
             tanimoto_ranking_pairs: tanimoto.valid_pairs,
             tanimoto_diagnostics: tanimoto.diagnostics,
+            violation_bce,
+            violation_diagnostics,
         }
     }
+}
+
+/// Numerically stable BCE-with-logits between `logits` and a multi-hot
+/// `targets` matrix, both shaped `[batch, classes]`. Reduces to the
+/// per-element mean, matching the standard PyTorch reduction.
+fn sigmoid_binary_cross_entropy<B: Backend>(
+    logits: Tensor<B, 2>,
+    targets: Tensor<B, 2>,
+) -> Tensor<B, 1> {
+    // log(1 + exp(-|x|)) + max(x, 0) - x * y
+    // Avoids the overflow path when |x| is large; equivalent to
+    // softplus(x) - x * y when applied to positive logits.
+    let zero = logits.clone() * 0.0;
+    let max_part = logits.clone().max_pair(zero);
+    let abs_neg = -logits.clone().abs();
+    let softplus = abs_neg.exp().log1p();
+    let cross = max_part - logits * targets + softplus;
+    cross.mean()
 }
 
 /// Applies Gaussian denoising noise to the decoder-side latent input.
@@ -2010,6 +2136,7 @@ mod tests {
                 fingerprint_indices: vec![1, 3, 5],
                 fingerprint_counts: vec![2, 1, 1],
                 descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                ..Default::default()
             }],
             &device,
         );
@@ -2021,12 +2148,65 @@ mod tests {
             output.descriptor_predictions.dims(),
             [1, REGRESSION_TARGET_WIDTH]
         );
+        assert_eq!(
+            output.violation_logits.dims(),
+            [1, crate::fingerprints::VIOLATION_CLASS_COUNT]
+        );
 
         let losses = model.loss(batch);
         assert!(losses.total().into_scalar().is_finite());
         assert_eq!(losses.tanimoto_ranking.dims(), [1]);
         assert_eq!(losses.tanimoto_ranking_accuracy.dims(), [1]);
         assert_eq!(losses.tanimoto_ranking_pairs.dims(), [1]);
+        assert_eq!(losses.violation_bce.dims(), [1]);
+        assert!(losses.violation_bce.into_scalar().is_finite());
+    }
+
+    #[test]
+    fn reconstruction_loss_uses_target_fingerprint_for_negative_rows() {
+        // A negative row's decoder target is the source positive's
+        // fingerprint, not its mutated input. Build a mixed batch where
+        // the (target == positive) and (input != positive); the
+        // reconstruction loss should be smaller when the decoder
+        // predicts the positive than when it predicts the negative.
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = MoleculeAutoencoderBatcher::new(8, REGRESSION_TARGET_WIDTH);
+        let batch: MoleculeAutoencoderBatch<B> = batcher.batch(
+            vec![MoleculeAutoencoderSample {
+                cid: 1,
+                fingerprint_indices: vec![5, 7],
+                fingerprint_counts: vec![1, 1],
+                descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                violation_label: 0b0000_0001,
+                target_fingerprint_indices: vec![1, 3],
+                target_fingerprint_counts: vec![2, 1],
+            }],
+            &device,
+        );
+
+        // Sanity: target storage holds the source positive bins.
+        let target_indices = batch
+            .target_fingerprints
+            .indices
+            .to_data()
+            .as_slice::<i64>()
+            .expect("i64 target indices")
+            .to_vec();
+        assert_eq!(target_indices, vec![1, 3]);
+        let input_indices = batch
+            .fingerprints
+            .indices
+            .to_data()
+            .as_slice::<i64>()
+            .expect("i64 input indices")
+            .to_vec();
+        assert_eq!(input_indices, vec![5, 7]);
+
+        let model = MoleculeAutoencoderConfig::symmetric(8, 4, vec![16]).init::<B>(&device);
+        let losses = model.loss(batch);
+        assert!(losses.reconstruction.into_scalar().is_finite());
+        assert!(losses.violation_bce.into_scalar().is_finite());
     }
 
     #[test]
@@ -2041,12 +2221,14 @@ mod tests {
                     fingerprint_indices: vec![0, 2],
                     fingerprint_counts: vec![2, 1],
                     descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                    ..Default::default()
                 },
                 MoleculeAutoencoderSample {
                     cid: 2,
                     fingerprint_indices: vec![1],
                     fingerprint_counts: vec![3],
                     descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                    ..Default::default()
                 },
             ],
             &device,
@@ -2096,6 +2278,7 @@ mod tests {
                 fingerprint_indices: vec![1],
                 fingerprint_counts: vec![2],
                 descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                ..Default::default()
             }],
             &device,
         );
@@ -2131,6 +2314,7 @@ mod tests {
                 fingerprint_indices: vec![1],
                 fingerprint_counts: vec![2],
                 descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                ..Default::default()
             }],
             &device,
         );
@@ -2168,6 +2352,7 @@ mod tests {
                 fingerprint_indices: vec![0, 2],
                 fingerprint_counts: vec![2, 1],
                 descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                ..Default::default()
             }],
             &device,
         );
@@ -2226,6 +2411,7 @@ mod tests {
                 fingerprint_indices: vec![1, 3],
                 fingerprint_counts: vec![3, 1],
                 descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                ..Default::default()
             }],
             &device,
         );
@@ -2254,6 +2440,7 @@ mod tests {
                 fingerprint_indices: vec![0],
                 fingerprint_counts: vec![1],
                 descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                ..Default::default()
             }],
             &device,
         );
@@ -2287,6 +2474,7 @@ mod tests {
                 fingerprint_indices: vec![1, 3],
                 fingerprint_counts: vec![3, 1],
                 descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                ..Default::default()
             }],
             &device,
         );
@@ -2351,12 +2539,14 @@ mod tests {
                     fingerprint_indices: vec![0, 2, 4],
                     fingerprint_counts: vec![2, 1, 3],
                     descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                    ..Default::default()
                 },
                 MoleculeAutoencoderSample {
                     cid: 2,
                     fingerprint_indices: vec![1, 3, 5],
                     fingerprint_counts: vec![1, 2, 1],
                     descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                    ..Default::default()
                 },
             ],
             &device,
@@ -2656,6 +2846,7 @@ mod tests {
                 fingerprint_indices: vec![0, 2],
                 fingerprint_counts: vec![2, 1],
                 descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                ..Default::default()
             }],
             &device,
         );

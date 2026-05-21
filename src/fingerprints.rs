@@ -11,6 +11,15 @@ pub const DEFAULT_ECFP_RADIUS: u8 = 2;
 /// Default folded counted ECFP width for the v1 model.
 pub const DEFAULT_ECFP_SIZE: usize = 4096;
 
+/// Number of [`finge_rs::ViolationClass`] variants the multi-label
+/// classifier head distinguishes (mirrors `ViolationClass::COUNT`).
+pub const VIOLATION_CLASS_COUNT: usize = finge_rs::ViolationClass::COUNT;
+
+/// Maximum number of `MutatorMix::sample` attempts per negative slot before
+/// giving up. Mutators can fail on small or all-aliphatic molecules; a
+/// handful of re-rolls usually finds a viable target.
+const NEGATIVE_FINGERPRINT_RETRIES: u32 = 4;
+
 /// Counted ECFP configuration. Construct via [`CountedEcfpConfig::builder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CountedEcfpConfig {
@@ -234,9 +243,81 @@ pub fn compute_fingerprint_targets(
             message: source.to_string(),
         })?;
     let fingerprint = config.to_fingerprint().compute(&prepared);
+    fingerprint_targets_from_active_counts(fingerprint.active_counts(), size)
+}
+
+/// Drives [`finge_rs::MutatorMix`] once on a parsed SMILES.
+///
+/// Returns the counted-ECFP fingerprint of the mutated molecule along
+/// with the [`finge_rs::ViolationLabel`] bitset describing every
+/// violation class the post-mutation predicates fire on.
+///
+/// Returns `Ok(None)` when no eligible mutation can be produced for this
+/// input even after a small number of retry attempts. Tiny or strictly
+/// aliphatic molecules can legitimately reject every mutator (e.g. the
+/// topological-pathology mutator needs at least one aromatic bond);
+/// callers should treat the `None` arm as a silent skip.
+///
+/// # Errors
+///
+/// Returns [`Error::FingerprintPreparation`] when `finge-rs` cannot prepare
+/// the SMILES, or [`Error::InvalidBatch`] when the produced fingerprint
+/// exceeds the configured sparse-index storage.
+pub fn compute_negative_fingerprint_targets(
+    molecule_id: u64,
+    smiles: &Smiles,
+    seed: u64,
+    config: CountedEcfpConfig,
+    scratch: &mut finge_rs::smiles_support::SmilesRdkitScratch,
+) -> Result<Option<(FingerprintTargets, finge_rs::ViolationLabel)>> {
+    use finge_rs::Fingerprint;
+    use rand_chacha::ChaCha8Rng;
+    use rand_chacha::rand_core::SeedableRng;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut last_error: Option<finge_rs::MutatorError> = None;
+
+    for _ in 0..NEGATIVE_FINGERPRINT_RETRIES {
+        let prepared =
+            scratch
+                .try_prepare(smiles)
+                .map_err(|source| Error::FingerprintPreparation {
+                    molecule_id,
+                    message: source.to_string(),
+                })?;
+        // `MutatorMix<'_, G>` captures the prepared graph's lifetime in
+        // the mutator/predicate trait objects, so we rebuild the mix
+        // inside the loop where the fresh scratch borrow is in scope.
+        let mix = finge_rs::MutatorMix::with_default_mutators_and_predicates();
+        match mix.sample(prepared, &mut rng) {
+            Ok((invalidated, label)) => {
+                let fingerprint = config.to_fingerprint().compute(&invalidated);
+                let targets = fingerprint_targets_from_active_counts(
+                    fingerprint.active_counts(),
+                    config.size(),
+                )?;
+                return Ok(Some((targets, label)));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    // Every retry yielded a "no eligible target" outcome. Surfacing as
+    // Ok(None) lets the preprocessor degrade gracefully on small or
+    // all-aliphatic inputs without poisoning the positive emit.
+    let _ = last_error;
+    Ok(None)
+}
+
+/// Collects sparse `(index, count)` pairs from a finge-rs fingerprint into a
+/// [`FingerprintTargets`] of the configured width.
+fn fingerprint_targets_from_active_counts(
+    pairs: impl IntoIterator<Item = (usize, u32)>,
+    size: usize,
+) -> Result<FingerprintTargets> {
     let mut indices = Vec::new();
     let mut counts = Vec::new();
-    for (index, count) in fingerprint.active_counts() {
+    for (index, count) in pairs {
         let index = u16::try_from(index).map_err(|_| {
             Error::InvalidBatch(format!("fingerprint index {index} exceeds u16 storage"))
         })?;
@@ -301,6 +382,58 @@ mod tests {
             targets.to_dense_log_counts(),
             vec![0.0, 2.0_f32.ln_1p(), 0.0, 4.0_f32.ln_1p(), 0.0]
         );
+    }
+
+    #[test]
+    fn negative_fingerprint_emits_label_and_distinct_indices_for_phenol() {
+        let smiles: Smiles = "c1ccccc1O".parse().expect("valid SMILES");
+        let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
+        let positive =
+            compute_fingerprint_targets(42, &smiles, CountedEcfpConfig::default(), &mut scratch)
+                .expect("positive fingerprint");
+        let (negative, label) = compute_negative_fingerprint_targets(
+            42,
+            &smiles,
+            0x00C0_FFEE,
+            CountedEcfpConfig::default(),
+            &mut scratch,
+        )
+        .expect("negative fingerprint")
+        .expect("phenol accepts at least one mutator");
+
+        assert_eq!(negative.fingerprint_size(), positive.fingerprint_size());
+        assert!(!label.is_empty(), "MutatorMix must set at least one bit");
+        // A single-mutation negative usually differs from the positive in
+        // at least one sparse bin; treat equality as a regression.
+        assert_ne!(negative.indices(), positive.indices());
+    }
+
+    #[test]
+    fn negative_fingerprint_is_deterministic_under_same_seed() {
+        let smiles: Smiles = "c1ccc(N)cc1".parse().expect("valid SMILES");
+        let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
+        let first = compute_negative_fingerprint_targets(
+            7,
+            &smiles,
+            0xCAFE_BABE,
+            CountedEcfpConfig::default(),
+            &mut scratch,
+        )
+        .expect("first sample")
+        .expect("aniline accepts mutators");
+        let second = compute_negative_fingerprint_targets(
+            7,
+            &smiles,
+            0xCAFE_BABE,
+            CountedEcfpConfig::default(),
+            &mut scratch,
+        )
+        .expect("second sample")
+        .expect("aniline accepts mutators");
+
+        assert_eq!(first.0.indices(), second.0.indices());
+        assert_eq!(first.0.counts(), second.0.counts());
+        assert_eq!(first.1.as_u8(), second.1.as_u8());
     }
 
     #[test]

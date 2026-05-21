@@ -97,6 +97,145 @@ impl<B: Backend> TanimotoRankingDiagnostics<B> {
     }
 }
 
+/// Raw violation-classifier tensors staged for host-side quality metrics.
+///
+/// Both tensors are shaped `[batch, class_count]` so the host-side
+/// MCC / accuracy helper can iterate them in lockstep after a
+/// Transaction round-trip.
+#[derive(Debug, Clone)]
+pub struct ViolationDiagnostics<B: Backend> {
+    /// Per-sample violation-classifier logits, shape `[batch, classes]`.
+    pub logits: Tensor<B, 2>,
+    /// Per-sample multi-hot violation targets, shape `[batch, classes]`.
+    pub targets: Tensor<B, 2>,
+    /// Number of samples that contributed to the loss (== batch size).
+    pub batch_size: usize,
+    /// Number of violation classes (== `VIOLATION_CLASS_COUNT`).
+    pub class_count: usize,
+}
+
+impl<B: Backend> ViolationDiagnostics<B> {
+    /// Empty diagnostics for the zero-loss / pre-sync path. The tensors
+    /// have zero-sized shapes so Transactions can register them but the
+    /// host-side helper short-circuits on `batch_size == 0`.
+    #[must_use]
+    pub fn empty(device: &B::Device) -> Self {
+        Self {
+            logits: Tensor::zeros([0, 0], device),
+            targets: Tensor::zeros([0, 0], device),
+            batch_size: 0,
+            class_count: 0,
+        }
+    }
+}
+
+/// Macro-averaged classification-quality scalars for the violation head.
+///
+/// Both scalars treat each of the `class_count` independent binary
+/// heads equally regardless of class frequency, which matters because
+/// the per-class positive rate is heavily skewed (most rows have label
+/// `0x00`, and even on negative rows only one or two bits typically
+/// co-fire).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ViolationClassificationQuality {
+    /// Matthews correlation coefficient averaged over classes (macro-
+    /// MCC). Each class is treated as an independent binary classifier
+    /// with threshold `logit > 0` (== `sigmoid(logit) > 0.5`), and the
+    /// per-class MCC is averaged. Range `[-1, 1]`, `0.0` indicates
+    /// random-quality predictions. A class whose confusion-matrix
+    /// denominator is zero (e.g. the head predicts the same label
+    /// everywhere, or no positives exist in the batch) contributes
+    /// `0.0`, matching the convention used by `sklearn` and most
+    /// retrieval benchmarks.
+    pub mcc_macro: f32,
+    /// Fraction of `(sample, class)` cells where the thresholded
+    /// prediction matches the target bit, averaged over the entire
+    /// `batch * class_count` matrix. Falls back to `0.0` when the
+    /// batch is empty.
+    pub accuracy: f32,
+}
+
+/// Computes [`ViolationClassificationQuality`] from already-materialised
+/// host buffers. Returns all-zeros when the batch is empty.
+///
+/// `logits` and `targets` are expected in `[batch * class_count]`
+/// row-major layout; `targets` is the multi-hot float vector
+/// (`1.0` for set bits, `0.0` otherwise) emitted by the batcher from
+/// each sample's `ViolationLabel` bitset.
+///
+/// # Panics
+///
+/// Panics when either slice is shorter than `batch_size * class_count`.
+#[must_use]
+pub fn violation_classification_quality(
+    logits: &[f32],
+    targets: &[f32],
+    batch_size: usize,
+    class_count: usize,
+) -> ViolationClassificationQuality {
+    if batch_size == 0 || class_count == 0 {
+        return ViolationClassificationQuality::default();
+    }
+    let expected = batch_size * class_count;
+    assert!(
+        logits.len() >= expected,
+        "logits buffer is too short for the declared batch * class_count shape"
+    );
+    assert!(
+        targets.len() >= expected,
+        "targets buffer is too short for the declared batch * class_count shape"
+    );
+
+    let mut mcc_sum = 0.0_f64;
+    let mut correct = 0_u64;
+    for class in 0..class_count {
+        let mut tp = 0_u64;
+        let mut tn = 0_u64;
+        let mut fp = 0_u64;
+        let mut fn_count = 0_u64;
+        for sample in 0..batch_size {
+            let offset = sample * class_count + class;
+            let predicted = logits[offset] > 0.0;
+            let actual = targets[offset] > 0.5;
+            match (predicted, actual) {
+                (true, true) => tp += 1,
+                (false, false) => tn += 1,
+                (true, false) => fp += 1,
+                (false, true) => fn_count += 1,
+            }
+        }
+        correct += tp + tn;
+        mcc_sum += binary_mcc(tp, tn, fp, fn_count);
+    }
+    ViolationClassificationQuality {
+        mcc_macro: (mcc_sum / class_count as f64) as f32,
+        accuracy: correct as f32 / expected as f32,
+    }
+}
+
+/// Matthews correlation coefficient for a single 2x2 confusion matrix.
+///
+/// Returns `0.0` when any of the four marginal sums (`TP + FP`,
+/// `TP + FN`, `TN + FP`, `TN + FN`) is zero — matching the convention
+/// `sklearn.metrics.matthews_corrcoef` uses for the all-positive /
+/// all-negative degenerate cases.
+fn binary_mcc(tp: u64, tn: u64, fp: u64, fn_count: u64) -> f64 {
+    let row_pos = tp + fp;
+    let row_neg = tn + fn_count;
+    let col_pos = tp + fn_count;
+    let col_neg = tn + fp;
+    if row_pos == 0 || row_neg == 0 || col_pos == 0 || col_neg == 0 {
+        return 0.0;
+    }
+    let tp = tp as f64;
+    let tn = tn as f64;
+    let fp = fp as f64;
+    let fn_ = fn_count as f64;
+    let numerator = tp * tn - fp * fn_;
+    let denominator = (row_pos as f64 * row_neg as f64 * col_pos as f64 * col_neg as f64).sqrt();
+    numerator / denominator
+}
+
 /// In-batch softmax ranking objective for counted-fingerprint Tanimoto metric order.
 #[must_use]
 pub fn tanimoto_ranking_output<B: Backend>(
@@ -690,5 +829,74 @@ mod tests {
         let quality =
             tanimoto_ranking_quality(&[0.0_f32; 4], &[0.0_f32; 4], &[0_i32], &[0.0_f32], 1, 4);
         assert_eq!(quality, TanimotoRankingQuality::default());
+    }
+
+    #[test]
+    fn violation_classification_quality_perfect_predictions_score_one() {
+        // 2 samples, 4 classes; predictions match targets exactly.
+        // Class 0: tgt [1, 0] logits [+5, -5] -> TP=1, TN=1
+        // Class 1: tgt [0, 1] logits [-5, +5] -> TP=1, TN=1
+        // Class 2: tgt [1, 1] logits [+5, +5] -> TP=2 (no negatives -> MCC=0 by convention)
+        // Class 3: tgt [0, 0] logits [-5, -5] -> TN=2 (no positives -> MCC=0)
+        // Macro MCC = (1 + 1 + 0 + 0) / 4 = 0.5, accuracy = 1.0
+        let logits = vec![5.0, -5.0, 5.0, -5.0, -5.0, 5.0, 5.0, -5.0];
+        let targets = vec![1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
+        let quality = violation_classification_quality(&logits, &targets, 2, 4);
+        assert!((quality.accuracy - 1.0).abs() < 1.0e-6);
+        assert!((quality.mcc_macro - 0.5).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn violation_classification_quality_inverted_predictions_score_negative_one() {
+        // 2 samples, 1 class. Targets [1, 0]; predictions [-5, +5] are
+        // completely inverted -> TP=0, TN=0, FP=1, FN=1, MCC=-1.
+        let quality = violation_classification_quality(&[-5.0, 5.0], &[1.0, 0.0], 2, 1);
+        assert_eq!(quality.accuracy, 0.0);
+        assert!((quality.mcc_macro + 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn violation_classification_quality_returns_zero_when_class_has_no_variance() {
+        // Single class, all-positive targets, model also predicts all
+        // positive: TP=4, FN=0, TN=0, FP=0. Denominator factors include
+        // (TN+FP)=0 -> MCC=0 by convention.
+        let quality = violation_classification_quality(&[5.0; 4], &[1.0_f32; 4], 4, 1);
+        assert_eq!(quality.accuracy, 1.0);
+        assert_eq!(quality.mcc_macro, 0.0);
+    }
+
+    #[test]
+    fn violation_classification_quality_handles_empty_inputs() {
+        let quality = violation_classification_quality(&[], &[], 0, 0);
+        assert_eq!(quality, ViolationClassificationQuality::default());
+        let quality = violation_classification_quality(&[1.0_f32; 4], &[1.0_f32; 4], 0, 8);
+        assert_eq!(quality, ViolationClassificationQuality::default());
+    }
+
+    #[test]
+    fn violation_classification_quality_mixed_classes_average_per_class_mcc() {
+        // 4 samples, 2 classes.
+        // Class 0: targets [1, 0, 1, 0], logits [+5, -5, -5, +5]
+        //   -> TP=1, TN=1, FP=1, FN=1
+        //   -> num = 1 - 1 = 0, MCC=0
+        // Class 1: targets [1, 1, 0, 0], logits [+5, +5, -5, -5] (perfect)
+        //   -> TP=2, TN=2, FP=0, FN=0
+        //   -> MCC=1
+        // Macro = (0 + 1)/2 = 0.5; accuracy = (2+4)/8 = 0.75
+        let logits = vec![5.0, 5.0, -5.0, 5.0, -5.0, -5.0, 5.0, -5.0];
+        let targets = vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        let quality = violation_classification_quality(&logits, &targets, 4, 2);
+        assert!((quality.mcc_macro - 0.5).abs() < 1.0e-5);
+        assert!((quality.accuracy - 0.75).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn binary_mcc_matches_textbook_formula() {
+        // Wikipedia worked example: TP=90, TN=80, FP=10, FN=20.
+        // MCC = (90*80 - 10*20) / sqrt(100 * 110 * 90 * 100)
+        //     = (7200 - 200) / sqrt(99_000_000)
+        //     = 7000 / 9949.87... = 0.7035...
+        let mcc = binary_mcc(90, 80, 10, 20);
+        assert!((mcc - 0.703_526).abs() < 1.0e-5, "got {mcc}");
     }
 }

@@ -15,7 +15,17 @@ use crate::{
 };
 
 /// Magic bytes stamped at the start of every cached sparse shard file.
-const SHARD_MAGIC: [u8; 8] = *b"MAESH02\0";
+///
+/// `MAESH03` is the post-`v2 → v3` bump introduced when negative-molecule
+/// rows joined the shard schema: each row now carries a violation-class
+/// bitset and, for negatives, a second (CSR-encoded) decoder-target
+/// fingerprint. Older `MAESH02` shards must be re-preprocessed —
+/// [`SparseMoleculeShard::read_from_path`] surfaces a clear "re-preprocess
+/// required" error when it encounters the legacy magic.
+const SHARD_MAGIC: [u8; 8] = *b"MAESH03\0";
+/// Previous shard magic kept around so the reader can emit a precise
+/// "please re-preprocess" error when it encounters a `v2` file.
+const LEGACY_SHARD_MAGIC_V2: [u8; 8] = *b"MAESH02\0";
 /// FNV-1a 64-bit offset basis used to derive stable molecule IDs from
 /// dataset + record string tuples.
 const STABLE_ID_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -35,7 +45,7 @@ const ZINC20_STABLE_ID_NUMBER_MASK: u64 = 0x0000_ffff_ffff_ffff;
 /// Bitmask isolating the 15-bit ZINC20 tranche suffix.
 const ZINC20_STABLE_ID_SUFFIX_MASK: u64 = 0x7fff;
 /// Current cached-shard manifest schema version.
-pub const SHARD_MANIFEST_VERSION: u32 = 2;
+pub const SHARD_MANIFEST_VERSION: u32 = 3;
 /// Default number of dataset records preprocessed per Rayon chunk.
 #[cfg(feature = "datasets")]
 pub const DEFAULT_PREPROCESS_CHUNK_ROWS: usize = 8192;
@@ -272,10 +282,11 @@ pub struct PreprocessedDatasetChunk {
     /// Cumulative count of source dataset records consumed up to this
     /// chunk.
     records_seen: usize,
-    /// Per-record preprocessing outcome: `Ok(Some(_))` accepted,
-    /// `Ok(None)` skipped by the quality filter, `Err(_)` parse / RDKit
-    /// failure.
-    results: Vec<Result<Option<MoleculeTargets>>>,
+    /// Per-record preprocessing outcome: an `Ok(Vec)` (empty Vec means
+    /// the record was rejected by the quality filter, length 1 means a
+    /// positive with no negatives, length > 1 means a positive plus
+    /// negatives), or an `Err(_)` parse / RDKit failure.
+    results: Vec<Result<Vec<MoleculeTargets>>>,
 }
 
 #[cfg(feature = "datasets")]
@@ -288,16 +299,17 @@ impl PreprocessedDatasetChunk {
 
     /// Per-record preprocessing results, preserving source order.
     ///
-    /// `Ok(Some(_))` is an accepted molecule, `Ok(None)` is a record skipped
-    /// by the configured [`SmilesQualityFilter`], and `Err(_)` is a parse or
-    /// fingerprint failure.
-    pub fn results(&self) -> &[Result<Option<MoleculeTargets>>] {
+    /// `Ok(rows)` with `rows.is_empty()` is a record skipped by the
+    /// configured [`SmilesQualityFilter`]; `Ok(rows)` with `!rows.is_empty()`
+    /// is the positive row followed by any negative replicas; `Err(_)`
+    /// is a parse or fingerprint failure.
+    pub fn results(&self) -> &[Result<Vec<MoleculeTargets>>] {
         &self.results
     }
 
     /// Consumes the chunk, returning its results.
     #[must_use]
-    pub fn into_results(self) -> Vec<Result<Option<MoleculeTargets>>> {
+    pub fn into_results(self) -> Vec<Result<Vec<MoleculeTargets>>> {
         self.results
     }
 }
@@ -363,7 +375,7 @@ where
 fn preprocess_record_chunk_parallel(
     chunk: Vec<Result<MoleculeRecord>>,
     config: &PreprocessingConfig,
-) -> Vec<Result<Option<MoleculeTargets>>> {
+) -> Vec<Result<Vec<MoleculeTargets>>> {
     use rayon::prelude::*;
 
     chunk
@@ -404,6 +416,10 @@ impl DataSplit {
     }
 }
 
+/// Default number of negatives emitted per positive when the preprocessor
+/// is asked to bake violation-classified mutants into the shard.
+pub const DEFAULT_NEGATIVES_PER_POSITIVE: f32 = 0.0;
+
 /// Deterministic preprocessing configuration. Construct via
 /// [`PreprocessingConfig::builder`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -417,6 +433,18 @@ pub struct PreprocessingConfig {
     /// Quality bounds applied to candidate SMILES before fingerprinting.
     #[serde(default)]
     quality_filter: SmilesQualityFilter,
+    /// Average number of `MutatorMix`-generated negative rows emitted per
+    /// positive. Fractional values turn into per-record Bernoulli draws
+    /// using a `splitmix64`-derived seed. `0.0` disables negatives.
+    #[serde(default = "default_negatives_per_positive")]
+    negatives_per_positive: f32,
+}
+
+/// Serde fallback for the negatives-per-positive ratio — preserves
+/// backward-compatible deserialization of `PreprocessingConfig` JSON
+/// emitted before this field existed.
+const fn default_negatives_per_positive() -> f32 {
+    DEFAULT_NEGATIVES_PER_POSITIVE
 }
 
 impl Default for PreprocessingConfig {
@@ -458,6 +486,36 @@ impl PreprocessingConfig {
         &self.quality_filter
     }
 
+    /// Average number of negatives emitted per positive (0.0 disables).
+    #[must_use]
+    pub const fn negatives_per_positive(&self) -> f32 {
+        self.negatives_per_positive
+    }
+
+    /// Resolves the integer number of negative rows the preprocessor should
+    /// emit for a given source molecule. The integer part of
+    /// [`Self::negatives_per_positive`] is emitted deterministically;
+    /// any fractional remainder turns into a per-record Bernoulli draw
+    /// seeded from `stable_id` via a `splitmix64` mix, so two preprocess
+    /// runs over the same dataset produce identical row counts.
+    #[must_use]
+    pub fn negative_count_for_stable_id(&self, stable_id: u64) -> usize {
+        let ratio = self.negatives_per_positive.max(0.0);
+        // `trunc` is already non-negative here so the cast lane is safe;
+        // saturate at `u32::MAX` to keep the conversion well-defined on
+        // any (pathological) input that survives the builder validation.
+        let base_raw = ratio.trunc().min(u32::MAX as f32);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let base = base_raw as u32 as usize;
+        let fractional = ratio - ratio.trunc();
+        if fractional <= 0.0 {
+            return base;
+        }
+        let draw = (splitmix64(stable_id.wrapping_add(0xA5A5_A5A5_5A5A_5A5A)) % 1_000_000) as f32
+            / 1_000_000.0;
+        if draw < fractional { base + 1 } else { base }
+    }
+
     /// Assigns a deterministic split from a stable molecule id.
     #[must_use]
     pub fn split_for_stable_id(&self, stable_id: u64) -> DataSplit {
@@ -481,6 +539,8 @@ pub struct PreprocessingConfigBuilder {
     validation_per_mille: u16,
     /// Pending SMILES quality filter.
     quality_filter: SmilesQualityFilter,
+    /// Pending average number of negatives emitted per positive.
+    negatives_per_positive: f32,
 }
 
 impl Default for PreprocessingConfigBuilder {
@@ -498,6 +558,7 @@ impl PreprocessingConfigBuilder {
             descriptors: DescriptorConfig::default(),
             validation_per_mille: 100,
             quality_filter: SmilesQualityFilter::default(),
+            negatives_per_positive: DEFAULT_NEGATIVES_PER_POSITIVE,
         }
     }
 
@@ -529,12 +590,21 @@ impl PreprocessingConfigBuilder {
         self
     }
 
+    /// Sets the average number of negatives emitted per positive.
+    /// Values < 0 are clamped to 0 at build time.
+    #[must_use]
+    pub const fn negatives_per_positive(mut self, value: f32) -> Self {
+        self.negatives_per_positive = value;
+        self
+    }
+
     /// Validates and builds the immutable [`PreprocessingConfig`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::ConfigInvalid`] when `validation_per_mille` exceeds
-    /// 1000.
+    /// 1000 or when `negatives_per_positive` is negative, NaN, or
+    /// infinite.
     pub fn build(self) -> Result<PreprocessingConfig> {
         if self.validation_per_mille > 1000 {
             return Err(Error::ConfigInvalid {
@@ -544,11 +614,20 @@ impl PreprocessingConfigBuilder {
                 ),
             });
         }
+        if !self.negatives_per_positive.is_finite() || self.negatives_per_positive < 0.0 {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "negatives_per_positive must be a finite non-negative float, got {}",
+                    self.negatives_per_positive
+                ),
+            });
+        }
         Ok(PreprocessingConfig {
             counted_ecfp: self.counted_ecfp,
             descriptors: self.descriptors,
             validation_per_mille: self.validation_per_mille,
             quality_filter: self.quality_filter,
+            negatives_per_positive: self.negatives_per_positive,
         })
     }
 }
@@ -557,18 +636,34 @@ impl PreprocessingConfigBuilder {
 ///
 /// Constructed by [`preprocess_record`]; consumed via the accessor methods
 /// below.
+///
+/// A row is a *positive* when `violation_label == 0` (and then
+/// `target_fingerprint == fingerprint`), or a *negative* when
+/// `violation_label != 0` (the bitset of fired
+/// [`finge_rs::ViolationClass`] predicates) — in which case
+/// `fingerprint` is the mutated input the encoder sees and
+/// `target_fingerprint` is the original positive's fingerprint the
+/// decoder is trained to reconstruct (denoising / correction framing).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoleculeTargets {
     /// Stable numeric molecule identifier (the FNV / ZINC20-packed ID).
     cid: u64,
     /// Original SMILES string for traceability.
     source_smiles: String,
-    /// Counted-ECFP fingerprint vector.
+    /// Counted-ECFP fingerprint vector (encoder input).
     fingerprint: FingerprintTargets,
+    /// Decoder reconstruction target. Equal to [`Self::fingerprint`] for
+    /// positives; equal to the source positive's fingerprint for
+    /// negatives (denoising framing).
+    #[serde(default)]
+    target_fingerprint: Option<FingerprintTargets>,
     /// Scalar descriptor regression targets.
     descriptors: DescriptorTargets,
     /// Deterministic train/validation split assignment.
     split: DataSplit,
+    /// Multi-label violation bitset. `0` for positives.
+    #[serde(default)]
+    violation_label: u8,
 }
 
 impl MoleculeTargets {
@@ -584,10 +679,28 @@ impl MoleculeTargets {
         &self.source_smiles
     }
 
-    /// Sparse counted ECFP target.
+    /// Sparse counted ECFP target (the encoder input).
     #[must_use]
     pub const fn fingerprint(&self) -> &FingerprintTargets {
         &self.fingerprint
+    }
+
+    /// Decoder reconstruction target. Returns the input fingerprint for
+    /// positive rows; returns the source-positive fingerprint for
+    /// negative rows.
+    #[must_use]
+    pub fn target_fingerprint(&self) -> &FingerprintTargets {
+        self.target_fingerprint
+            .as_ref()
+            .unwrap_or(&self.fingerprint)
+    }
+
+    /// Returns the explicit target fingerprint if this row carries one
+    /// (i.e. is a negative). Positive rows return `None` so callers can
+    /// alias the decoder target to the encoder input in shard storage.
+    #[must_use]
+    pub const fn explicit_target_fingerprint(&self) -> Option<&FingerprintTargets> {
+        self.target_fingerprint.as_ref()
     }
 
     /// Molecule descriptor targets.
@@ -601,21 +714,44 @@ impl MoleculeTargets {
     pub const fn split(&self) -> DataSplit {
         self.split
     }
+
+    /// Violation-class bitset. `0` for positives.
+    #[must_use]
+    pub const fn violation_label(&self) -> u8 {
+        self.violation_label
+    }
+
+    /// Convenience: `true` when [`Self::violation_label`] is non-zero.
+    #[must_use]
+    pub const fn is_negative(&self) -> bool {
+        self.violation_label != 0
+    }
 }
 
-/// Parses and fingerprints one dataset record, applying the configured
-/// quality filter before doing fingerprint work.
+/// Parses and fingerprints one dataset record.
+///
+/// Applies the configured quality filter before doing fingerprint work,
+/// then emits one positive row plus zero or more negative rows derived
+/// from `MutatorMix` (per
+/// [`PreprocessingConfig::negatives_per_positive`]).
+///
+/// Returns an empty `Vec` when the record is rejected by the quality
+/// filter; callers should treat that as a silent skip. The first
+/// element of a non-empty result is always the positive; subsequent
+/// elements are negatives with `violation_label != 0` and
+/// `target_fingerprint == positive.fingerprint`.
 ///
 /// # Errors
 ///
-/// Returns an error when the SMILES cannot be parsed or fingerprint preparation
-/// fails. Returns `Ok(None)` when the record is rejected by the quality
-/// filter; callers should treat that as a silent skip.
+/// Returns an error when the SMILES cannot be parsed or fingerprint
+/// preparation fails for the positive. Negative-side `MutatorError`s
+/// are absorbed into a silent skip (the negative slot is dropped, the
+/// positive emits normally).
 pub fn preprocess_record(
     record: &MoleculeRecord,
     config: &PreprocessingConfig,
     scratch: &mut finge_rs::smiles_support::SmilesRdkitScratch,
-) -> Result<Option<MoleculeTargets>> {
+) -> Result<Vec<MoleculeTargets>> {
     let smiles = record
         .smiles
         .parse::<Smiles>()
@@ -625,19 +761,63 @@ pub fn preprocess_record(
         })?;
     let descriptors = DescriptorTargets::from_smiles(&smiles);
     if !config.quality_filter.accepts(&descriptors) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let fingerprint =
         compute_fingerprint_targets(record.stable_id, &smiles, config.counted_ecfp, scratch)?;
     let split = config.split_for_stable_id(record.stable_id);
 
-    Ok(Some(MoleculeTargets {
+    let negative_count = config.negative_count_for_stable_id(record.stable_id);
+    let mut out = Vec::with_capacity(1 + negative_count);
+    out.push(MoleculeTargets {
         cid: record.stable_id,
         source_smiles: record.smiles.clone(),
-        fingerprint,
-        descriptors,
+        fingerprint: fingerprint.clone(),
+        target_fingerprint: None,
+        descriptors: descriptors.clone(),
         split,
-    }))
+        violation_label: 0,
+    });
+
+    for replica in 0..negative_count {
+        // Seed each negative deterministically from
+        // (stable_id, replica). Two preprocess runs over the same
+        // dataset produce identical negative rows.
+        let seed = splitmix64(
+            record
+                .stable_id
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(replica as u64),
+        );
+        match crate::fingerprints::compute_negative_fingerprint_targets(
+            record.stable_id,
+            &smiles,
+            seed,
+            config.counted_ecfp,
+            scratch,
+        ) {
+            Ok(Some((neg_fingerprint, label))) => {
+                out.push(MoleculeTargets {
+                    cid: record.stable_id,
+                    source_smiles: record.smiles.clone(),
+                    fingerprint: neg_fingerprint,
+                    target_fingerprint: Some(fingerprint.clone()),
+                    descriptors: descriptors.clone(),
+                    split,
+                    violation_label: label.as_u8(),
+                });
+            }
+            Ok(None) => {
+                // MutatorMix gave up on this seed; skip silently and
+                // let the realized negative ratio dip below the
+                // configured target.
+            }
+            Err(error) => {
+                return Err(error);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// One row view into a sparse molecule shard.
@@ -653,6 +833,15 @@ pub struct MoleculeShardRow<'a> {
     descriptor_targets: &'a [f32],
     /// Train / validation split assignment for this row.
     split: DataSplit,
+    /// [`finge_rs::ViolationClass`] bitset for this row (`0` = positive).
+    violation_label: u8,
+    /// Decoder-target sparse fingerprint indices when this row stores
+    /// an explicit target (i.e. a negative). Empty for positives — in
+    /// that case the decoder target aliases the encoder input.
+    target_fingerprint_indices: &'a [u16],
+    /// Decoder-target sparse fingerprint counts, aligned with
+    /// [`Self::target_fingerprint_indices`].
+    target_fingerprint_counts: &'a [u16],
 }
 
 impl<'a> MoleculeShardRow<'a> {
@@ -685,6 +874,42 @@ impl<'a> MoleculeShardRow<'a> {
     pub const fn split(&self) -> DataSplit {
         self.split
     }
+
+    /// Multi-label violation bitset (`0` for positives).
+    #[must_use]
+    pub const fn violation_label(&self) -> u8 {
+        self.violation_label
+    }
+
+    /// `true` when this row is a mutated negative (label bitset != 0).
+    #[must_use]
+    pub const fn is_negative(&self) -> bool {
+        self.violation_label != 0
+    }
+
+    /// Decoder-target sparse fingerprint indices. For positive rows the
+    /// shard stores no explicit target and this accessor aliases to
+    /// [`Self::fingerprint_indices`].
+    #[must_use]
+    pub const fn target_fingerprint_indices(&self) -> &'a [u16] {
+        if self.target_fingerprint_indices.is_empty() && self.violation_label == 0 {
+            self.fingerprint_indices
+        } else {
+            self.target_fingerprint_indices
+        }
+    }
+
+    /// Decoder-target sparse fingerprint counts. Aliases the encoder
+    /// input on positive rows; mirrors the explicit decoder target on
+    /// negative rows.
+    #[must_use]
+    pub const fn target_fingerprint_counts(&self) -> &'a [u16] {
+        if self.target_fingerprint_counts.is_empty() && self.violation_label == 0 {
+            self.fingerprint_counts
+        } else {
+            self.target_fingerprint_counts
+        }
+    }
 }
 
 /// Tensor-ready sparse molecule shard.
@@ -698,7 +923,7 @@ pub struct SparseMoleculeShard {
     cids: Vec<u64>,
     /// CSR-style row offsets into `indices` / `counts`, length `len() + 1`.
     row_offsets: Vec<u64>,
-    /// Concatenated sparse fingerprint indices.
+    /// Concatenated sparse fingerprint indices (encoder input).
     indices: Vec<u16>,
     /// Concatenated sparse fingerprint counts (aligned with `indices`).
     counts: Vec<u16>,
@@ -706,6 +931,25 @@ pub struct SparseMoleculeShard {
     descriptor_targets: Vec<f32>,
     /// Per-row train / validation split assignments.
     splits: Vec<DataSplit>,
+    /// Per-row [`finge_rs::ViolationClass`] bitset. `0` for positives.
+    /// Length matches [`Self::len`].
+    #[serde(default)]
+    violation_labels: Vec<u8>,
+    /// CSR-style row offsets into `target_indices` / `target_counts`.
+    /// Length `len() + 1`. Positive rows produce an empty slice (the
+    /// reader aliases the decoder target to the encoder input), so the
+    /// offset increment is 0 for positives and equals the source
+    /// positive's `nnz` for negatives.
+    #[serde(default)]
+    target_row_offsets: Vec<u64>,
+    /// Concatenated sparse fingerprint indices (decoder target).
+    /// Empty for shards with no negative rows.
+    #[serde(default)]
+    target_indices: Vec<u16>,
+    /// Concatenated sparse fingerprint counts (decoder target, aligned
+    /// with `target_indices`).
+    #[serde(default)]
+    target_counts: Vec<u16>,
 }
 
 impl SparseMoleculeShard {
@@ -721,6 +965,10 @@ impl SparseMoleculeShard {
             counts: Vec::new(),
             descriptor_targets: Vec::new(),
             splits: Vec::new(),
+            violation_labels: Vec::new(),
+            target_row_offsets: vec![0],
+            target_indices: Vec::new(),
+            target_counts: Vec::new(),
         }
     }
 
@@ -772,6 +1020,33 @@ impl SparseMoleculeShard {
         &self.splits
     }
 
+    /// Per-row [`finge_rs::ViolationClass`] bitset. `0` indicates the row
+    /// is a positive (decoder target aliases the encoder input).
+    #[must_use]
+    pub fn violation_labels(&self) -> &[u8] {
+        &self.violation_labels
+    }
+
+    /// CSR-style row offsets into the decoder-target sparse storage.
+    /// Length `len() + 1`. Positive rows produce a zero-width slice; the
+    /// reader aliases their decoder target to the encoder input.
+    #[must_use]
+    pub fn target_row_offsets(&self) -> &[u64] {
+        &self.target_row_offsets
+    }
+
+    /// Concatenated decoder-target sparse fingerprint indices.
+    #[must_use]
+    pub fn target_indices(&self) -> &[u16] {
+        &self.target_indices
+    }
+
+    /// Concatenated decoder-target sparse fingerprint counts.
+    #[must_use]
+    pub fn target_counts(&self) -> &[u16] {
+        &self.target_counts
+    }
+
     /// Number of rows.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -786,16 +1061,25 @@ impl SparseMoleculeShard {
 
     /// Appends one preprocessed molecule.
     ///
+    /// The `violation_label` parameter is the multi-label bitset for this
+    /// row (`0` for positives). `target_fingerprint`, when provided,
+    /// stores the decoder reconstruction target separately — required
+    /// when the row is a negative (denoising / correction framing).
+    /// When `None`, the decoder target aliases the encoder input.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidBatch`] when the fingerprint width, descriptor
-    /// width, or sparse index/count shape does not match the shard.
+    /// width, sparse index/count shape, or target fingerprint width does
+    /// not match the shard.
     pub fn push(
         &mut self,
         cid: u64,
         fingerprint: &FingerprintTargets,
         descriptor_targets: &[f32],
         split: DataSplit,
+        violation_label: u8,
+        target_fingerprint: Option<&FingerprintTargets>,
     ) -> Result<()> {
         if fingerprint.fingerprint_size() != self.fingerprint_size {
             return Err(Error::InvalidBatch(format!(
@@ -811,6 +1095,15 @@ impl SparseMoleculeShard {
                 self.descriptor_width
             )));
         }
+        if let Some(target) = target_fingerprint
+            && target.fingerprint_size() != self.fingerprint_size
+        {
+            return Err(Error::InvalidBatch(format!(
+                "target fingerprint width {} does not match shard width {}",
+                target.fingerprint_size(),
+                self.fingerprint_size
+            )));
+        }
         self.cids.push(cid);
         self.indices.extend_from_slice(fingerprint.indices());
         self.counts.extend_from_slice(fingerprint.counts());
@@ -818,6 +1111,13 @@ impl SparseMoleculeShard {
             .extend_from_slice(descriptor_targets);
         self.splits.push(split);
         self.row_offsets.push(self.indices.len() as u64);
+        self.violation_labels.push(violation_label);
+        if let Some(target) = target_fingerprint {
+            self.target_indices.extend_from_slice(target.indices());
+            self.target_counts.extend_from_slice(target.counts());
+        }
+        self.target_row_offsets
+            .push(self.target_indices.len() as u64);
         Ok(())
     }
 
@@ -837,6 +1137,8 @@ impl SparseMoleculeShard {
             &targets.fingerprint,
             &targets.descriptors.regression_targets(config),
             targets.split,
+            targets.violation_label,
+            targets.explicit_target_fingerprint(),
         )
     }
 
@@ -850,12 +1152,17 @@ impl SparseMoleculeShard {
         let end = self.row_offsets[row + 1] as usize;
         let descriptor_start = row * self.descriptor_width;
         let descriptor_end = descriptor_start + self.descriptor_width;
+        let target_start = self.target_row_offsets[row] as usize;
+        let target_end = self.target_row_offsets[row + 1] as usize;
         Some(MoleculeShardRow {
             cid: self.cids[row],
             fingerprint_indices: &self.indices[start..end],
             fingerprint_counts: &self.counts[start..end],
             descriptor_targets: &self.descriptor_targets[descriptor_start..descriptor_end],
             split: self.splits[row],
+            violation_label: self.violation_labels[row],
+            target_fingerprint_indices: &self.target_indices[target_start..target_end],
+            target_fingerprint_counts: &self.target_counts[target_start..target_end],
         })
     }
 
@@ -876,6 +1183,7 @@ impl SparseMoleculeShard {
         write_u64(path, &mut writer, self.descriptor_width as u64)?;
         write_u64(path, &mut writer, self.len() as u64)?;
         write_u64(path, &mut writer, self.indices.len() as u64)?;
+        write_u64(path, &mut writer, self.target_indices.len() as u64)?;
         for &value in &self.cids {
             write_u64(path, &mut writer, value)?;
         }
@@ -894,6 +1202,16 @@ impl SparseMoleculeShard {
         for &split in &self.splits {
             write_all(path, &mut writer, &[split.as_byte()])?;
         }
+        write_all(path, &mut writer, &self.violation_labels)?;
+        for &value in &self.target_row_offsets {
+            write_u64(path, &mut writer, value)?;
+        }
+        for &value in &self.target_indices {
+            write_u16(path, &mut writer, value)?;
+        }
+        for &value in &self.target_counts {
+            write_u16(path, &mut writer, value)?;
+        }
         writer.flush().map_err(|source| Error::io(path, source))
     }
 
@@ -910,6 +1228,15 @@ impl SparseMoleculeShard {
 
         let mut magic = [0_u8; 8];
         read_exact(path, &mut reader, &mut magic)?;
+        if magic == LEGACY_SHARD_MAGIC_V2 {
+            return Err(Error::ShardFormat {
+                path: path.to_path_buf(),
+                message: "shard is the legacy MAESH02 format; \
+                          rerun preprocess to regenerate as MAESH03 \
+                          (negative-molecule columns required)"
+                    .to_string(),
+            });
+        }
         if magic != SHARD_MAGIC {
             return Err(Error::ShardFormat {
                 path: path.to_path_buf(),
@@ -921,6 +1248,7 @@ impl SparseMoleculeShard {
         let descriptor_width = read_u64(path, &mut reader)? as usize;
         let row_count = read_u64(path, &mut reader)? as usize;
         let nnz = read_u64(path, &mut reader)? as usize;
+        let target_nnz = read_u64(path, &mut reader)? as usize;
 
         let mut cids = Vec::with_capacity(row_count);
         for _ in 0..row_count {
@@ -960,6 +1288,20 @@ impl SparseMoleculeShard {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut violation_labels = vec![0_u8; row_count];
+        read_exact(path, &mut reader, &mut violation_labels)?;
+        let mut target_row_offsets = Vec::with_capacity(row_count + 1);
+        for _ in 0..=row_count {
+            target_row_offsets.push(read_u64(path, &mut reader)?);
+        }
+        let mut target_indices = Vec::with_capacity(target_nnz);
+        for _ in 0..target_nnz {
+            target_indices.push(read_u16(path, &mut reader)?);
+        }
+        let mut target_counts = Vec::with_capacity(target_nnz);
+        for _ in 0..target_nnz {
+            target_counts.push(read_u16(path, &mut reader)?);
+        }
 
         let shard = Self {
             fingerprint_size,
@@ -970,6 +1312,10 @@ impl SparseMoleculeShard {
             counts,
             descriptor_targets,
             splits,
+            violation_labels,
+            target_row_offsets,
+            target_indices,
+            target_counts,
         };
         shard.validate_for_path(path)?;
         Ok(shard)
@@ -1004,7 +1350,12 @@ impl SparseMoleculeShard {
             return Ok(Self::new(header.fingerprint_size, header.descriptor_width));
         }
 
-        let layout = ShardFileLayout::new(header.row_count, header.nnz, header.descriptor_width)?;
+        let layout = ShardFileLayout::new(
+            header.row_count,
+            header.nnz,
+            header.target_nnz,
+            header.descriptor_width,
+        )?;
         let cids = read_u64_vec_at(
             path,
             &mut file,
@@ -1113,6 +1464,79 @@ impl SparseMoleculeShard {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let mut violation_labels = vec![0_u8; row_count];
+        read_exact_at(
+            path,
+            &mut file,
+            checked_add(
+                path,
+                layout.violation_labels,
+                start_row as u64,
+                "violation-label byte offset",
+            )?,
+            &mut violation_labels,
+        )?;
+
+        let target_absolute_offsets = read_u64_vec_at(
+            path,
+            &mut file,
+            checked_add(
+                path,
+                layout.target_row_offsets,
+                checked_mul(path, start_row, 8, "target row-offset byte offset")?,
+                "target row-offset byte offset",
+            )?,
+            row_count + 1,
+        )?;
+        let target_sparse_start =
+            *target_absolute_offsets
+                .first()
+                .ok_or_else(|| Error::ShardFormat {
+                    path: path.to_path_buf(),
+                    message: "row range did not include a start target sparse offset".to_string(),
+                })?;
+        let target_sparse_end =
+            *target_absolute_offsets
+                .last()
+                .ok_or_else(|| Error::ShardFormat {
+                    path: path.to_path_buf(),
+                    message: "row range did not include an end target sparse offset".to_string(),
+                })?;
+        let target_sparse_len = target_sparse_end
+            .checked_sub(target_sparse_start)
+            .ok_or_else(|| Error::ShardFormat {
+                path: path.to_path_buf(),
+                message: "row-range target sparse offsets are not monotonic".to_string(),
+            })? as usize;
+        let target_row_offsets = target_absolute_offsets
+            .into_iter()
+            .map(|offset| offset - target_sparse_start)
+            .collect::<Vec<_>>();
+        let target_sparse_start = target_sparse_start as usize;
+
+        let target_indices = read_u16_vec_at(
+            path,
+            &mut file,
+            checked_add(
+                path,
+                layout.target_indices,
+                checked_mul(path, target_sparse_start, 2, "target index byte offset")?,
+                "target index byte offset",
+            )?,
+            target_sparse_len,
+        )?;
+        let target_counts = read_u16_vec_at(
+            path,
+            &mut file,
+            checked_add(
+                path,
+                layout.target_counts,
+                checked_mul(path, target_sparse_start, 2, "target count byte offset")?,
+                "target count byte offset",
+            )?,
+            target_sparse_len,
+        )?;
+
         let shard = Self {
             fingerprint_size: header.fingerprint_size,
             descriptor_width: header.descriptor_width,
@@ -1122,6 +1546,10 @@ impl SparseMoleculeShard {
             counts,
             descriptor_targets,
             splits,
+            violation_labels,
+            target_row_offsets,
+            target_indices,
+            target_counts,
         };
         shard.validate_for_path(path)?;
         Ok(shard)
@@ -1162,6 +1590,49 @@ impl SparseMoleculeShard {
                 path: path.to_path_buf(),
                 message: "split length does not match row count".to_string(),
             });
+        }
+        if self.violation_labels.len() != self.len() {
+            return Err(Error::ShardFormat {
+                path: path.to_path_buf(),
+                message: "violation-label length does not match row count".to_string(),
+            });
+        }
+        if self.target_row_offsets.len() != self.len() + 1 {
+            return Err(Error::ShardFormat {
+                path: path.to_path_buf(),
+                message: "target row offset length does not match row count".to_string(),
+            });
+        }
+        if self.target_indices.len() != self.target_counts.len() {
+            return Err(Error::ShardFormat {
+                path: path.to_path_buf(),
+                message: "target indices and target counts have different lengths".to_string(),
+            });
+        }
+        if self.target_row_offsets.first().copied() != Some(0)
+            || self.target_row_offsets.last().copied() != Some(self.target_indices.len() as u64)
+        {
+            return Err(Error::ShardFormat {
+                path: path.to_path_buf(),
+                message: "target row offsets do not cover sparse values".to_string(),
+            });
+        }
+        // Positive rows (label = 0) must not carry an explicit decoder
+        // target; the row reader aliases them to the encoder input. Any
+        // deviation indicates a writer bug.
+        for row in 0..self.len() {
+            let target_start = self.target_row_offsets[row];
+            let target_end = self.target_row_offsets[row + 1];
+            let has_explicit_target = target_end != target_start;
+            if self.violation_labels[row] == 0 && has_explicit_target {
+                return Err(Error::ShardFormat {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "row {row} is a positive (label = 0) but carries an explicit \
+                         decoder-target fingerprint"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -1387,8 +1858,11 @@ struct ShardFileHeader {
     descriptor_width: usize,
     /// Number of rows packed in the shard.
     row_count: usize,
-    /// Total nonzero sparse entries across all rows.
+    /// Total nonzero sparse entries across all rows (encoder input).
     nnz: usize,
+    /// Total nonzero sparse entries across all decoder-target rows
+    /// (sum of negatives only; zero for shards with no negatives).
+    target_nnz: usize,
 }
 
 /// Pre-computed byte offsets into a shard file, one per logical section.
@@ -1408,15 +1882,30 @@ struct ShardFileLayout {
     descriptors: u64,
     /// Byte offset of the per-row train/validation split byte block.
     splits: u64,
+    /// Byte offset of the per-row violation-label byte block.
+    violation_labels: u64,
+    /// Byte offset of the decoder-target CSR row-offset section.
+    target_row_offsets: u64,
+    /// Byte offset of the decoder-target sparse-index section.
+    target_indices: u64,
+    /// Byte offset of the decoder-target sparse-count section.
+    target_counts: u64,
 }
 
 impl ShardFileLayout {
     /// Computes the absolute byte offsets of every shard section from
-    /// the row count, sparse-NNZ, and descriptor width. Returns
-    /// [`Error::ShardFormat`] when any multiplication overflows `u64`.
-    fn new(row_count: usize, nnz: usize, descriptor_width: usize) -> Result<Self> {
+    /// the row count, sparse-NNZ, target-sparse-NNZ, and descriptor
+    /// width. Returns [`Error::ShardFormat`] when any multiplication
+    /// overflows `u64`.
+    fn new(
+        row_count: usize,
+        nnz: usize,
+        target_nnz: usize,
+        descriptor_width: usize,
+    ) -> Result<Self> {
         let path = Path::new("<shard layout>");
-        let cids = 40_u64;
+        // Header: 8-byte magic + 5 × u64 = 48 bytes.
+        let cids = 48_u64;
         let row_offsets = checked_add(
             path,
             cids,
@@ -1454,6 +1943,30 @@ impl ShardFileLayout {
             checked_mul(path, descriptor_values, 4, "descriptor section length")?,
             "split section start",
         )?;
+        let violation_labels = checked_add(
+            path,
+            splits,
+            row_count as u64,
+            "violation-label section start",
+        )?;
+        let target_row_offsets = checked_add(
+            path,
+            violation_labels,
+            row_count as u64,
+            "target row-offset section start",
+        )?;
+        let target_indices = checked_add(
+            path,
+            target_row_offsets,
+            checked_mul(path, row_count + 1, 8, "target row-offset section length")?,
+            "target index section start",
+        )?;
+        let target_counts = checked_add(
+            path,
+            target_indices,
+            checked_mul(path, target_nnz, 2, "target index section length")?,
+            "target count section start",
+        )?;
 
         Ok(Self {
             cids,
@@ -1462,6 +1975,10 @@ impl ShardFileLayout {
             counts,
             descriptors,
             splits,
+            violation_labels,
+            target_row_offsets,
+            target_indices,
+            target_counts,
         })
     }
 }
@@ -1518,13 +2035,23 @@ fn read_f32(path: &Path, reader: &mut impl Read) -> Result<f32> {
 }
 
 /// Seeks to the start of `reader` and validates the magic header, then
-/// reads the 32-byte fixed-shape descriptor.
+/// reads the 40-byte fixed-shape descriptor (`MAESH03` adds a
+/// `target_nnz` field to the legacy 32-byte header).
 fn read_shard_header(path: &Path, reader: &mut (impl Read + Seek)) -> Result<ShardFileHeader> {
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|source| Error::io(path, source))?;
     let mut magic = [0_u8; 8];
     read_exact(path, reader, &mut magic)?;
+    if magic == LEGACY_SHARD_MAGIC_V2 {
+        return Err(Error::ShardFormat {
+            path: path.to_path_buf(),
+            message: "shard is the legacy MAESH02 format; \
+                      rerun preprocess to regenerate as MAESH03 \
+                      (negative-molecule columns required)"
+                .to_string(),
+        });
+    }
     if magic != SHARD_MAGIC {
         return Err(Error::ShardFormat {
             path: path.to_path_buf(),
@@ -1537,6 +2064,7 @@ fn read_shard_header(path: &Path, reader: &mut (impl Read + Seek)) -> Result<Sha
         descriptor_width: read_u64(path, reader)? as usize,
         row_count: read_u64(path, reader)? as usize,
         nnz: read_u64(path, reader)? as usize,
+        target_nnz: read_u64(path, reader)? as usize,
     })
 }
 
@@ -1650,6 +2178,8 @@ mod tests {
                 &test_fingerprint(),
                 &[0.0; REGRESSION_TARGET_WIDTH],
                 DataSplit::Train,
+                0,
+                None,
             )
             .expect("push");
         shard
@@ -1782,15 +2312,9 @@ mod tests {
             .flat_map(|chunk| chunk.results)
             .collect::<Vec<_>>();
         assert_eq!(results.len(), 4);
-        assert_eq!(
-            results[0]
-                .as_ref()
-                .expect("ethanol ok")
-                .as_ref()
-                .expect("ethanol kept")
-                .cid,
-            702
-        );
+        let ethanol = results[0].as_ref().expect("ethanol ok");
+        assert_eq!(ethanol.len(), 1, "negatives disabled by default");
+        assert_eq!(ethanol[0].cid, 702);
         assert!(matches!(
             &results[1],
             Err(Error::SmilesParse {
@@ -1798,15 +2322,9 @@ mod tests {
                 message
             }) if !message.is_empty()
         ));
-        assert_eq!(
-            results[2]
-                .as_ref()
-                .expect("water ok")
-                .as_ref()
-                .expect("water kept")
-                .cid,
-            704
-        );
+        let water = results[2].as_ref().expect("water ok");
+        assert_eq!(water.len(), 1);
+        assert_eq!(water[0].cid, 704);
         assert!(matches!(
             &results[3],
             Err(Error::DatasetRecord { message }) if message == "bad record"
@@ -1827,7 +2345,7 @@ mod tests {
 
         let outcome = preprocess_record(&record, &config, &mut scratch).expect("preprocess ok");
 
-        assert!(outcome.is_none());
+        assert!(outcome.is_empty(), "filtered record must produce no rows");
     }
 
     #[test]
@@ -1887,6 +2405,126 @@ mod tests {
         assert_eq!(row.cid, 702);
         assert_eq!(row.fingerprint_indices, &[3, 9]);
         assert_eq!(row.fingerprint_counts, &[1, 4]);
+        // Positive row: violation label is zero and the decoder target
+        // aliases the encoder input (no explicit target slice).
+        assert_eq!(row.violation_label(), 0);
+        assert!(!row.is_negative());
+        assert_eq!(row.target_fingerprint_indices(), row.fingerprint_indices());
+        assert_eq!(row.target_fingerprint_counts(), row.fingerprint_counts());
+    }
+
+    #[test]
+    fn sparse_shard_roundtrip_preserves_mixed_positive_and_negative_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mixed.maeshard");
+        let mut shard = SparseMoleculeShard::new(4096, REGRESSION_TARGET_WIDTH);
+        let positive_fp = test_fingerprint();
+        let negative_fp =
+            FingerprintTargets::new(vec![7, 11], vec![3, 2], 4096).expect("valid fingerprint");
+
+        shard
+            .push(
+                17,
+                &positive_fp,
+                &[0.0; REGRESSION_TARGET_WIDTH],
+                DataSplit::Train,
+                0,
+                None,
+            )
+            .expect("push positive");
+        shard
+            .push(
+                17,
+                &negative_fp,
+                &[0.0; REGRESSION_TARGET_WIDTH],
+                DataSplit::Train,
+                0b0001_0010,
+                Some(&positive_fp),
+            )
+            .expect("push negative");
+
+        shard.write_to_path(&path).expect("write");
+        let loaded = SparseMoleculeShard::read_from_path(&path).expect("read");
+        assert_eq!(loaded, shard);
+
+        let positive_row = loaded.row(0).expect("positive row");
+        let negative_row = loaded.row(1).expect("negative row");
+        assert!(!positive_row.is_negative());
+        assert_eq!(positive_row.target_fingerprint_indices(), &[3, 9]);
+        assert!(negative_row.is_negative());
+        assert_eq!(negative_row.violation_label(), 0b0001_0010);
+        // Negative row: decoder target points at the source positive's
+        // fingerprint, not its own (mutated) one.
+        assert_eq!(negative_row.fingerprint_indices(), &[7, 11]);
+        assert_eq!(negative_row.target_fingerprint_indices(), &[3, 9]);
+        assert_eq!(negative_row.target_fingerprint_counts(), &[1, 4]);
+    }
+
+    #[test]
+    fn sparse_shard_range_read_preserves_mixed_positive_and_negative_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mixed-range.maeshard");
+        let mut shard = SparseMoleculeShard::new(4096, REGRESSION_TARGET_WIDTH);
+        let positive_fp = test_fingerprint();
+        let negative_fp =
+            FingerprintTargets::new(vec![7, 11], vec![3, 2], 4096).expect("valid fingerprint");
+        shard
+            .push(
+                10,
+                &positive_fp,
+                &[0.0; REGRESSION_TARGET_WIDTH],
+                DataSplit::Train,
+                0,
+                None,
+            )
+            .expect("push positive 0");
+        shard
+            .push(
+                10,
+                &negative_fp,
+                &[1.0; REGRESSION_TARGET_WIDTH],
+                DataSplit::Train,
+                0b0000_0100,
+                Some(&positive_fp),
+            )
+            .expect("push negative");
+        shard
+            .push(
+                20,
+                &positive_fp,
+                &[2.0; REGRESSION_TARGET_WIDTH],
+                DataSplit::Validation,
+                0,
+                None,
+            )
+            .expect("push positive 2");
+        shard.write_to_path(&path).expect("write");
+
+        // Pull rows [1, 3): one negative + one positive. The slice must
+        // carry the negative's explicit target and the positive's
+        // aliased target side-by-side.
+        let range = SparseMoleculeShard::read_range_from_path(&path, 1, 3).expect("range");
+        assert_eq!(range.len(), 2);
+        let neg = range.row(0).expect("negative");
+        let pos = range.row(1).expect("positive");
+        assert!(neg.is_negative());
+        assert_eq!(neg.violation_label(), 0b0000_0100);
+        assert_eq!(neg.target_fingerprint_indices(), &[3, 9]);
+        assert!(!pos.is_negative());
+        assert_eq!(pos.target_fingerprint_indices(), pos.fingerprint_indices());
+    }
+
+    #[test]
+    fn sparse_shard_rejects_legacy_v2_magic_with_repreprocess_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.maeshard");
+        std::fs::write(&path, b"MAESH02\0").expect("write legacy magic");
+        let error = SparseMoleculeShard::read_from_path(&path).expect_err("legacy magic");
+        assert!(matches!(
+            error,
+            Error::ShardFormat { message, .. } if message.contains("MAESH02")
+                && message.contains("rerun preprocess")
+        ));
     }
 
     #[test]
@@ -1908,6 +2546,8 @@ mod tests {
                     } else {
                         DataSplit::Validation
                     },
+                    0,
+                    None,
                 )
                 .expect("push");
         }
@@ -1943,6 +2583,8 @@ mod tests {
                 &wrong_width,
                 &[0.0; REGRESSION_TARGET_WIDTH],
                 DataSplit::Train,
+                0,
+                None,
             )
             .expect_err("width mismatch");
         assert!(
@@ -1955,6 +2597,8 @@ mod tests {
                 &test_fingerprint(),
                 &[0.0; REGRESSION_TARGET_WIDTH - 1],
                 DataSplit::Train,
+                0,
+                None,
             )
             .expect_err("descriptor width mismatch");
         assert!(
@@ -1998,8 +2642,19 @@ mod tests {
         let path = dir.path().join("bad-split.maeshard");
         let shard = test_shard();
         shard.write_to_path(&path).expect("write shard");
+        // The split byte for row 0 sits immediately after the descriptor
+        // block. v3's appended sections (violation labels + target CSR)
+        // shifted the split section so we can no longer use a fixed
+        // negative offset from the end; compute it from the layout.
+        let split_offset = 48 // magic + 5 × u64 header
+            + 8 // cids (1 row)
+            + 16 // row_offsets (row_count + 1)
+            + 4 // indices (nnz = 2, 2 bytes each)
+            + 4 // counts (nnz = 2, 2 bytes each)
+            + REGRESSION_TARGET_WIDTH * 4; // descriptors (row_count × width)
         let mut file = OpenOptions::new().write(true).open(&path).expect("open");
-        file.seek(SeekFrom::End(-1)).expect("seek");
+        file.seek(SeekFrom::Start(split_offset as u64))
+            .expect("seek to split byte");
         file.write_all(&[9]).expect("overwrite split");
         drop(file);
 
@@ -2124,9 +2779,13 @@ mod tests {
         let config = PreprocessingConfig::default();
         let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
         let record = MoleculeRecord::new("pubchem-smiles", "702", "CCO");
-        let targets = preprocess_record(&record, &config, &mut scratch)
-            .expect("preprocess ok")
-            .expect("CCO passes the default quality filter");
+        let rows = preprocess_record(&record, &config, &mut scratch).expect("preprocess ok");
+        assert_eq!(
+            rows.len(),
+            1,
+            "default config emits one positive and zero negatives"
+        );
+        let targets = &rows[0];
 
         assert_eq!(targets.cid(), 702);
         assert_eq!(targets.source_smiles(), "CCO");
@@ -2135,10 +2794,100 @@ mod tests {
             config.counted_ecfp().size()
         );
         assert!(targets.descriptors().carbon_count() >= 2);
+        assert_eq!(targets.violation_label(), 0);
+        assert!(!targets.is_negative());
+        // The target fingerprint of a positive aliases the input.
+        assert!(targets.explicit_target_fingerprint().is_none());
+        assert_eq!(
+            targets.target_fingerprint().indices(),
+            targets.fingerprint().indices()
+        );
         // The split tag must be one of the two enum variants.
         assert!(matches!(
             targets.split(),
             DataSplit::Train | DataSplit::Validation
+        ));
+    }
+
+    #[test]
+    fn preprocess_record_emits_negatives_with_labels_and_distinct_inputs() {
+        let config = PreprocessingConfig::builder()
+            .negatives_per_positive(2.0)
+            .build()
+            .expect("valid config");
+        let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
+        let record = MoleculeRecord::new("pubchem-smiles", "996", "c1ccccc1O");
+        let rows = preprocess_record(&record, &config, &mut scratch).expect("preprocess ok");
+
+        assert_eq!(
+            rows.len(),
+            3,
+            "1 positive + 2 negatives expected for phenol"
+        );
+        let positive = &rows[0];
+        assert!(!positive.is_negative());
+        assert!(positive.explicit_target_fingerprint().is_none());
+
+        for negative in &rows[1..] {
+            assert!(negative.is_negative(), "label bitset must be non-zero");
+            // Decoder target on a negative is the source positive's
+            // fingerprint (denoising framing).
+            let target = negative
+                .explicit_target_fingerprint()
+                .expect("negative carries an explicit target");
+            assert_eq!(target.indices(), positive.fingerprint().indices());
+            // Same descriptors as the positive (source molecule).
+            assert_eq!(
+                negative.descriptors().carbon_count(),
+                positive.descriptors().carbon_count()
+            );
+            assert_eq!(negative.split(), positive.split());
+        }
+    }
+
+    #[test]
+    fn negative_count_for_stable_id_is_deterministic_and_zero_when_disabled() {
+        let zero = PreprocessingConfig::default();
+        assert_eq!(zero.negatives_per_positive(), 0.0);
+        assert_eq!(zero.negative_count_for_stable_id(0xABCD), 0);
+
+        let two = PreprocessingConfig::builder()
+            .negatives_per_positive(2.0)
+            .build()
+            .expect("valid");
+        assert_eq!(two.negative_count_for_stable_id(0xABCD), 2);
+        // Determinism: same stable_id → same count across calls.
+        assert_eq!(
+            two.negative_count_for_stable_id(0xABCD),
+            two.negative_count_for_stable_id(0xABCD)
+        );
+
+        // Fractional ratio: roughly half of a large sweep should emit 1.
+        let half = PreprocessingConfig::builder()
+            .negatives_per_positive(0.5)
+            .build()
+            .expect("valid");
+        let mut ones = 0_usize;
+        for id in 0..1_000_u64 {
+            if half.negative_count_for_stable_id(id) == 1 {
+                ones += 1;
+            }
+        }
+        assert!(
+            (350..=650).contains(&ones),
+            "Bernoulli draw should land near 50%, got {ones} of 1000"
+        );
+    }
+
+    #[test]
+    fn preprocessing_config_builder_rejects_negative_negatives_per_positive() {
+        let error = PreprocessingConfig::builder()
+            .negatives_per_positive(-0.1)
+            .build()
+            .expect_err("must reject negative ratio");
+        assert!(matches!(
+            error,
+            Error::ConfigInvalid { message } if message.contains("negatives_per_positive")
         ));
     }
 

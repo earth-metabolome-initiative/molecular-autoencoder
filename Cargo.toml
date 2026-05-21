@@ -70,6 +70,7 @@ finge-rs = { git = "https://github.com/earth-metabolome-initiative/finge-rs", de
 indicatif = { version = "0.18", optional = true }
 mascot-rs = { git = "https://github.com/LucaCappelletti94/mascot-rs", optional = true }
 parquet = { version = "55", default-features = false, features = ["arrow", "snap", "zstd"], optional = true }
+rand_chacha = { version = "0.3", default-features = false }
 rayon = { version = "1.11", optional = true }
 # reqwest auto-picks fetch on wasm32 and hyper+rustls on native, so the
 # same async surface compiles to both targets without per-target deps.

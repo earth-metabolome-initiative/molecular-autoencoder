@@ -598,6 +598,7 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
             fingerprint_indices: fingerprint.indices().to_vec(),
             fingerprint_counts: fingerprint.counts().to_vec(),
             descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+            ..Default::default()
         })
     }
 }

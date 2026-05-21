@@ -53,6 +53,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "aliasable"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "250f629c0161ad8107cf89319e990051fae62832fd343083bea452d93e2205fd"
+
+[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1467,7 +1473,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -2816,11 +2822,12 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "finge-rs"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/finge-rs#c5004322486aecc39913fea8918596f47baa7743"
+source = "git+https://github.com/earth-metabolome-initiative/finge-rs#3b138b2264b7b8d224fdf910e404d7f446e3900d"
 dependencies = [
  "bitvec",
  "elements_rs",
  "geometric-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main)",
+ "rand_core 0.6.4",
  "smiles-parser 0.1.0 (git+https://github.com/earth-metabolome-initiative/smiles-parser?branch=main)",
 ]
 
@@ -3164,14 +3171,14 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#c0b1a8e9c9add3398b83ada2f2bb7ff6d7d2f0c5"
+source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#0178cb4712c3868f8bc5dd17b4749ab2a8bdf2b4"
 dependencies = [
  "bitvec",
- "hashbrown 0.16.1",
- "lender",
+ "hashbrown 0.17.0",
+ "lender 0.6.2",
  "multi_ranged",
  "num-traits",
- "rand 0.8.6",
+ "rand 0.10.1",
  "thiserror 2.0.18",
 ]
 
@@ -3182,7 +3189,7 @@ source = "git+https://github.com/earth-metabolome-initiative/geometric-traits#c0
 dependencies = [
  "bitvec",
  "hashbrown 0.16.1",
- "lender",
+ "lender 0.4.2",
  "mem_dbg",
  "multi_ranged",
  "num-traits",
@@ -3394,6 +3401,8 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.2.0",
  "rustc-std-workspace-alloc",
 ]
@@ -3977,6 +3986,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lender"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeed4888de4544bf3ba2e111326978dbcc37f57bf2c7d6a6a78ed6c01f77ef93"
+dependencies = [
+ "aliasable",
+ "fallible-iterator",
+ "maybe-dangling",
+ "stable_try_trait_v2",
+]
+
+[[package]]
 name = "lexical-core"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4287,6 +4308,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "maybe-dangling"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59dbb09ed53f8e4f314e353dc6c1853ae5b4c480a668a422657804a544ea9f65"
+
+[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4439,6 +4466,7 @@ dependencies = [
  "indicatif",
  "mascot-rs",
  "parquet",
+ "rand_chacha 0.3.1",
  "rayon",
  "reqwest 0.12.28",
  "serde",
@@ -4495,9 +4523,9 @@ dependencies = [
 
 [[package]]
 name = "multi_ranged"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9809fbd1a12e6b2303cedb9bff55196574b4d0c9b40209ba0d39aa1bb780cc69"
+checksum = "62ab5d66e0b5838b06db54cc27d1061959725ad3ca240f26daa4a055038b4429"
 dependencies = [
  "num-traits",
  "serde",
@@ -8026,7 +8054,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

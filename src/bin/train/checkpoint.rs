@@ -143,6 +143,8 @@ mod tests {
                 &fingerprint,
                 &[0.0; molecular_autoencoder::features::REGRESSION_TARGET_WIDTH],
                 DataSplit::Train,
+                0,
+                None,
             )
             .expect("push");
         shard

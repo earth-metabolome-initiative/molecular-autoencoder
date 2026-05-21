@@ -564,10 +564,25 @@ fn source_rows_per_batch(
 /// Converts a borrowed shard row into the owned sample shape the batcher
 /// consumes.
 fn sample_from_row(row: MoleculeShardRow<'_>) -> MoleculeAutoencoderSample {
+    // Decoder target storage: empty slice when the shard row is a
+    // positive (the batcher then aliases the decoder target to the
+    // encoder input); explicit slice when the row is a negative
+    // produced by `MutatorMix` at preprocessing time.
+    let (target_indices, target_counts) = if row.is_negative() {
+        (
+            row.target_fingerprint_indices().to_vec(),
+            row.target_fingerprint_counts().to_vec(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     MoleculeAutoencoderSample {
         cid: row.cid(),
         fingerprint_indices: row.fingerprint_indices().to_vec(),
         fingerprint_counts: row.fingerprint_counts().to_vec(),
         descriptor_targets: row.descriptor_targets().to_vec(),
+        violation_label: row.violation_label(),
+        target_fingerprint_indices: target_indices,
+        target_fingerprint_counts: target_counts,
     }
 }

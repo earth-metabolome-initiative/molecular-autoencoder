@@ -473,19 +473,27 @@ where
             let sample_metrics = should_sample_metrics(next_step, args.metric_every);
             let MoleculeAutoencoderBatch {
                 fingerprints,
+                target_fingerprints,
                 descriptor_targets,
+                violation_targets,
                 tanimoto_ranking,
                 ..
             } = batch;
-            let fingerprints_for_metrics = sample_metrics.then(|| fingerprints.clone());
+            // Reconstruction-quality metrics compare the decoder output
+            // to the decoder target (which equals the encoder input on
+            // positive rows and the source positive's fingerprint on
+            // negative rows under the denoising framing).
+            let fingerprints_for_metrics = sample_metrics.then(|| target_fingerprints.clone());
             let output = current.forward(&fingerprints);
             let reconstructed_for_metrics =
                 sample_metrics.then(|| output.reconstructed_log_counts.clone());
             let losses = current.loss_from_output(
                 output,
                 fingerprints,
+                target_fingerprints,
                 descriptor_targets,
                 tanimoto_ranking,
+                violation_targets,
             );
             let loss = losses.total();
             let batch_metrics = match (fingerprints_for_metrics, reconstructed_for_metrics) {
@@ -588,15 +596,25 @@ where
             let step_start = Instant::now();
             let MoleculeAutoencoderBatch {
                 fingerprints,
+                target_fingerprints,
                 descriptor_targets,
+                violation_targets,
                 tanimoto_ranking,
                 ..
             } = batch;
             let output = model.forward(&fingerprints);
             let reconstructed = output.reconstructed_log_counts.clone();
-            let fingerprints_for_metrics = fingerprints.clone();
-            let losses =
-                model.loss_from_output(output, fingerprints, descriptor_targets, tanimoto_ranking);
+            // Reconstruction quality is measured against the decoder
+            // target, not the encoder input (denoising framing).
+            let fingerprints_for_metrics = target_fingerprints.clone();
+            let losses = model.loss_from_output(
+                output,
+                fingerprints,
+                target_fingerprints,
+                descriptor_targets,
+                tanimoto_ranking,
+                violation_targets,
+            );
             let total_loss = losses.total();
             let count_tanimoto_tensor =
                 batch_sparse_log_count_tanimoto(&fingerprints_for_metrics, reconstructed.clone())
@@ -733,7 +751,14 @@ mod tests {
             )
             .expect("valid fingerprint");
             shard
-                .push(cid, &fingerprint, &[0.0; REGRESSION_TARGET_WIDTH], split)
+                .push(
+                    cid,
+                    &fingerprint,
+                    &[0.0; REGRESSION_TARGET_WIDTH],
+                    split,
+                    0,
+                    None,
+                )
                 .expect("push row");
         }
         let path = dir.join("shard-00000.maeshard");
@@ -815,6 +840,7 @@ mod tests {
                 fingerprint_indices: vec![3, 11],
                 fingerprint_counts: vec![1, 1],
                 descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
+                ..Default::default()
             }],
             &device,
         );

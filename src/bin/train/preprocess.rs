@@ -72,6 +72,7 @@ pub fn prepare_manifest(args: &Args, paths: &ResolvedPaths) -> AppResult<PathBuf
         source_selection,
         args.quality_filter()?,
         args.ecfp_radius,
+        args.negatives_per_positive,
     )?;
     Ok(manifest_path)
 }
@@ -85,6 +86,7 @@ fn preprocess_cache(
     source_selection: SourceSelection,
     quality_filter: SmilesQualityFilter,
     ecfp_radius: u8,
+    negatives_per_positive: f32,
 ) -> AppResult<()> {
     if rows_per_shard == 0 {
         return Err(invalid_input("rows per shard must be greater than zero"));
@@ -99,6 +101,7 @@ fn preprocess_cache(
     let config = PreprocessingConfig::builder()
         .counted_ecfp(counted_ecfp)
         .quality_filter(quality_filter)
+        .negatives_per_positive(negatives_per_positive)
         .build()
         .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
     let mut manifest = ShardManifest::new(source_selection.manifest_source(), config.clone());
@@ -237,26 +240,28 @@ impl PreprocessContext<'_> {
                 let records_seen = chunk.records_seen();
                 for result in chunk.into_results() {
                     match result {
-                        Ok(Some(targets)) => {
-                            self.shard
-                                .push_targets(&targets, *self.config.descriptors())?;
-                            if self.shard.len() >= self.rows_per_shard {
-                                write_preprocessed_shard(
-                                    self.cache_dir,
-                                    *self.shard_index,
-                                    self.manifest,
-                                    self.shard,
-                                )?;
-                                self.progress.shard_written(self.manifest, 0);
-                                *self.shard = SparseMoleculeShard::new(
-                                    self.config.counted_ecfp().size(),
-                                    REGRESSION_TARGET_WIDTH,
-                                );
-                                *self.shard_index += 1;
-                            }
-                        }
-                        Ok(None) => {
+                        Ok(rows) if rows.is_empty() => {
                             self.manifest.record_skipped();
+                        }
+                        Ok(rows) => {
+                            for targets in &rows {
+                                self.shard
+                                    .push_targets(targets, *self.config.descriptors())?;
+                                if self.shard.len() >= self.rows_per_shard {
+                                    write_preprocessed_shard(
+                                        self.cache_dir,
+                                        *self.shard_index,
+                                        self.manifest,
+                                        self.shard,
+                                    )?;
+                                    self.progress.shard_written(self.manifest, 0);
+                                    *self.shard = SparseMoleculeShard::new(
+                                        self.config.counted_ecfp().size(),
+                                        REGRESSION_TARGET_WIDTH,
+                                    );
+                                    *self.shard_index += 1;
+                                }
+                            }
                         }
                         Err(error) => {
                             self.manifest.record_error();
@@ -408,6 +413,8 @@ mod tests {
                 &fingerprint,
                 &[0.0; REGRESSION_TARGET_WIDTH],
                 DataSplit::Train,
+                0,
+                None,
             )
             .expect("push row");
         shard

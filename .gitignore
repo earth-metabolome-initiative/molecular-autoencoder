@@ -21,6 +21,8 @@ target
 #.idea/
 shards
 runs
+cache
+checkpoints
 
 # Generated LaTeX formula render artifacts
 docs/formulas/*.aux
