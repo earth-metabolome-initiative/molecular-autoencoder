@@ -1,0 +1,11 @@
+\documentclass[border=0pt]{standalone}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\begin{document}
+\color[HTML]{475569}
+\sffamily\fontsize{10}{13}\selectfont
+\setlength{\parindent}{0pt}
+\begin{minipage}{320mm}
+PubChem ($\sim$123M SMILES) and ZINC20 ($\sim$1G SMILES) records are turned into sparse counted ECFP rows. At preprocessing time, each positive optionally seeds one or more MutatorMix negatives carrying a multi-label violation bitset. Positives and negatives share the same encoder, and the decoder is trained to reconstruct the source positive in either case (denoising / correction framing).
+\end{minipage}
+\end{document}
