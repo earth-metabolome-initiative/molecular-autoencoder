@@ -62,7 +62,7 @@ bash slurm/lrc/submit.sh smoke -- --datasets pubchem --force-preprocess   # forw
 
 - `--gres=gpu:GRTX2080TI:4`, `--cpus-per-task=8`, `--mem=80G`, 12 hour walltime.
 - es0 nodes have only `CPUTot=8` total cores despite carrying 4 GPUs, so 8 is the per-node ceiling. The partition runs `OverSubscribe=FORCE:1`, so `--exclusive` would conflict.
-- DDP needs NCCL at runtime (cudarc `dlopen`s `libnccl.so.2`). The Lmod `cuda/12.2.1` module does not ship it; `nvhpc/23.11` does. The script briefly loads `nvhpc/23.11` to read `NVHPC_ROOT`, captures `$NVHPC_ROOT/REDIST/comm_libs/12.3/nccl/lib`, then swaps back to `gcc/11.4.0 cuda/12.2.1` and prepends the NCCL libdir to `LD_LIBRARY_PATH`. Override with `MAUTO_NCCL_MODULE` / `MAUTO_NCCL_REDIST_SUBPATH` if the cluster reorganises.
+- DDP needs NCCL at runtime (cudarc `dlopen`s `libnccl.so.2`, requires `ncclAlltoAll` from NCCL 2.19+). The Lmod `cuda/12.2.1` module ships no NCCL, and `nvhpc/23.11` only ships NCCL 2.18.5 (too old). `setup_env.sh` pip-downloads the `nvidia-nccl-cu12` manylinux2014 wheel (currently 2.21+) once and unpacks it to `$HOME/local/nccl-cu12/nvidia/nccl/lib/`. `ddp_4gpu.sh` then prepends that to `LD_LIBRARY_PATH`. Override with `MAUTO_NCCL_LIB_DIR` if you keep an NCCL install elsewhere.
 - Runs `train --cuda-devices 0,1,2,3 --epochs 20 --batch-size 16384`.
 - Use case: validate `burn-collective` all-reduce on real hardware.
 

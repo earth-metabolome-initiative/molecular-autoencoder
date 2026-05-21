@@ -42,24 +42,20 @@ load_user_cargo_environment() {
 
 clean_rust_compiler_environment
 
-# Discover the NCCL libdir from nvhpc/23.11. The Lmod 'cuda/12.2.1'
-# module does NOT ship NCCL, but the NVIDIA HPC SDK module does (CUDA
-# 12.3 variant, ABI-compatible with our cuda/12.2.1 build). Load it
-# only long enough to read NVHPC_ROOT, then swap back to gcc + cuda so
-# the rest of the env (CC, PATH, etc.) stays as we built against.
-NCCL_MODULE="${MAUTO_NCCL_MODULE:-nvhpc/23.11}"
-NCCL_REDIST_SUBPATH="${MAUTO_NCCL_REDIST_SUBPATH:-REDIST/comm_libs/12.3/nccl/lib}"
+# cudarc 0.19.4 dlopens libnccl.so.2 from LD_LIBRARY_PATH and needs
+# symbols (ncclAlltoAll) added in NCCL 2.19+. setup_env.sh installs the
+# nvidia-nccl-cu12 manylinux2014 wheel under $HOME by default;
+# MAUTO_NCCL_LIB_DIR can point this script at a different libnccl
+# install if the user maintains one elsewhere.
+NCCL_LIB_DIR="${MAUTO_NCCL_LIB_DIR:-$HOME/local/nccl-cu12/nvidia/nccl/lib}"
 module purge
-module load "$NCCL_MODULE"
-NCCL_LIB_DIR="$NVHPC_ROOT/$NCCL_REDIST_SUBPATH"
-module purge
-
 module load "$GCC_MODULE" "$CUDA_MODULE"
 load_user_cargo_environment
 
 if [ ! -f "$NCCL_LIB_DIR/libnccl.so.2" ]; then
     echo "ERROR: libnccl.so.2 not found at $NCCL_LIB_DIR"
-    echo "Override with MAUTO_NCCL_MODULE / MAUTO_NCCL_REDIST_SUBPATH if the cluster moved it."
+    echo "Run 'bash slurm/lrc/setup_env.sh' on the login node first, or"
+    echo "set MAUTO_NCCL_LIB_DIR to point at an existing libnccl.so.2 directory."
     exit 1
 fi
 export LD_LIBRARY_PATH="$NCCL_LIB_DIR:${LD_LIBRARY_PATH:-}"

@@ -18,6 +18,9 @@ CACHE_DIR="$SCRATCH_ROOT/cache"
 CHECKPOINT_DIR="$SCRATCH_ROOT/checkpoints"
 LOGS_DIR="$SCRATCH_ROOT/logs"
 TARGET_DIR="$SCRATCH_ROOT/target"
+NCCL_INSTALL_DIR="${MAUTO_NCCL_INSTALL_DIR:-$HOME/local/nccl-cu12}"
+NCCL_LIB_DIR="$NCCL_INSTALL_DIR/nvidia/nccl/lib"
+MINIFORGE_MODULE="${MAUTO_MINIFORGE_MODULE:-miniforge3/25.9.1}"
 MIN_RUST_VERSION="1.85.0"
 GCC_MODULE="${MAUTO_GCC_MODULE:-gcc/11.4.0}"
 CUDA_MODULE="${MAUTO_CUDA_MODULE:-cuda/12.2.1}"
@@ -109,6 +112,53 @@ load_cluster_modules() {
     echo "nvcc: $(command -v nvcc) -> $(nvcc --version | tail -1)"
 }
 
+install_nccl_wheel() {
+    # cudarc 0.19.4 dlopens libnccl.so.2 and requires symbols (ncclAlltoAll)
+    # added in NCCL 2.19. The Lawrencium cuda/12.2.1 module ships no NCCL,
+    # and nvhpc/23.11 only ships 2.18.5. We grab the manylinux2014 wheel
+    # nvidia-nccl-cu12 publishes (currently 2.21+) and unpack it under
+    # $HOME so neither the cluster admins nor a recompile is needed.
+    if [ -f "$NCCL_LIB_DIR/libnccl.so.2" ]; then
+        echo "NCCL already installed: $(ls "$NCCL_LIB_DIR"/libnccl.so.2*)"
+        return
+    fi
+    echo "Installing nvidia-nccl-cu12 wheel under $NCCL_INSTALL_DIR"
+    # miniforge3 just gives us pip; the cluster's python module is fine too.
+    if command -v module > /dev/null 2>&1; then
+        module load "$MINIFORGE_MODULE"
+    fi
+    if ! command -v pip > /dev/null 2>&1; then
+        echo "ERROR: pip not in PATH after 'module load $MINIFORGE_MODULE'."
+        exit 1
+    fi
+    mkdir -p "$NCCL_INSTALL_DIR/wheels"
+    pip download --no-deps --only-binary :all: \
+        --platform manylinux2014_x86_64 \
+        --python-version 3.10 \
+        --dest "$NCCL_INSTALL_DIR/wheels" \
+        nvidia-nccl-cu12
+    (
+        cd "$NCCL_INSTALL_DIR"
+        # The wheel is a zip; unzip is part of base Rocky 8.
+        unzip -o wheels/nvidia_nccl_cu12-*.whl
+    )
+    # Some wheels ship libnccl.so.<x.y.z> without the libnccl.so.2 SONAME
+    # symlink. Recreate it if so.
+    if [ ! -e "$NCCL_LIB_DIR/libnccl.so.2" ]; then
+        real_so="$(find "$NCCL_LIB_DIR" -maxdepth 1 -name 'libnccl.so.2.*' -printf '%f\n' | head -1)"
+        if [ -z "$real_so" ]; then
+            echo "ERROR: wheel did not contain libnccl.so.2.*"
+            exit 1
+        fi
+        ln -sf "$real_so" "$NCCL_LIB_DIR/libnccl.so.2"
+        ln -sf "libnccl.so.2" "$NCCL_LIB_DIR/libnccl.so"
+    fi
+    ls -la "$NCCL_LIB_DIR"
+    if command -v module > /dev/null 2>&1; then
+        module unload "$MINIFORGE_MODULE" 2>/dev/null || true
+    fi
+}
+
 link_scratch_directory() {
     local link_path="$1"
     local target_path="$2"
@@ -126,6 +176,10 @@ link_scratch_directory() {
 clean_rust_compiler_environment
 load_cluster_modules
 ensure_cargo
+install_nccl_wheel
+# NCCL install can leave miniforge3 in the environment; reload our build
+# modules so subsequent cargo commands see the right gcc / cuda.
+load_cluster_modules
 
 if [ -d "$REPO_DIR/.git" ]; then
     echo "Updating $REPO_DIR"
