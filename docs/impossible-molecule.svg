@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180.95" height="174.25" viewBox="0 0 180.95 174.25" role="img" aria-labelledby="title desc">
+  <title id="title">Impossible molecule</title>
+  <desc id="desc">Central carbon carrying a positive formal charge, bonded to five hydrogens; the hypervalent five-H configuration alone makes the structure chemically impossible, regardless of charge magnitude.</desc>
+  <defs>
+    <style>
+      .bond { stroke: #1f2937; stroke-width: 3.5; stroke-linecap: round; }
+      .atomCircle { stroke: #0f172a; stroke-width: 2.5; }
+      .carbonFill { fill: #0f172a; }
+      .hydrogenFill { fill: #22d3ee; stroke: none; }
+    </style>
+  </defs>
+
+  <line class="bond" x1="90.48" y1="72" x2="90.48" y2="38"/>
+  <line class="bond" x1="111.4" y1="87.2" x2="143.74" y2="76.7"/>
+  <line class="bond" x1="103.41" y1="111.8" x2="123.39" y2="139.3"/>
+  <line class="bond" x1="77.54" y1="111.8" x2="57.56" y2="139.3"/>
+  <line class="bond" x1="69.55" y1="87.2" x2="37.22" y2="76.7"/>
+
+  <g aria-label="Five hydrogen atoms">
+    <circle class="atomCircle hydrogenFill" cx="90.48" cy="22" r="16"/>
+    <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACYAAAAmCAYAAACoPemuAAAAAXNSR0IB2cksfwAAAAlwSFlzAAAuIwAALiMBeKU/dgAAAJVJREFUWMPtljEKwkAURGckhXgIsUxp7ym8hZVXs9ETmN4rWOQI9mOTIpUxGxZSvAcL+2HY/9gPy0oAdfFUIMlN0mEo37bPJY2SvEbl0/b1V77548x2WJK0XXAJx9G+nwpv1jpKxBBDDDHEKtHMzO+SnNYotpfUMcoZ9JIuhb3uNcU+th+F/zGeC8QQQwwxxBADgOV8AfeKFn28idt7AAAAAElFTkSuQmCC" x="81.3" y="12.83" width="18.34" height="18.34" preserveAspectRatio="xMidYMid meet"/>
+    <circle class="atomCircle hydrogenFill" cx="158.95" cy="71.75" r="16"/>
+    <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACYAAAAmCAYAAACoPemuAAAAAXNSR0IB2cksfwAAAAlwSFlzAAAuIwAALiMBeKU/dgAAAJVJREFUWMPtljEKwkAURGckhXgIsUxp7ym8hZVXs9ETmN4rWOQI9mOTIpUxGxZSvAcL+2HY/9gPy0oAdfFUIMlN0mEo37bPJY2SvEbl0/b1V77548x2WJK0XXAJx9G+nwpv1jpKxBBDDDHEKtHMzO+SnNYotpfUMcoZ9JIuhb3uNcU+th+F/zGeC8QQQwwxxBADgOV8AfeKFn28idt7AAAAAElFTkSuQmCC" x="149.78" y="62.58" width="18.34" height="18.34" preserveAspectRatio="xMidYMid meet"/>
+    <circle class="atomCircle hydrogenFill" cx="132.8" cy="152.25" r="16"/>
+    <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACYAAAAmCAYAAACoPemuAAAAAXNSR0IB2cksfwAAAAlwSFlzAAAuIwAALiMBeKU/dgAAAJVJREFUWMPtljEKwkAURGckhXgIsUxp7ym8hZVXs9ETmN4rWOQI9mOTIpUxGxZSvAcL+2HY/9gPy0oAdfFUIMlN0mEo37bPJY2SvEbl0/b1V77548x2WJK0XXAJx9G+nwpv1jpKxBBDDDHEKtHMzO+SnNYotpfUMcoZ9JIuhb3uNcU+th+F/zGeC8QQQwwxxBADgOV8AfeKFn28idt7AAAAAElFTkSuQmCC" x="123.62" y="143.08" width="18.34" height="18.34" preserveAspectRatio="xMidYMid meet"/>
+    <circle class="atomCircle hydrogenFill" cx="48.16" cy="152.25" r="16"/>
+    <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACYAAAAmCAYAAACoPemuAAAAAXNSR0IB2cksfwAAAAlwSFlzAAAuIwAALiMBeKU/dgAAAJVJREFUWMPtljEKwkAURGckhXgIsUxp7ym8hZVXs9ETmN4rWOQI9mOTIpUxGxZSvAcL+2HY/9gPy0oAdfFUIMlN0mEo37bPJY2SvEbl0/b1V77548x2WJK0XXAJx9G+nwpv1jpKxBBDDDHEKtHMzO+SnNYotpfUMcoZ9JIuhb3uNcU+th+F/zGeC8QQQwwxxBADgOV8AfeKFn28idt7AAAAAElFTkSuQmCC" x="38.98" y="143.08" width="18.34" height="18.34" preserveAspectRatio="xMidYMid meet"/>
+    <circle class="atomCircle hydrogenFill" cx="22" cy="71.75" r="16"/>
+    <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACYAAAAmCAYAAACoPemuAAAAAXNSR0IB2cksfwAAAAlwSFlzAAAuIwAALiMBeKU/dgAAAJVJREFUWMPtljEKwkAURGckhXgIsUxp7ym8hZVXs9ETmN4rWOQI9mOTIpUxGxZSvAcL+2HY/9gPy0oAdfFUIMlN0mEo37bPJY2SvEbl0/b1V77548x2WJK0XXAJx9G+nwpv1jpKxBBDDDHEKtHMzO+SnNYotpfUMcoZ9JIuhb3uNcU+th+F/zGeC8QQQwwxxBADgOV8AfeKFn28idt7AAAAAElFTkSuQmCC" x="12.83" y="62.58" width="18.34" height="18.34" preserveAspectRatio="xMidYMid meet"/>
+  </g>
+
+  <g aria-label="Central carbon with isotope mass 99 and positive formal charge">
+    <circle class="atomCircle carbonFill" cx="90.48" cy="94" r="22"/>
+    <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACMAAAAmCAYAAABOFCLqAAAAAXNSR0IB2cksfwAAAAlwSFlzAAAuIwAALiMBeKU/dgAAAeZJREFUWMPtmE9IVUEUh7+RiqxnRWYilRUZrYIEg1oUSC5aSvu21UpctWvTVghp2z4M2hUICdHShUSLFlFRaYFYLSrLxF5+ba4wDPnnxb0OwTurM3PvzP3m/Jhzzww07T+wUNZE6k7gANAJfAHmgM8hhOVNWYl6Wh1R3/p3q6uz6kP1unqkCoge9YGN27LaXZpM6lXgNrAt6v4OjAOvgQ/ADqAD6APOFG2An0CtFOnUG8lK59VhddcaY2rqtULKqbKkGUpAnqsnGhi/Xe0vA6RXXYxAptWuTd/7aiiisGK/1FNZEpF6KZFnNFtWVKcikEW1PRfI8SQqd6v8Xss6zweS9r2cEt1PItORMzLHIv99COFTTpj9kT9XtRLrwcSyfM0NU4/8ttwwH1eJUhaY6cg/rO7OCfMkefdsTpiJpD2YM+m1qC+jpPdNrWWJTFEe3kp21HDO6LSq76LoLKhHcwL1F5X9ij1T23ICjSQ/zcfq3gbnOKkOlFV+3kmAZtSLGxh7UB1Vl9Sbq723ZcPn4BBUrwALwFDRfQgYV18AY8ArYLY4J+0BeoDzwDlgazGms2zJLqhv/uFEOan2VbXLLqsT6u81AOrqI3VQDZXfQqj7ikKsG+gCloB5YAZ4GkL40bzwaVoV9gfxYlfS/41dNgAAAABJRU5ErkJggg==" x="82.57" y="85.42" width="15.81" height="17.16" preserveAspectRatio="xMidYMid meet"/>
+    <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB8AAAAWCAYAAAA4oUfxAAAAAXNSR0IB2cksfwAAAAlwSFlzAAAuIwAALiMBeKU/dgAAAThJREFUSMftlb1KA0EURs+IBKyCWERELRSLNKKIP429b2BnZ2ntC1gKgo3iA4iVWFj7AIopFJRoq6RSTGchHJsBQ4jJZBJIkw+Wy945M9/dvTO7MNQAFDoBagkoAzXgJYRgP9hOpgX1VP3xT09quRc2xTio13GxPXVCXVUf1bo6k8Ommu/E6o+a8ksxf5LDpppfxYnLLcZe1U81dMs2a+Qf/9kYay3GqsA4MJfBJpl/xVho84KmM9gk82qM6827GliJt8UMNqnna7GPD+p4Q/6w4ShtdMt2U8BZnPimXqrPaiVeNhkls0lfuLhDd4Gt2Ncb4AJ4BwghlHLYbKmb8UkO+smmGI+pd+qHWuwHO9pmgXOgAtwCU8A+MA9shxDquWzqT+VY/W7YsffqYi9sThEL6mQ/2aEGql+b1fJImeoqNwAAAABJRU5ErkJggg==" x="73.47" y="81.94" width="14" height="9.94" preserveAspectRatio="xMidYMid meet"/>
+    <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAaCAYAAACgoey0AAAAAXNSR0IB2cksfwAAAAlwSFlzAAAuIwAALiMBeKU/dgAAAIVJREFUSMdjYBgFowAH+P//f8H///99yNXPRIHd1gwMDMYDYTFFYNTiUYtpBhjx5NM8BgaGUDx6NRkYGL4yMDA8wmUEAwNDByMj4zZskix4DN4PNRgXyGRgYHjKwMCwCY/Fl2hRcq3+//9//WjiGrV4WFn8D4rp3hAw+v//v/xok2gU4AIAVuYkNCMs8NMAAAAASUVORK5CYII=" x="93.64" y="81.9" width="13.55" height="11.74" preserveAspectRatio="xMidYMid meet"/>
+  </g>
+</svg>
