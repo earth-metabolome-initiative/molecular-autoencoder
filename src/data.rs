@@ -418,7 +418,7 @@ impl DataSplit {
 
 /// Default number of negatives emitted per positive when the preprocessor
 /// is asked to bake violation-classified mutants into the shard.
-pub const DEFAULT_NEGATIVES_PER_POSITIVE: f32 = 0.0;
+pub const DEFAULT_NEGATIVES_PER_POSITIVE: f32 = 1.0;
 
 /// Deterministic preprocessing configuration. Construct via
 /// [`PreprocessingConfig::builder`].
@@ -2847,7 +2847,10 @@ mod tests {
 
     #[test]
     fn negative_count_for_stable_id_is_deterministic_and_zero_when_disabled() {
-        let zero = PreprocessingConfig::default();
+        let zero = PreprocessingConfig::builder()
+            .negatives_per_positive(0.0)
+            .build()
+            .expect("valid");
         assert_eq!(zero.negatives_per_positive(), 0.0);
         assert_eq!(zero.negative_count_for_stable_id(0xABCD), 0);
 
