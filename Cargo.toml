@@ -61,7 +61,7 @@ burn-cpu = { version = "=0.21.0", default-features = false, features = ["std"], 
 burn-cubecl = { version = "=0.21.0", default-features = false, optional = true }
 burn-fusion = { version = "=0.21.0", default-features = false, optional = true }
 burn-ir = { version = "=0.21.0", default-features = false, optional = true }
-cudarc = { version = "=0.19.4", default-features = false, features = ["driver", "fallback-dynamic-loading", "cuda-version-from-build-system"], optional = true }
+cudarc = { version = "=0.19.7", default-features = false, features = ["driver", "fallback-dynamic-loading", "cuda-version-from-build-system"], optional = true }
 clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"], optional = true }
 csv = { version = "1", optional = true }
 cubecl = { version = "=0.10.0", default-features = false, optional = true }
