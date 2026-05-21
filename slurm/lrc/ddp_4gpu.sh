@@ -41,9 +41,29 @@ load_user_cargo_environment() {
 }
 
 clean_rust_compiler_environment
+
+# Discover the NCCL libdir from nvhpc/23.11. The Lmod 'cuda/12.2.1'
+# module does NOT ship NCCL, but the NVIDIA HPC SDK module does (CUDA
+# 12.3 variant, ABI-compatible with our cuda/12.2.1 build). Load it
+# only long enough to read NVHPC_ROOT, then swap back to gcc + cuda so
+# the rest of the env (CC, PATH, etc.) stays as we built against.
+NCCL_MODULE="${MAUTO_NCCL_MODULE:-nvhpc/23.11}"
+NCCL_REDIST_SUBPATH="${MAUTO_NCCL_REDIST_SUBPATH:-REDIST/comm_libs/12.3/nccl/lib}"
 module purge
+module load "$NCCL_MODULE"
+NCCL_LIB_DIR="$NVHPC_ROOT/$NCCL_REDIST_SUBPATH"
+module purge
+
 module load "$GCC_MODULE" "$CUDA_MODULE"
 load_user_cargo_environment
+
+if [ ! -f "$NCCL_LIB_DIR/libnccl.so.2" ]; then
+    echo "ERROR: libnccl.so.2 not found at $NCCL_LIB_DIR"
+    echo "Override with MAUTO_NCCL_MODULE / MAUTO_NCCL_REDIST_SUBPATH if the cluster moved it."
+    exit 1
+fi
+export LD_LIBRARY_PATH="$NCCL_LIB_DIR:${LD_LIBRARY_PATH:-}"
+echo "NCCL libdir:  $NCCL_LIB_DIR"
 
 # cubecl-cuda reads CUDA_PATH specifically; the Lmod cuda module only
 # sets CUDA_HOME / CUDA_ROOT. Derive CUDA_PATH from nvcc's location so it
