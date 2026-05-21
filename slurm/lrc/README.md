@@ -60,7 +60,8 @@ bash slurm/lrc/submit.sh smoke -- --datasets pubchem --force-preprocess   # forw
 
 ### `ddp_4gpu.sh`
 
-- `--gres=gpu:GRTX2080TI:4`, `--exclusive`, `--mem=0`, `--cpus-per-task=32`, 12 hour walltime.
+- `--gres=gpu:GRTX2080TI:4`, `--cpus-per-task=8`, `--mem=80G`, 12 hour walltime.
+- es0 nodes have only `CPUTot=8` total cores despite carrying 4 GPUs, so 8 is the per-node ceiling. The partition runs `OverSubscribe=FORCE:1`, so `--exclusive` would conflict.
 - Runs `train --cuda-devices 0,1,2,3 --epochs 20 --batch-size 16384`.
 - Use case: validate `burn-collective` all-reduce on real hardware.
 

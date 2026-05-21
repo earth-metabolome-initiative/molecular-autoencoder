@@ -5,10 +5,9 @@
 #SBATCH --qos=es_normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:GRTX2080TI:4
-#SBATCH --mem=0
-#SBATCH --exclusive
+#SBATCH --mem=80G
 #SBATCH --time=12:00:00
 #SBATCH --output=/global/scratch/users/%u/molecular-autoencoder/logs/ddp_%j.out
 #SBATCH --error=/global/scratch/users/%u/molecular-autoencoder/logs/ddp_%j.err
