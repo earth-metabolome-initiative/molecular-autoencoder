@@ -5,7 +5,15 @@
 # It installs rustup if needed (the cluster's rust/1.70.0 module is too old
 # for edition 2024), clones / updates the repo, wires the scratch
 # directories into $HOME via symlinks, loads gcc + cuda modules, and runs
-# `cargo build --release --features cuda-fusion,datasets --locked`.
+# `cargo build --release --features cuda-no-fusion,datasets --locked`.
+#
+# We default to `cuda-no-fusion` over `cuda-fusion` because cubecl-fusion's
+# first-batch JIT compile pass took 75+ minutes on the es0 2080 Ti nodes
+# before any progress, and re-fired on every new tensor shape (backward,
+# optimizer step, validation). The unfused path has slower steady-state
+# kernels but reaches steady-state in seconds. Override with
+# `MAUTO_CARGO_FEATURES=cuda-fusion,datasets` if you have time to wait
+# out the fusion warmup.
 #
 # Compute-node jobs reuse the prebuilt binary; they do not rebuild.
 
@@ -227,7 +235,9 @@ echo "Cargo:     $(cargo --version)"
 echo "Target:    $CARGO_TARGET_DIR"
 echo "RUSTFLAGS: $RUSTFLAGS"
 
-cargo build --release --features cuda-fusion,datasets --locked
+CARGO_FEATURES="${MAUTO_CARGO_FEATURES:-cuda-no-fusion,datasets}"
+echo "Cargo features: $CARGO_FEATURES"
+cargo build --release --features "$CARGO_FEATURES" --locked
 
 "$CARGO_TARGET_DIR/release/train" --help > /dev/null
 echo "train --help: OK"

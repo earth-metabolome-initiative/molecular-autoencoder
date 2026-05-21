@@ -26,7 +26,7 @@ bash slurm/lrc/setup_env.sh
 - Loads `gcc/11.4.0` and `cuda/12.2.1` Lmod modules.
 - Installs `rustup` under `$HOME/.cargo` (the cluster's `rust/1.70.0` module is too old for edition 2024).
 - Creates the scratch tree under `/global/scratch/users/$USER/molecular-autoencoder/{cache,checkpoints,logs,target}` and symlinks the first three back into the repo.
-- Builds the release binary with `CARGO_TARGET_DIR` on scratch and `RUSTFLAGS=-C target-cpu=x86-64-v3` for cross-partition portability. (`target-cpu=native` SIGILLs on older lr4 nodes per the spectral-sim experience; safer to stick with the v3 baseline.)
+- Builds the release binary with `CARGO_TARGET_DIR` on scratch and `RUSTFLAGS=-C target-cpu=x86-64-v3` for cross-partition portability. (`target-cpu=native` SIGILLs on older lr4 nodes per the spectral-sim experience; safer to stick with the v3 baseline.) Defaults to the `cuda-no-fusion,datasets` feature combo because `cuda-fusion`'s first-batch JIT took 75+ minutes on the es0 2080 Tis with re-fires on every new tensor shape (backward, optimizer step, validation). Override with `MAUTO_CARGO_FEATURES=cuda-fusion,datasets` if you have time to wait out the fusion warmup.
 - Sanity-checks `train --help`.
 
 Re-run `setup_env.sh` after `git pull` to rebuild.
