@@ -2276,7 +2276,10 @@ mod tests {
     #[cfg(feature = "datasets")]
     #[test]
     fn parallel_preprocessing_preserves_order_and_reports_record_errors() {
-        let config = PreprocessingConfig::default();
+        let config = PreprocessingConfig::builder()
+            .negatives_per_positive(0.0)
+            .build()
+            .expect("valid");
         let mut chunks = Vec::new();
         let records = vec![
             Ok(MoleculeRecord::new("pubchem-smiles", "702", "CCO")),
@@ -2776,7 +2779,10 @@ mod tests {
 
     #[test]
     fn molecule_targets_accessors_round_trip_preprocessed_record() {
-        let config = PreprocessingConfig::default();
+        let config = PreprocessingConfig::builder()
+            .negatives_per_positive(0.0)
+            .build()
+            .expect("valid");
         let mut scratch = finge_rs::smiles_support::SmilesRdkitScratch::default();
         let record = MoleculeRecord::new("pubchem-smiles", "702", "CCO");
         let rows = preprocess_record(&record, &config, &mut scratch).expect("preprocess ok");
