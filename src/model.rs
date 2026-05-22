@@ -51,7 +51,15 @@ pub const DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE: f64 = 0.10;
 pub const DEFAULT_TANIMOTO_RANKING_MIN_GAP: f64 = 0.05;
 
 /// Default number of random candidate partners sampled per anchor.
-pub const DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR: usize = 32;
+///
+/// `K = 8` keeps the SoftRank Spearman pairwise-sigmoid cube small
+/// (`[batch, 8, 8]` = 64 elements per row instead of the `1024` at
+/// `K = 32`), which is the dominant per-batch compute cost when
+/// `--tanimoto-ranking-loss softrank-spearman` is active. Softmax CE
+/// is also K-linear so it benefits proportionally. Override with
+/// `--tanimoto-ranking-candidates` if a richer per-anchor ordering is
+/// worth the quadratic compute.
+pub const DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR: usize = 8;
 
 /// Default max anchors per batch for the ranking loss (`0` uses all rows).
 pub const DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH: usize = 0;
