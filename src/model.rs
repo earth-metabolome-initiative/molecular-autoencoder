@@ -1901,7 +1901,7 @@ pub struct MoleculeAutoencoderOutput<B: Backend> {
 /// Weighted loss components.
 #[derive(Debug)]
 pub struct MoleculeLossBreakdown<B: Backend> {
-    /// Main counted ECFP reconstruction Huber loss.
+    /// Main counted ECFP reconstruction-head loss (Huber or Poisson per the active `ReconstructionLossKind`).
     pub reconstruction: Tensor<B, 1>,
     /// Per-row counterpart of [`Self::reconstruction`], shape `[batch]`,
     /// surfaced so the train-time metrics pipeline can split the

@@ -107,12 +107,12 @@ pub struct EvaluationSummary {
     /// Sum of binary-Tanimoto scores over every negative (correction)
     /// row seen across all batches.
     pub binary_tanimoto_correction_sum: f64,
-    /// Sum of reconstruction Huber per-row scores over every positive
+    /// Sum of reconstruction-head per-row scores over every positive
     /// (reconstruction) row seen across all batches.
-    pub huber_reconstruction_sum: f64,
-    /// Sum of reconstruction Huber per-row scores over every negative
+    pub recon_loss_reconstruction_sum: f64,
+    /// Sum of reconstruction-head per-row scores over every negative
     /// (correction) row seen across all batches.
-    pub huber_correction_sum: f64,
+    pub recon_loss_correction_sum: f64,
     /// Sum of bit-presence BCE per-row scores (already multiplied by
     /// `bce_weight`) over every positive (reconstruction) row seen
     /// across all batches.
@@ -161,11 +161,12 @@ impl EvaluationSummary {
         if let Some(mean) = metrics.binary_tanimoto_correction {
             self.binary_tanimoto_correction_sum += f64::from(mean) * metrics.correction_rows as f64;
         }
-        if let Some(mean) = metrics.huber_reconstruction {
-            self.huber_reconstruction_sum += f64::from(mean) * metrics.reconstruction_rows as f64;
+        if let Some(mean) = metrics.recon_loss_reconstruction {
+            self.recon_loss_reconstruction_sum +=
+                f64::from(mean) * metrics.reconstruction_rows as f64;
         }
-        if let Some(mean) = metrics.huber_correction {
-            self.huber_correction_sum += f64::from(mean) * metrics.correction_rows as f64;
+        if let Some(mean) = metrics.recon_loss_correction {
+            self.recon_loss_correction_sum += f64::from(mean) * metrics.correction_rows as f64;
         }
         if let Some(mean) = metrics.bce_reconstruction {
             self.bce_reconstruction_sum += f64::from(mean) * metrics.reconstruction_rows as f64;
@@ -218,18 +219,18 @@ impl EvaluationSummary {
         weighted_mean(self.binary_tanimoto_correction_sum, self.correction_rows)
     }
 
-    /// Row-weighted mean reconstruction Huber over positive
+    /// Row-weighted mean reconstruction-head loss over positive
     /// (reconstruction) rows. Returns `None` when no positive rows
     /// were seen.
-    pub fn mean_huber_reconstruction(self) -> Option<f32> {
-        weighted_mean(self.huber_reconstruction_sum, self.reconstruction_rows)
+    pub fn mean_recon_loss_reconstruction(self) -> Option<f32> {
+        weighted_mean(self.recon_loss_reconstruction_sum, self.reconstruction_rows)
     }
 
-    /// Row-weighted mean reconstruction Huber over negative
+    /// Row-weighted mean reconstruction-head loss over negative
     /// (correction) rows. Returns `None` when no negative rows were
     /// seen.
-    pub fn mean_huber_correction(self) -> Option<f32> {
-        weighted_mean(self.huber_correction_sum, self.correction_rows)
+    pub fn mean_recon_loss_correction(self) -> Option<f32> {
+        weighted_mean(self.recon_loss_correction_sum, self.correction_rows)
     }
 
     /// Row-weighted mean bit-presence BCE (already multiplied by
@@ -869,8 +870,8 @@ fn polarity_split<B: Backend>(
     let count_correction_sum = (count_per_row * correction_mask.clone()).sum();
     let binary_reconstruction_sum = (binary_per_row.clone() * reconstruction_mask.clone()).sum();
     let binary_correction_sum = (binary_per_row * correction_mask.clone()).sum();
-    let huber_reconstruction_sum = (huber_per_row.clone() * reconstruction_mask.clone()).sum();
-    let huber_correction_sum = (huber_per_row * correction_mask.clone()).sum();
+    let recon_loss_reconstruction_sum = (huber_per_row.clone() * reconstruction_mask.clone()).sum();
+    let recon_loss_correction_sum = (huber_per_row * correction_mask.clone()).sum();
     let bce_reconstruction_sum = (bce_per_row.clone() * reconstruction_mask).sum();
     let bce_correction_sum = (bce_per_row * correction_mask).sum();
     PolaritySplitTensors {
@@ -878,8 +879,8 @@ fn polarity_split<B: Backend>(
         count_correction_sum,
         binary_reconstruction_sum,
         binary_correction_sum,
-        huber_reconstruction_sum,
-        huber_correction_sum,
+        recon_loss_reconstruction_sum,
+        recon_loss_correction_sum,
         bce_reconstruction_sum,
         bce_correction_sum,
         reconstruction_count,
@@ -1207,8 +1208,8 @@ mod tests {
             count_tanimoto_correction: count_correction,
             binary_tanimoto_reconstruction: binary_reconstruction,
             binary_tanimoto_correction: binary_correction,
-            huber_reconstruction: None,
-            huber_correction: None,
+            recon_loss_reconstruction: None,
+            recon_loss_correction: None,
             bce_reconstruction: None,
             bce_correction: None,
             reconstruction_rows,

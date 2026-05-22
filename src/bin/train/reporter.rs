@@ -208,16 +208,16 @@ impl TrainingReporter {
                         metrics.correction_rows,
                     ));
                 }
-                if let Some(value) = metrics.huber_reconstruction {
+                if let Some(value) = metrics.recon_loss_reconstruction {
                     renderer.update_train(metric_state(
-                        self.metric_ids.huber_reconstruction.clone(),
+                        self.metric_ids.recon_loss_reconstruction.clone(),
                         value,
                         metrics.reconstruction_rows,
                     ));
                 }
-                if let Some(value) = metrics.huber_correction {
+                if let Some(value) = metrics.recon_loss_correction {
                     renderer.update_train(metric_state(
-                        self.metric_ids.huber_correction.clone(),
+                        self.metric_ids.recon_loss_correction.clone(),
                         value,
                         metrics.correction_rows,
                     ));
@@ -377,16 +377,16 @@ impl TrainingReporter {
                         metrics.correction_rows,
                     ));
                 }
-                if let Some(value) = metrics.huber_reconstruction {
+                if let Some(value) = metrics.recon_loss_reconstruction {
                     renderer.update_valid(metric_state(
-                        self.metric_ids.huber_reconstruction.clone(),
+                        self.metric_ids.recon_loss_reconstruction.clone(),
                         value,
                         metrics.reconstruction_rows,
                     ));
                 }
-                if let Some(value) = metrics.huber_correction {
+                if let Some(value) = metrics.recon_loss_correction {
                     renderer.update_valid(metric_state(
-                        self.metric_ids.huber_correction.clone(),
+                        self.metric_ids.recon_loss_correction.clone(),
                         value,
                         metrics.correction_rows,
                     ));
@@ -533,8 +533,8 @@ impl IndicatifTrainingBars {
                 format_polarity(metrics.count_tanimoto_correction),
                 format_polarity(metrics.binary_tanimoto_reconstruction),
                 format_polarity(metrics.binary_tanimoto_correction),
-                format_polarity(metrics.huber_reconstruction),
-                format_polarity(metrics.huber_correction),
+                format_polarity(metrics.recon_loss_reconstruction),
+                format_polarity(metrics.recon_loss_correction),
                 format_polarity(metrics.bce_reconstruction),
                 format_polarity(metrics.bce_correction),
                 metrics.violation_bce,
@@ -571,8 +571,8 @@ impl IndicatifTrainingBars {
                 format_polarity(metrics.count_tanimoto_correction),
                 format_polarity(metrics.binary_tanimoto_reconstruction),
                 format_polarity(metrics.binary_tanimoto_correction),
-                format_polarity(metrics.huber_reconstruction),
-                format_polarity(metrics.huber_correction),
+                format_polarity(metrics.recon_loss_reconstruction),
+                format_polarity(metrics.recon_loss_correction),
                 format_polarity(metrics.bce_reconstruction),
                 format_polarity(metrics.bce_correction),
                 metrics.violation_bce,
@@ -627,7 +627,7 @@ impl IndicatifTrainingBars {
 enum ReporterMetric {
     /// Total weighted loss.
     Loss,
-    /// Counted ECFP reconstruction Huber loss.
+    /// Counted ECFP reconstruction-head loss (Huber or Poisson per `--reconstruction-loss`).
     Reconstruction,
     /// Bit-presence BCE auxiliary loss.
     ReconstructionBce,
@@ -651,12 +651,12 @@ enum ReporterMetric {
     BinaryTanimotoReconstruction,
     /// Binary-Tanimoto quality on negative (correction) rows.
     BinaryTanimotoCorrection,
-    /// Reconstruction Huber loss restricted to positive (reconstruction)
+    /// Reconstruction-head loss restricted to positive (reconstruction)
     /// rows.
-    HuberReconstruction,
-    /// Reconstruction Huber loss restricted to negative (correction)
+    ReconLossReconstruction,
+    /// Reconstruction-head loss restricted to negative (correction)
     /// rows.
-    HuberCorrection,
+    ReconLossCorrection,
     /// Bit-presence BCE loss restricted to positive (reconstruction)
     /// rows (already multiplied by `bce_weight`).
     BceReconstruction,
@@ -686,8 +686,8 @@ impl ReporterMetric {
         Self::CountTanimotoCorrection,
         Self::BinaryTanimotoReconstruction,
         Self::BinaryTanimotoCorrection,
-        Self::HuberReconstruction,
-        Self::HuberCorrection,
+        Self::ReconLossReconstruction,
+        Self::ReconLossCorrection,
         Self::BceReconstruction,
         Self::BceCorrection,
         Self::Violation,
@@ -710,8 +710,8 @@ impl ReporterMetric {
             Self::CountTanimotoCorrection => "Count Tanimoto (Correction)",
             Self::BinaryTanimotoReconstruction => "Binary Tanimoto (Reconstruction)",
             Self::BinaryTanimotoCorrection => "Binary Tanimoto (Correction)",
-            Self::HuberReconstruction => "Reconstruction Huber (Reconstruction)",
-            Self::HuberCorrection => "Reconstruction Huber (Correction)",
+            Self::ReconLossReconstruction => "Reconstruction Loss (Reconstruction)",
+            Self::ReconLossCorrection => "Reconstruction Loss (Correction)",
             Self::BceReconstruction => "Reconstruction BCE (Reconstruction)",
             Self::BceCorrection => "Reconstruction BCE (Correction)",
             Self::Violation => "Violation BCE",
@@ -723,7 +723,9 @@ impl ReporterMetric {
     const fn description(self) -> &'static str {
         match self {
             Self::Loss => "weighted total loss",
-            Self::Reconstruction => "counted ECFP reconstruction Huber loss",
+            Self::Reconstruction => {
+                "counted ECFP reconstruction-head loss (Huber or Poisson per --reconstruction-loss)"
+            }
             Self::ReconstructionBce => "bit-presence BCE-with-logits auxiliary loss",
             Self::Descriptors => "descriptor side-task loss",
             Self::TanimotoRanking => "latent counted-Tanimoto softmax CE loss",
@@ -751,11 +753,11 @@ impl ReporterMetric {
             Self::BinaryTanimotoCorrection => {
                 "binary fingerprint Tanimoto over negative (correction / denoising) rows"
             }
-            Self::HuberReconstruction => {
-                "counted ECFP reconstruction Huber loss restricted to positive (reconstruction) rows"
+            Self::ReconLossReconstruction => {
+                "reconstruction-head loss (Huber or Poisson per --reconstruction-loss) restricted to positive (reconstruction) rows"
             }
-            Self::HuberCorrection => {
-                "counted ECFP reconstruction Huber loss restricted to negative (correction / denoising) rows"
+            Self::ReconLossCorrection => {
+                "reconstruction-head loss (Huber or Poisson per --reconstruction-loss) restricted to negative (correction / denoising) rows"
             }
             Self::BceReconstruction => {
                 "bit-presence BCE loss (already multiplied by bce_weight) restricted to positive (reconstruction) rows"
@@ -808,7 +810,7 @@ impl ReporterMetric {
 struct ReporterMetricIds {
     /// Metric ID for the weighted total loss.
     loss: MetricId,
-    /// Metric ID for the reconstruction Huber loss.
+    /// Metric ID for the reconstruction-head loss.
     reconstruction: MetricId,
     /// Metric ID for the bit-presence BCE loss.
     reconstruction_bce: MetricId,
@@ -832,10 +834,10 @@ struct ReporterMetricIds {
     binary_tanimoto_reconstruction: MetricId,
     /// Metric ID for the negative-row binary-Tanimoto gauge.
     binary_tanimoto_correction: MetricId,
-    /// Metric ID for the positive-row reconstruction Huber gauge.
-    huber_reconstruction: MetricId,
-    /// Metric ID for the negative-row reconstruction Huber gauge.
-    huber_correction: MetricId,
+    /// Metric ID for the positive-row reconstruction-head loss gauge.
+    recon_loss_reconstruction: MetricId,
+    /// Metric ID for the negative-row reconstruction-head loss gauge.
+    recon_loss_correction: MetricId,
     /// Metric ID for the positive-row reconstruction BCE gauge.
     bce_reconstruction: MetricId,
     /// Metric ID for the negative-row reconstruction BCE gauge.
@@ -863,8 +865,8 @@ impl ReporterMetricIds {
             count_tanimoto_correction: metric_id(ReporterMetric::CountTanimotoCorrection),
             binary_tanimoto_reconstruction: metric_id(ReporterMetric::BinaryTanimotoReconstruction),
             binary_tanimoto_correction: metric_id(ReporterMetric::BinaryTanimotoCorrection),
-            huber_reconstruction: metric_id(ReporterMetric::HuberReconstruction),
-            huber_correction: metric_id(ReporterMetric::HuberCorrection),
+            recon_loss_reconstruction: metric_id(ReporterMetric::ReconLossReconstruction),
+            recon_loss_correction: metric_id(ReporterMetric::ReconLossCorrection),
             bce_reconstruction: metric_id(ReporterMetric::BceReconstruction),
             bce_correction: metric_id(ReporterMetric::BceCorrection),
             violation: metric_id(ReporterMetric::Violation),
@@ -892,8 +894,8 @@ impl ReporterMetricIds {
                 self.binary_tanimoto_reconstruction.clone()
             }
             ReporterMetric::BinaryTanimotoCorrection => self.binary_tanimoto_correction.clone(),
-            ReporterMetric::HuberReconstruction => self.huber_reconstruction.clone(),
-            ReporterMetric::HuberCorrection => self.huber_correction.clone(),
+            ReporterMetric::ReconLossReconstruction => self.recon_loss_reconstruction.clone(),
+            ReporterMetric::ReconLossCorrection => self.recon_loss_correction.clone(),
             ReporterMetric::BceReconstruction => self.bce_reconstruction.clone(),
             ReporterMetric::BceCorrection => self.bce_correction.clone(),
             ReporterMetric::Violation => self.violation.clone(),
@@ -1027,8 +1029,8 @@ mod tests {
             count_tanimoto_correction: Some(0.32),
             binary_tanimoto_reconstruction: Some(0.80),
             binary_tanimoto_correction: Some(0.40),
-            huber_reconstruction: Some(0.2),
-            huber_correction: Some(0.5),
+            recon_loss_reconstruction: Some(0.2),
+            recon_loss_correction: Some(0.5),
             bce_reconstruction: Some(0.1),
             bce_correction: Some(0.4),
             reconstruction_rows: 3,

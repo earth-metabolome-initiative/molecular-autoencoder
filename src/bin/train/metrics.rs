@@ -52,13 +52,13 @@ pub struct BatchLossMetrics {
     /// denoising) rows of the batch. `None` when the batch had no
     /// negative rows.
     pub binary_tanimoto_correction: Option<f32>,
-    /// Mean reconstruction Huber loss over the positive (reconstruction)
+    /// Mean reconstruction-head loss over the positive (reconstruction)
     /// rows of the batch. `None` when the batch had no positive rows.
-    pub huber_reconstruction: Option<f32>,
-    /// Mean reconstruction Huber loss over the negative (correction /
+    pub recon_loss_reconstruction: Option<f32>,
+    /// Mean reconstruction-head loss over the negative (correction /
     /// denoising) rows of the batch. `None` when the batch had no
     /// negative rows.
-    pub huber_correction: Option<f32>,
+    pub recon_loss_correction: Option<f32>,
     /// Mean bit-presence BCE loss (already multiplied by `bce_weight`)
     /// over the positive (reconstruction) rows of the batch. `None`
     /// when the batch had no positive rows.
@@ -100,12 +100,12 @@ pub struct PolaritySplitTensors<B: Backend> {
     pub binary_reconstruction_sum: Tensor<B, 1>,
     /// Sum of per-row binary Tanimoto over negative (correction) rows.
     pub binary_correction_sum: Tensor<B, 1>,
-    /// Sum of per-row reconstruction Huber loss over positive
+    /// Sum of per-row reconstruction-head loss over positive
     /// (reconstruction) rows.
-    pub huber_reconstruction_sum: Tensor<B, 1>,
-    /// Sum of per-row reconstruction Huber loss over negative
+    pub recon_loss_reconstruction_sum: Tensor<B, 1>,
+    /// Sum of per-row reconstruction-head loss over negative
     /// (correction) rows.
-    pub huber_correction_sum: Tensor<B, 1>,
+    pub recon_loss_correction_sum: Tensor<B, 1>,
     /// Sum of per-row bit-presence BCE loss over positive
     /// (reconstruction) rows. Already multiplied by `bce_weight`.
     pub bce_reconstruction_sum: Tensor<B, 1>,
@@ -175,8 +175,8 @@ where
         count_correction_sum,
         binary_reconstruction_sum,
         binary_correction_sum,
-        huber_reconstruction_sum,
-        huber_correction_sum,
+        recon_loss_reconstruction_sum,
+        recon_loss_correction_sum,
         bce_reconstruction_sum,
         bce_correction_sum,
         reconstruction_count,
@@ -199,8 +199,8 @@ where
         .register(count_correction_sum)
         .register(binary_reconstruction_sum)
         .register(binary_correction_sum)
-        .register(huber_reconstruction_sum)
-        .register(huber_correction_sum)
+        .register(recon_loss_reconstruction_sum)
+        .register(recon_loss_correction_sum)
         .register(bce_reconstruction_sum)
         .register(bce_correction_sum)
         .register(reconstruction_count)
@@ -238,11 +238,11 @@ where
         scalar_data(&data[9], "binary Tanimoto correction sum")?,
         correction_rows,
     );
-    let huber_reconstruction = polarity_mean(
+    let recon_loss_reconstruction = polarity_mean(
         scalar_data(&data[10], "Huber reconstruction sum")?,
         reconstruction_rows,
     );
-    let huber_correction = polarity_mean(
+    let recon_loss_correction = polarity_mean(
         scalar_data(&data[11], "Huber correction sum")?,
         correction_rows,
     );
@@ -271,8 +271,8 @@ where
         count_tanimoto_correction,
         binary_tanimoto_reconstruction,
         binary_tanimoto_correction,
-        huber_reconstruction,
-        huber_correction,
+        recon_loss_reconstruction,
+        recon_loss_correction,
         bce_reconstruction,
         bce_correction,
         reconstruction_rows,

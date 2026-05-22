@@ -234,13 +234,13 @@ where
                     let valid_loss = valid.mean_loss();
                     if !reporter.is_active() {
                         println!(
-                            "epoch={epoch} valid_loss={valid_loss:.6} valid_count_tanimoto_reconstruction={} valid_count_tanimoto_correction={} valid_binary_tanimoto_reconstruction={} valid_binary_tanimoto_correction={} valid_huber_reconstruction={} valid_huber_correction={} valid_bce_reconstruction={} valid_bce_correction={} valid_reconstruction_rows={} valid_correction_rows={} valid_batches={} valid_examples={} valid_data_wait_ms_per_batch={:.3} valid_step_ms_per_batch={:.3}",
+                            "epoch={epoch} valid_loss={valid_loss:.6} valid_count_tanimoto_reconstruction={} valid_count_tanimoto_correction={} valid_binary_tanimoto_reconstruction={} valid_binary_tanimoto_correction={} valid_recon_loss_reconstruction={} valid_recon_loss_correction={} valid_bce_reconstruction={} valid_bce_correction={} valid_reconstruction_rows={} valid_correction_rows={} valid_batches={} valid_examples={} valid_data_wait_ms_per_batch={:.3} valid_step_ms_per_batch={:.3}",
                             format_summary_metric(valid.mean_count_tanimoto_reconstruction()),
                             format_summary_metric(valid.mean_count_tanimoto_correction()),
                             format_summary_metric(valid.mean_binary_tanimoto_reconstruction()),
                             format_summary_metric(valid.mean_binary_tanimoto_correction()),
-                            format_summary_metric(valid.mean_huber_reconstruction()),
-                            format_summary_metric(valid.mean_huber_correction()),
+                            format_summary_metric(valid.mean_recon_loss_reconstruction()),
+                            format_summary_metric(valid.mean_recon_loss_correction()),
                             format_summary_metric(valid.mean_bce_reconstruction()),
                             format_summary_metric(valid.mean_bce_correction()),
                             valid.reconstruction_rows,
