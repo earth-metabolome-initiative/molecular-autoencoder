@@ -90,14 +90,20 @@ pub const DEFAULT_BCE_NONZERO_WEIGHT: f64 = 1.0;
 /// Default clamp ceiling applied to predicted log-rates before the
 /// `exp` step inside the Poisson NLL reconstruction loss.
 ///
-/// `exp(20) ≈ 4.85e8` is well within `f32` range even when summed across
-/// `[batch=10240, width=4096]` cells (≈ 2e16 worst case), but it is high
-/// enough that the optimizer can drive z anywhere a sensible learned
-/// log-rate would land for typical small-integer ECFP counts. Real
-/// training settles deep into the negatives at inactive bins and within
-/// `[0, log(small_int)]` at active bins, so the clamp only fires on
-/// pathological early-training spikes.
-pub const DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT: f64 = 20.0;
+/// `exp(5) ≈ 148` is plenty of headroom for any realistic ECFP bin
+/// count: at radius 2 the counts are small integers that very rarely
+/// exceed `~10`, so this clamp only ever fires on early-training spikes
+/// where the optimizer briefly drives a logit far above its sensible
+/// operating range. The previous `20.0` ceiling let a single saturated
+/// cell contribute `exp(20) ≈ 4.85e8` to the dense `exp(z).sum_dim(1)`
+/// reduction, which produced catastrophic per-batch loss spikes (the
+/// gradient through `exp` scales with the same magnitude, so Adam's
+/// running second moment also blows up and the per-batch loss value
+/// jumps by ~`10^5×` baseline). At `5.0` the worst per-cell
+/// contribution is `148 / 4096 ≈ 0.036`, so even a saturated cell
+/// stays in the same order of magnitude as the baseline `~1.0`
+/// loss-at-`z=0`.
+pub const DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT: f64 = 5.0;
 
 /// Selectable reconstruction loss kind.
 ///
