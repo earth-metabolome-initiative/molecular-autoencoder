@@ -554,8 +554,10 @@ fn row_cosine_similarity_3d<B: Backend>(left: Tensor<B, 3>, right: Tensor<B, 3>)
 ///
 /// Used by the SoftRank Spearman surrogate to score the agreement between
 /// the soft ranks of the latent logits and the soft ranks of the teacher
-/// scores. The denominator is clamped via `clamp_min(1.0e-12)` so
-/// degenerate zero-variance rows contribute `0` rather than `NaN`.
+/// scores. The epsilon is added *inside* the sqrt so the backward pass
+/// is finite at degenerate zero-variance rows (a `sqrt(0)` node has
+/// `+∞` derivative even when the forward value is later clamped, which
+/// would otherwise blow up the loss after a few training steps).
 fn pearson_per_row<B: Backend>(
     left: Tensor<B, 2>,
     right: Tensor<B, 2>,
@@ -569,7 +571,7 @@ fn pearson_per_row<B: Backend>(
     let covariance = (left_centered.clone() * right_centered.clone()).sum_dim(1) * inv_n;
     let left_var = left_centered.powf_scalar(2.0).sum_dim(1) * inv_n;
     let right_var = right_centered.powf_scalar(2.0).sum_dim(1) * inv_n;
-    let denominator = (left_var * right_var).sqrt().clamp_min(1.0e-12);
+    let denominator = (left_var * right_var + 1.0e-12).sqrt();
     covariance / denominator
 }
 
@@ -1239,6 +1241,41 @@ mod tests {
         assert!(
             misaligned_loss > aligned_loss,
             "misaligned loss {misaligned_loss} should exceed aligned loss {aligned_loss}"
+        );
+    }
+
+    #[test]
+    fn pearson_per_row_is_gradient_safe_when_a_row_is_constant() {
+        // Regression: an earlier port clamped the Pearson denominator
+        // *after* the sqrt, which leaves a `sqrt(0)` node in the
+        // autograd graph for any zero-variance row. The forward value
+        // is fine but the backward derivative is `+∞`, and the
+        // resulting NaN gradient floods the optimizer after a handful
+        // of steps. The fix is the standard "epsilon under the sqrt"
+        // pattern; this test makes sure the loss surface stays finite
+        // when a row collapses.
+        type AD = burn::backend::Autodiff<B>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // Make `left` learnable; keep `right` constant across the row
+        // so its variance is structurally zero.
+        let left = Tensor::<AD, 2>::from_floats([[0.1, 0.2, 0.3, 0.4]], &device).require_grad();
+        let right = Tensor::<AD, 2>::from_floats([[1.0, 1.0, 1.0, 1.0]], &device);
+        let pearson = pearson_per_row(left.clone(), right, 4);
+        let loss = (pearson.ones_like() - pearson).sum();
+        let value = loss.clone().into_scalar();
+        assert!(
+            value.is_finite(),
+            "forward loss must be finite, got {value}"
+        );
+        let grads = loss.backward();
+        let left_grad = left.grad(&grads).expect("left gradient");
+        let left_grad_data = left_grad
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32 gradient data");
+        assert!(
+            left_grad_data.iter().all(|g| g.is_finite()),
+            "every entry of d(loss)/d(left) must be finite, got {left_grad_data:?}"
         );
     }
 }
