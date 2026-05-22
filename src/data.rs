@@ -16,16 +16,28 @@ use crate::{
 
 /// Magic bytes stamped at the start of every cached sparse shard file.
 ///
-/// `MAESH03` is the post-`v2 → v3` bump introduced when negative-molecule
-/// rows joined the shard schema: each row now carries a violation-class
-/// bitset and, for negatives, a second (CSR-encoded) decoder-target
-/// fingerprint. Older `MAESH02` shards must be re-preprocessed —
-/// [`SparseMoleculeShard::read_from_path`] surfaces a clear "re-preprocess
-/// required" error when it encounters the legacy magic.
-const SHARD_MAGIC: [u8; 8] = *b"MAESH03\0";
-/// Previous shard magic kept around so the reader can emit a precise
-/// "please re-preprocess" error when it encounters a `v2` file.
+/// `MAESH04` is the post-`v3 → v4` bump introduced when the upstream
+/// `finge-rs::MutatorMix` mutation distribution changed (per-sample
+/// mutation count is now `1 + Poisson(0.7)` clamped to `[1, 4]`,
+/// within-OOD ranges were widened per channel, and predicate-driven
+/// labels routinely set multiple violation bits per row). The on-disk
+/// schema is unchanged from `MAESH03`, but the *content* distribution
+/// is incompatible enough that previously cached shards would silently
+/// train against stale samples; bumping the magic forces a clean
+/// re-preprocess. Older `MAESH02` / `MAESH03` shards must be
+/// re-preprocessed — [`SparseMoleculeShard::read_from_path`] surfaces
+/// a clear "re-preprocess required" error when it encounters either
+/// legacy magic.
+const SHARD_MAGIC: [u8; 8] = *b"MAESH04\0";
+/// Pre-`v3` shard magic kept around so the reader can emit a precise
+/// "please re-preprocess" error when it encounters a `v2` file (no
+/// violation-class columns, no negative-molecule rows).
 const LEGACY_SHARD_MAGIC_V2: [u8; 8] = *b"MAESH02\0";
+/// Pre-`v4` shard magic kept around so the reader can emit a precise
+/// "please re-preprocess" error when it encounters a `v3` file
+/// (negative-molecule rows present, but generated under the old
+/// MutatorMix distribution).
+const LEGACY_SHARD_MAGIC_V3: [u8; 8] = *b"MAESH03\0";
 /// FNV-1a 64-bit offset basis used to derive stable molecule IDs from
 /// dataset + record string tuples.
 const STABLE_ID_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -45,7 +57,7 @@ const ZINC20_STABLE_ID_NUMBER_MASK: u64 = 0x0000_ffff_ffff_ffff;
 /// Bitmask isolating the 15-bit ZINC20 tranche suffix.
 const ZINC20_STABLE_ID_SUFFIX_MASK: u64 = 0x7fff;
 /// Current cached-shard manifest schema version.
-pub const SHARD_MANIFEST_VERSION: u32 = 3;
+pub const SHARD_MANIFEST_VERSION: u32 = 4;
 /// Default number of dataset records preprocessed per Rayon chunk.
 #[cfg(feature = "datasets")]
 pub const DEFAULT_PREPROCESS_CHUNK_ROWS: usize = 8192;
@@ -1228,13 +1240,10 @@ impl SparseMoleculeShard {
 
         let mut magic = [0_u8; 8];
         read_exact(path, &mut reader, &mut magic)?;
-        if magic == LEGACY_SHARD_MAGIC_V2 {
+        if let Some(message) = legacy_shard_magic_message(magic) {
             return Err(Error::ShardFormat {
                 path: path.to_path_buf(),
-                message: "shard is the legacy MAESH02 format; \
-                          rerun preprocess to regenerate as MAESH03 \
-                          (negative-molecule columns required)"
-                    .to_string(),
+                message,
             });
         }
         if magic != SHARD_MAGIC {
@@ -2034,22 +2043,46 @@ fn read_f32(path: &Path, reader: &mut impl Read) -> Result<f32> {
     Ok(f32::from_le_bytes(bytes))
 }
 
+/// Returns a "re-preprocess required" message when the given magic
+/// matches a known legacy shard version, or `None` when the magic is
+/// either current or unrecognized (the unrecognized case is handled
+/// separately by the caller as a generic "unexpected magic header"
+/// error).
+fn legacy_shard_magic_message(magic: [u8; 8]) -> Option<String> {
+    if magic == LEGACY_SHARD_MAGIC_V2 {
+        return Some(
+            "shard is the legacy MAESH02 format; rerun preprocess to regenerate as MAESH04 \
+             (negative-molecule columns plus the post-finge-rs-mutation-suite distribution \
+              are required)"
+                .to_string(),
+        );
+    }
+    if magic == LEGACY_SHARD_MAGIC_V3 {
+        return Some(
+            "shard is the legacy MAESH03 format; rerun preprocess to regenerate as MAESH04 \
+             (negatives were sampled under the previous finge-rs MutatorMix distribution; \
+              the new distribution emits multi-bit violation labels and widened OOD ranges)"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Seeks to the start of `reader` and validates the magic header, then
-/// reads the 40-byte fixed-shape descriptor (`MAESH03` adds a
-/// `target_nnz` field to the legacy 32-byte header).
+/// reads the 40-byte fixed-shape descriptor (`MAESH03` added a
+/// `target_nnz` field to the legacy 32-byte header; `MAESH04` keeps
+/// that same on-disk layout but represents a distribution-incompatible
+/// re-roll of the negative samples).
 fn read_shard_header(path: &Path, reader: &mut (impl Read + Seek)) -> Result<ShardFileHeader> {
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|source| Error::io(path, source))?;
     let mut magic = [0_u8; 8];
     read_exact(path, reader, &mut magic)?;
-    if magic == LEGACY_SHARD_MAGIC_V2 {
+    if let Some(message) = legacy_shard_magic_message(magic) {
         return Err(Error::ShardFormat {
             path: path.to_path_buf(),
-            message: "shard is the legacy MAESH02 format; \
-                      rerun preprocess to regenerate as MAESH03 \
-                      (negative-molecule columns required)"
-                .to_string(),
+            message,
         });
     }
     if magic != SHARD_MAGIC {
@@ -2526,6 +2559,19 @@ mod tests {
         assert!(matches!(
             error,
             Error::ShardFormat { message, .. } if message.contains("MAESH02")
+                && message.contains("rerun preprocess")
+        ));
+    }
+
+    #[test]
+    fn sparse_shard_rejects_legacy_v3_magic_with_repreprocess_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy_v3.maeshard");
+        std::fs::write(&path, b"MAESH03\0").expect("write legacy magic");
+        let error = SparseMoleculeShard::read_from_path(&path).expect_err("legacy magic");
+        assert!(matches!(
+            error,
+            Error::ShardFormat { message, .. } if message.contains("MAESH03")
                 && message.contains("rerun preprocess")
         ));
     }

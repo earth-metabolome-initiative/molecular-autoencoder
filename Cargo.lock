@@ -1473,7 +1473,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -2822,7 +2822,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "finge-rs"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/finge-rs#3b138b2264b7b8d224fdf910e404d7f446e3900d"
+source = "git+https://github.com/earth-metabolome-initiative/finge-rs#4d742f47913b8833c17b79cf81e8c1e78c19d3c9"
 dependencies = [
  "bitvec",
  "elements_rs",
@@ -8054,7 +8054,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
