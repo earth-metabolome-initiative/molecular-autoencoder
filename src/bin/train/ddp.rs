@@ -10,7 +10,7 @@
 use std::{
     sync::{
         Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -26,7 +26,7 @@ use burn::{
 use burn_collective::{CollectiveConfig, PeerId, finish_collective, register};
 use molecular_autoencoder::{
     MoleculeAutoencoder, MoleculeAutoencoderBatch, MoleculeAutoencoderBatcher,
-    MoleculeAutoencoderConfig, ShardManifest, TanimotoRankingRuntimeConfig,
+    MoleculeAutoencoderConfig, ReconstructionLossKind, ShardManifest, TanimotoRankingRuntimeConfig,
 };
 
 use crate::{
@@ -39,9 +39,32 @@ use crate::{
     ranking::{TanimotoMetricBackend, effective_device_prefetch_batches},
     reporter::TrainingReporter,
     training::{
-        BatchSink, BatchUpdate, EvaluationContext, TrainEpochContext, evaluate, train_epoch,
+        AdaptiveReconstructionLossController, BatchSink, BatchUpdate, EvaluationContext,
+        TrainEpochContext, evaluate, train_epoch,
     },
 };
+
+/// Encodes a [`ReconstructionLossKind`] for transport through the
+/// `Arc<AtomicU8>` that the lead peer uses to publish the
+/// adaptive-controller's current decision to the workers.
+fn encode_loss_kind(kind: ReconstructionLossKind) -> u8 {
+    match kind {
+        ReconstructionLossKind::Huber => 0,
+        ReconstructionLossKind::HuberSymmetric => 1,
+        ReconstructionLossKind::Poisson => 2,
+    }
+}
+
+/// Inverse of [`encode_loss_kind`]. Unknown bytes fall back to the
+/// shipping default so a stale or pre-feature atomic can never panic a
+/// peer mid-training.
+fn decode_loss_kind(byte: u8) -> ReconstructionLossKind {
+    match byte {
+        1 => ReconstructionLossKind::HuberSymmetric,
+        2 => ReconstructionLossKind::Poisson,
+        _ => ReconstructionLossKind::Huber,
+    }
+}
 
 /// Multi-peer DDP entry point. Assumes `devices.len() >= 2`; the caller in
 /// [`crate::run::run`] dispatches single-device runs through the legacy path.
@@ -100,6 +123,7 @@ where
             completed_epoch: 0,
             global_step: 0,
             best_validation_loss: None,
+            adaptive_scheduler: None,
         }
     };
 
@@ -146,6 +170,14 @@ where
     let stop_flag = Arc::new(AtomicBool::new(false));
     let train_barrier = Arc::new(Barrier::new(devices.len()));
     let valid_barrier = Arc::new(Barrier::new(devices.len()));
+    // Shared loss-kind channel: the lead controller publishes its
+    // current decision here and the workers read it at the top of each
+    // epoch. Seeded from the canonical model so peer 1..N start the
+    // first epoch on the same kind as the lead, including under
+    // `--resume`.
+    let shared_loss_kind = Arc::new(AtomicU8::new(encode_loss_kind(
+        canonical_model.reconstruction_loss_kind(),
+    )));
 
     let (batch_tx, batch_rx) = mpsc::channel::<BatchUpdate>();
 
@@ -173,6 +205,7 @@ where
             max_valid_batches,
             initial_state: initial_state.clone(),
             batcher,
+            shared_loss_kind: shared_loss_kind.clone(),
         };
         handles.push(thread::spawn(move || -> Result<(), String> {
             worker_loop::<B>(ctx).map_err(|err| err.to_string())
@@ -202,6 +235,7 @@ where
         loader_profile_every,
         recorder: &recorder,
         reporter: &mut reporter,
+        shared_loss_kind: shared_loss_kind.clone(),
     });
 
     // Surface a worker error after the lead loop, so any panic message is
@@ -285,6 +319,10 @@ where
     initial_state: CheckpointState,
     /// Batcher used to assemble samples into tensors.
     batcher: MoleculeAutoencoderBatcher,
+    /// Lead-published reconstruction-loss kind. Workers read this at
+    /// the top of every epoch and apply it to their local model so they
+    /// stay in lockstep with the lead's adaptive controller.
+    shared_loss_kind: Arc<AtomicU8>,
 }
 
 /// Per-peer training loop: registers with the collective backend, runs
@@ -317,6 +355,7 @@ where
         max_valid_batches,
         initial_state,
         batcher,
+        shared_loss_kind,
     } = ctx;
 
     register::<B::InnerBackend>(PeerId::from(peer_id), device.clone(), collective_cfg)
@@ -335,7 +374,17 @@ where
     let mut state = initial_state;
 
     for epoch in (state.completed_epoch + 1)..=args.epochs {
-        let epoch_kind = args.reconstruction_loss_kind_for_epoch(epoch);
+        // When the adaptive controller is on, the lead publishes its
+        // chosen kind into `shared_loss_kind` after every epoch.
+        // Workers prefer that value so the gradient all-reduce stays
+        // structurally homogeneous. Without the adaptive controller we
+        // fall back to the deterministic per-epoch curriculum, which
+        // every peer computes identically from `args`.
+        let epoch_kind = if args.reconstruction_loss_adaptive {
+            decode_loss_kind(shared_loss_kind.load(Ordering::Acquire))
+        } else {
+            args.reconstruction_loss_kind_for_epoch(epoch)
+        };
         if model.reconstruction_loss_kind() != epoch_kind {
             model.set_reconstruction_loss_kind(epoch_kind);
         }
@@ -359,6 +408,10 @@ where
                 epoch,
                 peer_id,
                 world_size,
+                // Workers passively follow the lead's adaptive
+                // decisions via the shared atomic; they don't own a
+                // controller of their own.
+                adaptive_loss: None,
             },
         )?;
         model = next_model;
@@ -447,6 +500,10 @@ where
     recorder: &'a DefaultRecorder,
     /// Live training reporter (TUI or indicatif fallback).
     reporter: &'a mut TrainingReporter,
+    /// Atomic the lead writes after every epoch (and after the
+    /// controller emits a transition) so workers can pick up the same
+    /// reconstruction-loss kind on their side.
+    shared_loss_kind: Arc<AtomicU8>,
 }
 
 /// Lead-process training loop: drives `train_epoch` / `evaluate` on peer 0,
@@ -480,6 +537,7 @@ where
         loader_profile_every,
         recorder,
         reporter,
+        shared_loss_kind,
     } = ctx;
 
     register::<B::InnerBackend>(PeerId::from(0u32), device.clone(), collective_cfg)
@@ -496,8 +554,31 @@ where
 
     let workers = world_size.saturating_sub(1) as usize;
 
+    // Build the adaptive controller from CLI flags (or `None` when the
+    // feature is off), restore its EMA / current_kind from the
+    // checkpoint on resume, and turn on the model's balance
+    // diagnostics so loss_from_output emits the active/inactive Huber
+    // sums on the lead peer. The lead is the only peer that owns the
+    // controller; workers passively follow via `shared_loss_kind`.
+    let mut adaptive_loss = AdaptiveReconstructionLossController::from_args(args);
+    if let Some(controller) = adaptive_loss.as_mut() {
+        controller.seed_from_checkpoint(state.adaptive_scheduler);
+        model.set_compute_balance_diagnostics(true);
+        state.adaptive_scheduler = Some(controller.snapshot());
+        shared_loss_kind.store(
+            encode_loss_kind(controller.current_kind()),
+            Ordering::Release,
+        );
+    }
+
     for epoch in (state.completed_epoch + 1)..=args.epochs {
-        let epoch_kind = args.reconstruction_loss_kind_for_epoch(epoch);
+        // Same precedence rule as worker_loop: the adaptive
+        // controller's current decision wins when active; otherwise
+        // fall back to the deterministic per-epoch curriculum.
+        let epoch_kind = adaptive_loss.as_ref().map_or_else(
+            || args.reconstruction_loss_kind_for_epoch(epoch),
+            AdaptiveReconstructionLossController::current_kind,
+        );
         if model.reconstruction_loss_kind() != epoch_kind {
             println!(
                 "reconstruction_loss_kind_swap epoch={epoch} from={:?} to={:?}",
@@ -527,9 +608,20 @@ where
                 epoch,
                 peer_id: 0,
                 world_size,
+                adaptive_loss: adaptive_loss.as_mut(),
             },
         )?;
         model = next_model;
+
+        // Publish the (possibly updated) controller decision before the
+        // train barrier releases. Workers re-read the atomic at the
+        // top of their next epoch so they pick up any mid-epoch swap.
+        if let Some(controller) = adaptive_loss.as_ref() {
+            shared_loss_kind.store(
+                encode_loss_kind(controller.current_kind()),
+                Ordering::Release,
+            );
+        }
 
         // Drain remaining worker batches and their epoch sentinels.
         drain_until_epoch_complete(batch_rx, reporter, &stop_flag, workers, true);

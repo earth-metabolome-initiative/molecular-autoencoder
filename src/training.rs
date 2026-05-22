@@ -74,6 +74,7 @@ impl<B: Backend> ItemLazy for MoleculeAutoencoderTrainingOutput<B> {
                 tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(device),
                 violation_bce: Tensor::from_data(violation_bce, device),
                 violation_diagnostics: ViolationDiagnostics::empty(device),
+                huber_balance: crate::model::HuberBalanceDiagnostics::empty(device),
             },
         }
     }
@@ -209,6 +210,7 @@ mod tests {
             tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(&device),
             violation_bce: scalar::<B>(0.1, &device),
             violation_diagnostics: ViolationDiagnostics::empty(&device),
+            huber_balance: crate::model::HuberBalanceDiagnostics::empty(&device),
         };
 
         let output = MoleculeAutoencoderTrainingOutput::new(reconstruction, losses);
@@ -235,6 +237,7 @@ mod tests {
                 tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(&device),
                 violation_bce: scalar::<B>(0.1, &device),
                 violation_diagnostics: ViolationDiagnostics::empty(&device),
+                huber_balance: crate::model::HuberBalanceDiagnostics::empty(&device),
             },
         )
         .sync();

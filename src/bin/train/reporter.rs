@@ -246,6 +246,11 @@ impl TrainingReporter {
                     metrics.violation_mcc,
                     examples,
                 ));
+                renderer.update_train(metric_state(
+                    self.metric_ids.huber_balance_ratio.clone(),
+                    huber_balance_ratio(metrics.active_huber_mean, metrics.inactive_huber_mean),
+                    examples,
+                ));
             }
             renderer.render_train(
                 training_progress(
@@ -413,6 +418,11 @@ impl TrainingReporter {
                 renderer.update_valid(metric_state(
                     self.metric_ids.violation_mcc.clone(),
                     metrics.violation_mcc,
+                    examples,
+                ));
+                renderer.update_valid(metric_state(
+                    self.metric_ids.huber_balance_ratio.clone(),
+                    huber_balance_ratio(metrics.active_huber_mean, metrics.inactive_huber_mean),
                     examples,
                 ));
             }
@@ -668,11 +678,14 @@ enum ReporterMetric {
     /// Macro-averaged Matthews correlation coefficient over the eight
     /// violation classes.
     ViolationMcc,
+    /// `active_huber_mean / inactive_huber_mean` — the signal that
+    /// drives the adaptive reconstruction-loss-kind scheduler.
+    HuberBalanceRatio,
 }
 
 impl ReporterMetric {
     /// All gauges in the canonical order the reporter renders them.
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
         Self::Loss,
         Self::Reconstruction,
         Self::ReconstructionBce,
@@ -692,6 +705,7 @@ impl ReporterMetric {
         Self::BceCorrection,
         Self::Violation,
         Self::ViolationMcc,
+        Self::HuberBalanceRatio,
     ];
 
     /// Short human-readable label for the gauge.
@@ -716,6 +730,7 @@ impl ReporterMetric {
             Self::BceCorrection => "Reconstruction BCE (Correction)",
             Self::Violation => "Violation BCE",
             Self::ViolationMcc => "Violation MCC",
+            Self::HuberBalanceRatio => "Huber Balance (active/inactive)",
         }
     }
 
@@ -768,6 +783,9 @@ impl ReporterMetric {
             Self::Violation => "multi-label violation-classifier BCE loss on the latent",
             Self::ViolationMcc => {
                 "macro-averaged Matthews correlation coefficient across the 8 violation classes"
+            }
+            Self::HuberBalanceRatio => {
+                "ratio of active vs inactive symmetric-Huber error per batch; drives the adaptive reconstruction-loss-kind scheduler (lower means active bins are catching up)"
             }
         }
     }
@@ -846,6 +864,8 @@ struct ReporterMetricIds {
     violation: MetricId,
     /// Metric ID for the macro-MCC violation-classifier quality gauge.
     violation_mcc: MetricId,
+    /// Metric ID for the active/inactive Huber balance ratio gauge.
+    huber_balance_ratio: MetricId,
 }
 
 impl ReporterMetricIds {
@@ -871,6 +891,7 @@ impl ReporterMetricIds {
             bce_correction: metric_id(ReporterMetric::BceCorrection),
             violation: metric_id(ReporterMetric::Violation),
             violation_mcc: metric_id(ReporterMetric::ViolationMcc),
+            huber_balance_ratio: metric_id(ReporterMetric::HuberBalanceRatio),
         }
     }
 
@@ -900,6 +921,7 @@ impl ReporterMetricIds {
             ReporterMetric::BceCorrection => self.bce_correction.clone(),
             ReporterMetric::Violation => self.violation.clone(),
             ReporterMetric::ViolationMcc => self.violation_mcc.clone(),
+            ReporterMetric::HuberBalanceRatio => self.huber_balance_ratio.clone(),
         }
     }
 }
@@ -908,6 +930,18 @@ impl ReporterMetricIds {
 /// number, or `n/a` when the batch had no rows of that polarity.
 fn format_polarity(value: Option<f32>) -> String {
     value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.4}"))
+}
+
+/// Computes the per-batch active/inactive Huber-error ratio that the
+/// adaptive scheduler tracks. Returns `0.0` when balance diagnostics
+/// are disabled (both means are `0.0`), and clamps the denominator at
+/// `1e-6` so a zero-inactive batch does not blow the gauge up.
+fn huber_balance_ratio(active_mean: f32, inactive_mean: f32) -> f32 {
+    if active_mean == 0.0 && inactive_mean == 0.0 {
+        0.0
+    } else {
+        active_mean / inactive_mean.max(1.0e-6)
+    }
 }
 
 /// Allocates a Burn [`MetricId`] keyed on the gauge's display name.
@@ -1035,6 +1069,8 @@ mod tests {
             bce_correction: Some(0.4),
             reconstruction_rows: 3,
             correction_rows: 1,
+            active_huber_mean: 0.42,
+            inactive_huber_mean: 0.21,
             violation_bce: 0.07,
             violation_mcc: 0.62,
         }

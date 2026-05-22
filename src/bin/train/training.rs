@@ -25,7 +25,7 @@ use molecular_autoencoder::{
 
 use crate::{
     AppResult,
-    checkpoint::{CachedShardInfo, CheckpointState},
+    checkpoint::{AdaptiveSchedulerState, CachedShardInfo, CheckpointState},
     cli::Args,
     dataloader::{BatchControl, BatchIterationContext, for_each_batch},
     invalid_input,
@@ -480,6 +480,11 @@ pub struct TrainEpochContext<'a, B: Backend> {
     pub peer_id: u32,
     /// Total DDP peer count.
     pub world_size: u32,
+    /// Optional adaptive reconstruction-loss scheduler. When `Some`,
+    /// the train loop calls `update` on every metric-sampled batch and
+    /// mutates the model's active loss kind when a hysteresis threshold
+    /// is crossed.
+    pub adaptive_loss: Option<&'a mut AdaptiveReconstructionLossController>,
 }
 
 /// Per-validation context owned by the run loop or per-worker DDP loop.
@@ -541,7 +546,9 @@ where
         epoch,
         peer_id,
         world_size,
+        adaptive_loss,
     } = context;
+    let mut adaptive_loss = adaptive_loss;
     let mut model = Some(model);
     let mut summary = EpochSummary::default();
 
@@ -616,6 +623,7 @@ where
                         binary_per_row,
                         losses.reconstruction_per_row.clone(),
                         losses.reconstruction_bce_per_row.clone(),
+                        losses.huber_balance.clone(),
                     );
                     Some(loss_metrics(loss.clone(), &losses, split)?)
                 }
@@ -631,6 +639,31 @@ where
             let grads = all_reduce_mean::<B>(grads, peer_id, world_size)?;
             model = Some(optimizer.step(args.learning_rate, current, grads));
             state.global_step = next_step;
+            // Adaptive reconstruction-loss scheduler: feed the latest
+            // active-vs-inactive Huber ratio into the controller, then
+            // mutate the freshly-stepped model in place if a transition
+            // fires. Only runs on metric-sampled batches because that
+            // is the only path where balance diagnostics get computed.
+            if let (Some(controller), Some(metrics)) =
+                (adaptive_loss.as_deref_mut(), batch_metrics.as_ref())
+            {
+                let inactive = metrics.inactive_huber_mean.max(1.0e-6);
+                let ratio = metrics.active_huber_mean / inactive;
+                if let Some(new_kind) = controller.update(ratio, epoch)
+                    && let Some(active_model) = model.as_mut()
+                    && active_model.reconstruction_loss_kind() != new_kind
+                {
+                    println!(
+                        "reconstruction_loss_kind_swap epoch={epoch} step={} from={:?} to={:?} ema={:.3}",
+                        state.global_step,
+                        active_model.reconstruction_loss_kind(),
+                        new_kind,
+                        controller.ema(),
+                    );
+                    active_model.set_reconstruction_loss_kind(new_kind);
+                }
+                state.adaptive_scheduler = Some(controller.snapshot());
+            }
             let step_time = step_start.elapsed();
             summary.record(
                 batch_size,
@@ -745,6 +778,7 @@ where
                 binary_per_row,
                 losses.reconstruction_per_row.clone(),
                 losses.reconstruction_bce_per_row.clone(),
+                losses.huber_balance.clone(),
             );
             let batch_metrics = validation_metrics(total_loss.clone(), &losses, split)?;
             if !batch_metrics.loss.is_finite() {
@@ -856,13 +890,19 @@ fn adapt_to_log1p_count<B: Backend>(
 ///
 /// `correction_mask` carries `1.0` on negative rows and `0.0` on
 /// positive rows (the convention used by [`polarity_mask`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "polarity_split bundles every per-row metric the train binary tracks; flattening to a struct would just shuffle the same arity across the call site"
+)]
 fn polarity_split<B: Backend>(
     correction_mask: Tensor<B, 1>,
     count_per_row: Tensor<B, 1>,
     binary_per_row: Tensor<B, 1>,
     huber_per_row: Tensor<B, 1>,
     bce_per_row: Tensor<B, 1>,
+    huber_balance: molecular_autoencoder::HuberBalanceDiagnostics<B>,
 ) -> PolaritySplitTensors<B> {
+    let device = correction_mask.device();
     let reconstruction_mask = correction_mask.clone() * -1.0 + 1.0;
     let reconstruction_count = reconstruction_mask.clone().sum();
     let correction_count = correction_mask.clone().sum();
@@ -874,6 +914,30 @@ fn polarity_split<B: Backend>(
     let recon_loss_correction_sum = (huber_per_row * correction_mask.clone()).sum();
     let bce_reconstruction_sum = (bce_per_row.clone() * reconstruction_mask).sum();
     let bce_correction_sum = (bce_per_row * correction_mask).sum();
+    // Active/inactive Huber sums are batch-wide (no polarity split):
+    // the diagnostic measures cell-type imbalance, not row-polarity
+    // imbalance. When balance diagnostics are disabled the per-row
+    // tensors are zero-shape so we substitute scalar zeros.
+    let (
+        active_huber_total_sum,
+        inactive_huber_total_sum,
+        active_cell_total_count,
+        inactive_cell_total_count,
+    ) = if huber_balance.active_huber_sum_per_row.dims()[0] == 0 {
+        (
+            Tensor::<B, 1>::zeros([1], &device),
+            Tensor::<B, 1>::zeros([1], &device),
+            Tensor::<B, 1>::zeros([1], &device),
+            Tensor::<B, 1>::zeros([1], &device),
+        )
+    } else {
+        (
+            huber_balance.active_huber_sum_per_row.sum(),
+            huber_balance.inactive_huber_sum_per_row.sum(),
+            huber_balance.active_count_per_row.sum(),
+            huber_balance.inactive_count_per_row.sum(),
+        )
+    };
     PolaritySplitTensors {
         count_reconstruction_sum,
         count_correction_sum,
@@ -885,6 +949,143 @@ fn polarity_split<B: Backend>(
         bce_correction_sum,
         reconstruction_count,
         correction_count,
+        active_huber_total_sum,
+        inactive_huber_total_sum,
+        active_cell_total_count,
+        inactive_cell_total_count,
+    }
+}
+
+/// Adaptive reconstruction-loss-kind scheduler driven by an EMA of the
+/// active-bin / inactive-bin symmetric-Huber ratio.
+///
+/// The controller is created by [`AdaptiveReconstructionLossController::from_args`]
+/// (returning `None` when `--reconstruction-loss-adaptive` is unset) and
+/// owned by the run loop. Each metric-sampled batch feeds a fresh
+/// `active / inactive` ratio into [`Self::update`]; the controller
+/// updates its EMA, applies hysteresis against the two configured
+/// thresholds, and returns `Some(new_kind)` when a transition should
+/// fire. The fixed-epoch warmup configured via
+/// `--reconstruction-loss-warmup-epochs` is honoured as a safety floor:
+/// while `epoch <= warmup_floor_epochs` the controller is forced to the
+/// warmup kind regardless of the EMA.
+#[derive(Debug, Clone)]
+pub struct AdaptiveReconstructionLossController {
+    /// EMA of `active_huber_mean / inactive_huber_mean` across
+    /// metric-sampled batches.
+    ema: f32,
+    /// Reconstruction-loss kind the controller currently wants the
+    /// model to use.
+    current_kind: molecular_autoencoder::ReconstructionLossKind,
+    /// Per-update EMA decay (closer to `1.0` = more smoothing).
+    decay: f32,
+    /// EMA below this value while in the Warmup state triggers a
+    /// transition to Main.
+    switch_to_main_at: f32,
+    /// EMA above this value while in the Main state triggers a
+    /// transition back to Warmup.
+    switch_to_warmup_at: f32,
+    /// Kind to use during the warmup (= the `HuberSymmetric` arm of the
+    /// curriculum).
+    warmup_kind: molecular_autoencoder::ReconstructionLossKind,
+    /// Kind to use after the warmup (= the `Huber + BCE` arm).
+    main_kind: molecular_autoencoder::ReconstructionLossKind,
+    /// Number of epochs during which the controller is pinned to
+    /// `warmup_kind` regardless of the EMA. `0` disables the floor.
+    warmup_floor_epochs: usize,
+}
+
+impl AdaptiveReconstructionLossController {
+    /// Builds a controller from the parsed CLI args, or returns `None`
+    /// when adaptive scheduling is disabled or the warmup kind is unset
+    /// (which `validate_adaptive_loss` already rejects upstream).
+    #[must_use]
+    pub fn from_args(args: &Args) -> Option<Self> {
+        if !args.reconstruction_loss_adaptive {
+            return None;
+        }
+        let warmup_kind: molecular_autoencoder::ReconstructionLossKind =
+            args.reconstruction_loss_warmup?.into();
+        let main_kind: molecular_autoencoder::ReconstructionLossKind =
+            args.reconstruction_loss.into();
+        let midpoint = ((args.reconstruction_loss_adaptive_switch_to_main
+            + args.reconstruction_loss_adaptive_switch_to_warmup)
+            * 0.5) as f32;
+        Some(Self {
+            ema: midpoint,
+            current_kind: warmup_kind,
+            decay: args.reconstruction_loss_adaptive_ema_decay as f32,
+            switch_to_main_at: args.reconstruction_loss_adaptive_switch_to_main as f32,
+            switch_to_warmup_at: args.reconstruction_loss_adaptive_switch_to_warmup as f32,
+            warmup_kind,
+            main_kind,
+            warmup_floor_epochs: args.reconstruction_loss_warmup_epochs,
+        })
+    }
+
+    /// Restores `ema` + `current_kind` from a persisted snapshot. When
+    /// `persisted` is `None` the controller keeps its bootstrapped EMA
+    /// (the midpoint between the two thresholds) and `current_kind`.
+    pub fn seed_from_checkpoint(&mut self, persisted: Option<AdaptiveSchedulerState>) {
+        if let Some(state) = persisted {
+            self.ema = state.ema;
+            self.current_kind = state.current_kind;
+        }
+    }
+
+    /// Currently-active reconstruction-loss kind according to the
+    /// controller.
+    #[must_use]
+    pub const fn current_kind(&self) -> molecular_autoencoder::ReconstructionLossKind {
+        self.current_kind
+    }
+
+    /// Current EMA value (exposed mainly for diagnostics / tests).
+    #[must_use]
+    pub const fn ema(&self) -> f32 {
+        self.ema
+    }
+
+    /// Updates the EMA with one fresh `active_huber / inactive_huber`
+    /// ratio sample and returns `Some(new_kind)` when a hysteresis
+    /// threshold has been crossed.
+    ///
+    /// While `epoch <= warmup_floor_epochs` the controller is forced
+    /// to the warmup kind regardless of EMA (returns `Some(warmup_kind)`
+    /// only on the first call where it actually changes the state).
+    pub fn update(
+        &mut self,
+        sample: f32,
+        epoch: usize,
+    ) -> Option<molecular_autoencoder::ReconstructionLossKind> {
+        if sample.is_finite() {
+            self.ema = self.decay * self.ema + (1.0 - self.decay) * sample;
+        }
+        if epoch <= self.warmup_floor_epochs {
+            if self.current_kind != self.warmup_kind {
+                self.current_kind = self.warmup_kind;
+                return Some(self.warmup_kind);
+            }
+            return None;
+        }
+        if self.current_kind == self.warmup_kind && self.ema < self.switch_to_main_at {
+            self.current_kind = self.main_kind;
+            return Some(self.main_kind);
+        }
+        if self.current_kind == self.main_kind && self.ema > self.switch_to_warmup_at {
+            self.current_kind = self.warmup_kind;
+            return Some(self.warmup_kind);
+        }
+        None
+    }
+
+    /// Captures the controller's current state for persistence.
+    #[must_use]
+    pub const fn snapshot(&self) -> AdaptiveSchedulerState {
+        AdaptiveSchedulerState {
+            ema: self.ema,
+            current_kind: self.current_kind,
+        }
     }
 }
 
@@ -991,6 +1192,7 @@ mod tests {
             completed_epoch: 0,
             global_step: 0,
             best_validation_loss: None,
+            adaptive_scheduler: None,
         };
         let mut reporter = fixture_reporter();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1015,6 +1217,7 @@ mod tests {
                 epoch: 1,
                 peer_id: 0,
                 world_size: 1,
+                adaptive_loss: None,
             },
         )
         .expect("train epoch");
@@ -1057,6 +1260,7 @@ mod tests {
             completed_epoch: 0,
             global_step: 0,
             best_validation_loss: None,
+            adaptive_scheduler: None,
         };
         let mut reporter = fixture_reporter();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1081,6 +1285,7 @@ mod tests {
                 epoch: 1,
                 peer_id: 0,
                 world_size: 1,
+                adaptive_loss: None,
             },
         )
         .expect("threaded train_epoch");
@@ -1214,6 +1419,8 @@ mod tests {
             bce_correction: None,
             reconstruction_rows,
             correction_rows,
+            active_huber_mean: 0.0,
+            inactive_huber_mean: 0.0,
             violation_bce: 0.0,
             violation_mcc: 0.0,
         }
@@ -1360,5 +1567,116 @@ mod tests {
         let grads = GradientsParams::new();
         let result = all_reduce_mean::<TestBackend>(grads, 0, 1).expect("identity");
         assert_eq!(result.len(), 0);
+    }
+
+    /// Builds an adaptive controller with the warmup curriculum
+    /// configured and the requested thresholds + decay, bypassing the
+    /// fixed-epoch floor unless the caller explicitly sets it.
+    fn adaptive_controller_with(
+        switch_to_main: f64,
+        switch_to_warmup: f64,
+        decay: f64,
+        warmup_floor_epochs: usize,
+    ) -> AdaptiveReconstructionLossController {
+        let mut args = fixture_args();
+        args.reconstruction_loss_adaptive = true;
+        args.reconstruction_loss_warmup =
+            Some(crate::cli::ReconstructionLossKindArg::HuberSymmetric);
+        args.reconstruction_loss = crate::cli::ReconstructionLossKindArg::Huber;
+        args.reconstruction_loss_warmup_epochs = warmup_floor_epochs;
+        args.reconstruction_loss_adaptive_switch_to_main = switch_to_main;
+        args.reconstruction_loss_adaptive_switch_to_warmup = switch_to_warmup;
+        args.reconstruction_loss_adaptive_ema_decay = decay;
+        AdaptiveReconstructionLossController::from_args(&args)
+            .expect("from_args returns Some when adaptive is enabled")
+    }
+
+    #[test]
+    fn controller_swaps_to_main_when_ema_drops_below_threshold() {
+        // decay = 0.0 makes `update` overwrite the EMA with the latest
+        // sample, so the threshold check fires on the first call.
+        let mut controller = adaptive_controller_with(1.0, 2.0, 0.0, 0);
+        assert_eq!(
+            controller.current_kind(),
+            molecular_autoencoder::ReconstructionLossKind::HuberSymmetric
+        );
+        let transition = controller.update(0.5, 1);
+        assert_eq!(
+            transition,
+            Some(molecular_autoencoder::ReconstructionLossKind::Huber)
+        );
+        assert_eq!(
+            controller.current_kind(),
+            molecular_autoencoder::ReconstructionLossKind::Huber
+        );
+    }
+
+    #[test]
+    fn controller_swaps_back_to_warmup_above_high_threshold() {
+        let mut controller = adaptive_controller_with(1.0, 2.0, 0.0, 0);
+        // Drop below the low threshold to move to Main first.
+        assert!(controller.update(0.5, 1).is_some());
+        // Now climb above the high threshold and verify the reverse
+        // transition fires.
+        let transition = controller.update(3.0, 1);
+        assert_eq!(
+            transition,
+            Some(molecular_autoencoder::ReconstructionLossKind::HuberSymmetric)
+        );
+        assert_eq!(
+            controller.current_kind(),
+            molecular_autoencoder::ReconstructionLossKind::HuberSymmetric
+        );
+    }
+
+    #[test]
+    fn controller_hysteresis_prevents_oscillation_at_boundary() {
+        // With thresholds 1.0 / 2.0, EMA samples that stay inside the
+        // dead band (1.0 .. 2.0) must not trigger any transitions.
+        let mut controller = adaptive_controller_with(1.0, 2.0, 0.0, 0);
+        for sample in [1.2_f32, 1.5, 1.9, 1.1, 1.7, 1.3] {
+            assert!(
+                controller.update(sample, 1).is_none(),
+                "in-band sample {sample} must not flip the state"
+            );
+        }
+        assert_eq!(
+            controller.current_kind(),
+            molecular_autoencoder::ReconstructionLossKind::HuberSymmetric
+        );
+    }
+
+    #[test]
+    fn controller_warmup_floor_suppresses_switch_until_epoch_n() {
+        // floor = 3 — until epoch 3 (inclusive), even sub-threshold
+        // ratios must keep the controller pinned to Warmup. From epoch
+        // 4 onward the same ratio triggers a swap.
+        let mut controller = adaptive_controller_with(1.0, 2.0, 0.0, 3);
+        for epoch in 1..=3 {
+            assert!(controller.update(0.1, epoch).is_none());
+            assert_eq!(
+                controller.current_kind(),
+                molecular_autoencoder::ReconstructionLossKind::HuberSymmetric
+            );
+        }
+        let transition = controller.update(0.1, 4);
+        assert_eq!(
+            transition,
+            Some(molecular_autoencoder::ReconstructionLossKind::Huber)
+        );
+    }
+
+    #[test]
+    fn controller_snapshot_round_trips_through_serde_json() {
+        let mut controller = adaptive_controller_with(1.0, 2.0, 0.5, 0);
+        // Drive the EMA away from its bootstrap midpoint so the
+        // round-trip actually tests preservation of a non-default value.
+        let _ = controller.update(3.0, 1);
+        let snapshot = controller.snapshot();
+        let encoded = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        let decoded: AdaptiveSchedulerState =
+            serde_json::from_str(&encoded).expect("deserialize snapshot");
+        assert!((decoded.ema - snapshot.ema).abs() < f32::EPSILON);
+        assert_eq!(decoded.current_kind, snapshot.current_kind);
     }
 }

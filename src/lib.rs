@@ -63,13 +63,13 @@ pub use model::{
     DEFAULT_TANIMOTO_RANKING_MIN_GAP, DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
     DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_WEIGHT,
     DEFAULT_VIOLATION_WEIGHT, Decoder, DecoderConfig, DecoderConfigBuilder, Encoder, EncoderConfig,
-    EncoderConfigBuilder, MoleculeAutoencoder, MoleculeAutoencoderConfig,
+    EncoderConfigBuilder, HuberBalanceDiagnostics, MoleculeAutoencoder, MoleculeAutoencoderConfig,
     MoleculeAutoencoderConfigBuilder, MoleculeAutoencoderOutput, MoleculeLossBreakdown,
     ReconstructionLossConfig, ReconstructionLossConfigBuilder, ReconstructionLossKind,
     TanimotoLossKind, TanimotoRankingConfig, TanimotoRankingConfigBuilder,
     TanimotoRankingRuntimeConfig, apply_latent_noise, weighted_sparse_log_count_bce_loss,
-    weighted_sparse_log_count_huber_loss, weighted_sparse_log_count_huber_loss_symmetric,
-    weighted_sparse_log_count_poisson_loss,
+    weighted_sparse_log_count_huber_balance_per_row, weighted_sparse_log_count_huber_loss,
+    weighted_sparse_log_count_huber_loss_symmetric, weighted_sparse_log_count_poisson_loss,
 };
 pub use ranking::{
     TanimotoRankingBatch, TanimotoRankingDiagnostics, TanimotoRankingOutput,

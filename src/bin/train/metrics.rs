@@ -73,6 +73,15 @@ pub struct BatchLossMetrics {
     /// Number of negative rows that contributed to the correction
     /// polarity means.
     pub correction_rows: usize,
+    /// Mean symmetric Huber over active bins (across the whole batch),
+    /// computed only when balance diagnostics are enabled on the model.
+    /// Zero when the model has not been asked to emit diagnostics.
+    pub active_huber_mean: f32,
+    /// Mean symmetric Huber over inactive bins. Zero when balance
+    /// diagnostics are disabled. The adaptive scheduler uses
+    /// `active_huber_mean / max(inactive_huber_mean, ε)` as its EMA
+    /// signal.
+    pub inactive_huber_mean: f32,
     /// Mean multi-label BCE-with-logits between the violation classifier
     /// head and the per-sample [`finge_rs::ViolationLabel`] bitset.
     pub violation_bce: f32,
@@ -118,6 +127,16 @@ pub struct PolaritySplitTensors<B: Backend> {
     /// Number of negative (correction) rows in the batch, as a scalar
     /// `f32` tensor.
     pub correction_count: Tensor<B, 1>,
+    /// Batch-wide sum of symmetric Huber at active bins, used by the
+    /// adaptive reconstruction-loss scheduler. Zero-shape placeholder
+    /// when the model has not been asked to emit balance diagnostics.
+    pub active_huber_total_sum: Tensor<B, 1>,
+    /// Batch-wide sum of symmetric Huber at inactive bins.
+    pub inactive_huber_total_sum: Tensor<B, 1>,
+    /// Total active-bin count across the batch (sum of per-row counts).
+    pub active_cell_total_count: Tensor<B, 1>,
+    /// Total inactive-bin count across the batch.
+    pub inactive_cell_total_count: Tensor<B, 1>,
 }
 
 /// Returns `"train"` or `"valid"` for the given split.
@@ -181,6 +200,10 @@ where
         bce_correction_sum,
         reconstruction_count,
         correction_count,
+        active_huber_total_sum,
+        inactive_huber_total_sum,
+        active_cell_total_count,
+        inactive_cell_total_count,
     } = polarity_split;
     let diagnostics = &losses.tanimoto_diagnostics;
     let pair_count = diagnostics.pair_count;
@@ -205,6 +228,10 @@ where
         .register(bce_correction_sum)
         .register(reconstruction_count)
         .register(correction_count)
+        .register(active_huber_total_sum)
+        .register(inactive_huber_total_sum)
+        .register(active_cell_total_count)
+        .register(inactive_cell_total_count)
         .register(losses.violation_bce.clone())
         .register(diagnostics.latent_logits.clone())
         .register(diagnostics.candidate_scores.clone())
@@ -214,14 +241,28 @@ where
         .register(violation_diagnostics.targets.clone())
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read {phase} metrics: {source}")))?;
-    if data.len() != 23 {
+    if data.len() != 27 {
         return Err(invalid_input(format!(
-            "{phase} metrics transaction returned {} tensors instead of 23",
+            "{phase} metrics transaction returned {} tensors instead of 27",
             data.len()
         )));
     }
     let reconstruction_rows = scalar_data_as_count(&data[14], "reconstruction row count")?;
     let correction_rows = scalar_data_as_count(&data[15], "correction row count")?;
+    let active_huber_sum = scalar_data(&data[16], "active Huber sum")?;
+    let inactive_huber_sum = scalar_data(&data[17], "inactive Huber sum")?;
+    let active_cell_count = scalar_data(&data[18], "active cell count")?;
+    let inactive_cell_count = scalar_data(&data[19], "inactive cell count")?;
+    let active_huber_mean = if active_cell_count > 0.5 {
+        active_huber_sum / active_cell_count
+    } else {
+        0.0
+    };
+    let inactive_huber_mean = if inactive_cell_count > 0.5 {
+        inactive_huber_sum / inactive_cell_count
+    } else {
+        0.0
+    };
     let count_tanimoto_reconstruction = polarity_mean(
         scalar_data(&data[6], "count Tanimoto reconstruction sum")?,
         reconstruction_rows,
@@ -254,9 +295,9 @@ where
         scalar_data(&data[13], "BCE correction sum")?,
         correction_rows,
     );
-    let quality = ranking_quality_from_data(&data[17..21], pair_count, candidate_count)?;
+    let quality = ranking_quality_from_data(&data[21..25], pair_count, candidate_count)?;
     let violation_quality =
-        violation_quality_from_data(&data[21..23], violation_batch, violation_classes)?;
+        violation_quality_from_data(&data[25..27], violation_batch, violation_classes)?;
     Ok(BatchLossMetrics {
         loss: scalar_data(&data[0], "loss")?,
         reconstruction: scalar_data(&data[1], "reconstruction loss")?,
@@ -277,7 +318,9 @@ where
         bce_correction,
         reconstruction_rows,
         correction_rows,
-        violation_bce: scalar_data(&data[16], "violation BCE loss")?,
+        active_huber_mean,
+        inactive_huber_mean,
+        violation_bce: scalar_data(&data[20], "violation BCE loss")?,
         violation_mcc: violation_quality.mcc_macro,
     })
 }

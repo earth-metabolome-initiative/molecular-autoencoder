@@ -25,7 +25,10 @@ use crate::{
     preprocess::prepare_manifest,
     ranking::{TanimotoMetricBackend, effective_device_prefetch_batches},
     reporter::TrainingReporter,
-    training::{BatchSink, EvaluationContext, TrainEpochContext, evaluate, train_epoch},
+    training::{
+        AdaptiveReconstructionLossController, BatchSink, EvaluationContext, TrainEpochContext,
+        evaluate, train_epoch,
+    },
 };
 
 /// Trains the molecular autoencoder according to the parsed CLI arguments.
@@ -47,6 +50,7 @@ where
     if devices.is_empty() {
         return Err(invalid_input("run::run requires at least one device"));
     }
+    args.validate_adaptive_loss()?;
     let device = devices
         .first()
         .cloned()
@@ -105,6 +109,7 @@ where
             completed_epoch: 0,
             global_step: 0,
             best_validation_loss: None,
+            adaptive_scheduler: None,
         }
     };
 
@@ -161,12 +166,31 @@ where
 
     let stop_flag = Arc::new(AtomicBool::new(false));
 
+    // Build the adaptive scheduler (or `None`), restore its persisted
+    // EMA + current kind from `state` on resume, and turn on the
+    // model's balance diagnostics so loss_from_output starts emitting
+    // the active/inactive Huber sums.
+    let mut adaptive_loss = AdaptiveReconstructionLossController::from_args(&args);
+    if let Some(controller) = adaptive_loss.as_mut() {
+        controller.seed_from_checkpoint(state.adaptive_scheduler);
+        model.set_compute_balance_diagnostics(true);
+        // Snapshot the (possibly bootstrapped) state right away so a
+        // checkpoint written before the first metric-sample batch
+        // already carries the controller's view of the world.
+        state.adaptive_scheduler = Some(controller.snapshot());
+    }
+
     for epoch in (state.completed_epoch + 1)..=args.epochs {
         // Reconstruction-loss curriculum: epochs in the warmup window
         // run under the warmup kind, then the loop swaps to the main
         // kind. Recomputed per epoch so `--resume` lands on the right
-        // kind based on `state.completed_epoch`.
-        let epoch_kind = args.reconstruction_loss_kind_for_epoch(epoch);
+        // kind based on `state.completed_epoch`. The adaptive
+        // scheduler, when active, takes over mid-epoch from this
+        // floor.
+        let epoch_kind = adaptive_loss.as_ref().map_or_else(
+            || args.reconstruction_loss_kind_for_epoch(epoch),
+            AdaptiveReconstructionLossController::current_kind,
+        );
         if model.reconstruction_loss_kind() != epoch_kind {
             println!(
                 "reconstruction_loss_kind_swap epoch={epoch} from={:?} to={:?}",
@@ -196,6 +220,7 @@ where
                 epoch,
                 peer_id: 0,
                 world_size: 1,
+                adaptive_loss: adaptive_loss.as_mut(),
             },
         )?;
         model = next_model;

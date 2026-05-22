@@ -1527,6 +1527,10 @@ impl MoleculeAutoencoderConfig {
             bce_nonzero_weight: self.reconstruction_loss.bce_nonzero_weight,
             reconstruction_loss_kind: self.reconstruction_loss.loss_kind,
             reconstruction_poisson_max_log_count: self.reconstruction_loss.poisson_max_log_count,
+            // Diagnostic flag defaults to false; the train binary
+            // flips it on via `set_compute_balance_diagnostics` when
+            // `--reconstruction-loss-adaptive` is requested.
+            compute_balance_diagnostics: false,
             descriptor_weight: self.auxiliary_weights.descriptors,
             tanimoto_ranking_weight: self.auxiliary_weights.tanimoto_ranking,
             violation_weight: self.auxiliary_weights.violation,
@@ -1961,6 +1965,10 @@ pub struct MoleculeLossBreakdown<B: Backend> {
     /// next Transaction round-trip. Empty shapes when the head is
     /// disabled or the batch is too small to contribute.
     pub violation_diagnostics: crate::ranking::ViolationDiagnostics<B>,
+    /// Active-vs-inactive symmetric Huber sums + counts staged for the
+    /// adaptive reconstruction-loss scheduler's EMA. Empty shapes when
+    /// `MoleculeAutoencoder::compute_balance_diagnostics` is `false`.
+    pub huber_balance: HuberBalanceDiagnostics<B>,
 }
 
 impl<B: Backend> MoleculeLossBreakdown<B> {
@@ -2030,6 +2038,12 @@ pub struct MoleculeAutoencoder<B: Backend> {
     /// Poisson branch; ignored under
     /// [`ReconstructionLossKind::Huber`].
     reconstruction_poisson_max_log_count: f64,
+    /// When `true`, `loss_from_output` populates
+    /// [`MoleculeLossBreakdown::huber_balance`] with active-vs-inactive
+    /// symmetric Huber sums + counts so the adaptive scheduler can
+    /// update its EMA. Off by default; toggled by the train binary when
+    /// `--reconstruction-loss-adaptive` is set.
+    compute_balance_diagnostics: bool,
     /// Standard deviation of the Gaussian noise injected into the
     /// decoder-side latent at training time.
     latent_noise_std: f64,
@@ -2068,6 +2082,21 @@ impl<B: Backend> MoleculeAutoencoder<B> {
     /// safe to call between epochs.
     pub const fn set_reconstruction_loss_kind(&mut self, kind: ReconstructionLossKind) {
         self.reconstruction_loss_kind = kind;
+    }
+
+    /// Whether `loss_from_output` should populate the active-vs-inactive
+    /// symmetric Huber diagnostics on the loss breakdown. Read by the
+    /// adaptive scheduler in the train binary.
+    #[must_use]
+    pub const fn compute_balance_diagnostics(&self) -> bool {
+        self.compute_balance_diagnostics
+    }
+
+    /// Toggles the per-batch active-vs-inactive Huber diagnostics. Off
+    /// by default; the train binary turns it on when
+    /// `--reconstruction-loss-adaptive` is set.
+    pub const fn set_compute_balance_diagnostics(&mut self, value: bool) {
+        self.compute_balance_diagnostics = value;
     }
 
     /// Runs the full autoencoder from sparse counted fingerprints.
@@ -2169,6 +2198,18 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             Tensor::zeros([batch_size], &device)
         };
         let reconstruction_bce = reconstruction_bce_per_row.clone().mean();
+        // Balance diagnostics for the adaptive scheduler. Computed up
+        // front (cloning the sparse target + the prediction tensor)
+        // because the loss helpers below consume `target_fingerprints`.
+        let huber_balance = if self.compute_balance_diagnostics {
+            weighted_sparse_log_count_huber_balance_per_row(
+                output.reconstructed_log_counts.clone(),
+                &target_fingerprints,
+                self.reconstruction_beta,
+            )
+        } else {
+            HuberBalanceDiagnostics::empty(&device)
+        };
         let reconstruction_per_row = match self.reconstruction_loss_kind {
             ReconstructionLossKind::Huber => weighted_sparse_log_count_huber_loss_per_row(
                 output.reconstructed_log_counts,
@@ -2237,6 +2278,7 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             tanimoto_diagnostics: tanimoto.diagnostics,
             violation_bce,
             violation_diagnostics,
+            huber_balance,
         }
     }
 }
@@ -2539,6 +2581,109 @@ pub fn weighted_sparse_log_count_huber_loss_symmetric_per_row<B: Backend>(
     let correction_per_row: Tensor<B, 1> = correction.sum_dim(1).squeeze_dim(1);
 
     (zero_per_row * config.zero_weight + correction_per_row) / width
+}
+
+/// Per-row active-vs-inactive Huber diagnostic for the adaptive
+/// reconstruction-loss scheduler.
+///
+/// Returns four `Tensor<B, 1>` columns (`[batch]`-shaped):
+///
+/// - `active_huber_sum_per_row` — sum of `huber(|ẑ - target_log_count|)`
+///   over active bins.
+/// - `inactive_huber_sum_per_row` — sum of `huber(|ẑ|)` over inactive
+///   bins (computed as the dense symmetric Huber over every cell minus
+///   the active-indices contribution under the same `|ẑ|` formula).
+/// - `active_count_per_row` — number of active bins (= `target.mask.sum_dim(1)`).
+/// - `inactive_count_per_row` — `width - active_count_per_row`.
+///
+/// Always uses the **symmetric** form so the controller's signal does
+/// not jump when the active reconstruction loss kind switches between
+/// the asymmetric `Huber` and `HuberSymmetric` paths. Re-uses
+/// `huber_from_delta` for the per-cell kernel.
+///
+/// # Panics
+///
+/// Panics when the predicted dense reconstruction shape does not match
+/// the sparse target batch size and fingerprint width.
+#[must_use]
+pub fn weighted_sparse_log_count_huber_balance_per_row<B: Backend>(
+    predicted_log_counts: Tensor<B, 2>,
+    target: &SparseFingerprintBatch<B>,
+    beta: f64,
+) -> HuberBalanceDiagnostics<B> {
+    let predicted_dims = predicted_log_counts.dims();
+    assert_eq!(
+        predicted_dims[0],
+        target.batch_size(),
+        "predicted and target batches must have the same row count"
+    );
+    assert_eq!(
+        predicted_dims[1], target.fingerprint_size,
+        "predicted reconstruction width must match sparse fingerprint width"
+    );
+
+    let device = predicted_log_counts.device();
+    let batch_size = predicted_dims[0];
+    let width_f = predicted_dims[1] as f64;
+    let dense_symmetric = huber_from_delta(predicted_log_counts.clone().abs(), beta);
+    let dense_sum_per_row: Tensor<B, 1> = dense_symmetric.sum_dim(1).squeeze_dim(1);
+    let predicted_nonzero = predicted_log_counts.gather(1, target.indices.clone());
+    let active_huber = huber_from_delta(
+        (predicted_nonzero.clone() - target.log_counts.clone()).abs(),
+        beta,
+    );
+    let active_huber_at_indices = active_huber * target.mask.clone();
+    let active_huber_sum_per_row: Tensor<B, 1> = active_huber_at_indices.sum_dim(1).squeeze_dim(1);
+    // The active-indices contribution under the same `|ẑ|` formula:
+    // subtract it from the dense-everywhere sum to get the inactive total.
+    let inactive_huber_at_active =
+        huber_from_delta(predicted_nonzero.abs(), beta) * target.mask.clone();
+    let inactive_huber_at_active_per_row: Tensor<B, 1> =
+        inactive_huber_at_active.sum_dim(1).squeeze_dim(1);
+    let inactive_huber_sum_per_row = dense_sum_per_row - inactive_huber_at_active_per_row;
+    let active_count_per_row: Tensor<B, 1> = target.mask.clone().sum_dim(1).squeeze_dim(1);
+    let inactive_count_per_row =
+        Tensor::<B, 1>::full([batch_size], width_f, &device) - active_count_per_row.clone();
+
+    HuberBalanceDiagnostics {
+        active_huber_sum_per_row,
+        inactive_huber_sum_per_row,
+        active_count_per_row,
+        inactive_count_per_row,
+    }
+}
+
+/// Per-row Huber balance tensors emitted by
+/// [`weighted_sparse_log_count_huber_balance_per_row`].
+///
+/// Used by the adaptive reconstruction-loss scheduler to maintain an
+/// EMA of `active_huber_mean / inactive_huber_mean`, which decides
+/// when to switch the active reconstruction loss kind.
+#[derive(Debug, Clone)]
+pub struct HuberBalanceDiagnostics<B: Backend> {
+    /// Per-row sum of symmetric Huber at active bins.
+    pub active_huber_sum_per_row: Tensor<B, 1>,
+    /// Per-row sum of symmetric Huber at inactive bins.
+    pub inactive_huber_sum_per_row: Tensor<B, 1>,
+    /// Per-row active-bin count.
+    pub active_count_per_row: Tensor<B, 1>,
+    /// Per-row inactive-bin count.
+    pub inactive_count_per_row: Tensor<B, 1>,
+}
+
+impl<B: Backend> HuberBalanceDiagnostics<B> {
+    /// Empty placeholder used when balance diagnostics are disabled
+    /// (zero-shape tensors that still serialise through the metrics
+    /// `Transaction` without contributing data).
+    #[must_use]
+    pub fn empty(device: &B::Device) -> Self {
+        Self {
+            active_huber_sum_per_row: Tensor::zeros([0], device),
+            inactive_huber_sum_per_row: Tensor::zeros([0], device),
+            active_count_per_row: Tensor::zeros([0], device),
+            inactive_count_per_row: Tensor::zeros([0], device),
+        }
+    }
 }
 
 /// Poisson NLL on raw counts, with the model output interpreted as
@@ -3868,5 +4013,94 @@ mod tests {
             err,
             crate::Error::ConfigInvalid { message } if message.contains("min_gap")
         ));
+    }
+
+    #[test]
+    fn huber_balance_helper_active_and_inactive_sums_match_hand_computed_reference() {
+        // Two rows, width 4, one active bin per row (positions 1 and 2
+        // respectively). Predictions are crafted so the symmetric Huber
+        // at each cell is easy to compute by hand for the chosen
+        // `beta = 1.0`:
+        //   - At each inactive cell |z| = 0.5  -> Huber = 0.5 * z^2     = 0.125
+        //   - At the active cell, |z - log_count| = 1.0
+        //                                       -> Huber = |delta| - 0.5 = 0.5
+        //   - At the active cell under |z| only, |z| = 0.5
+        //                                       -> Huber = 0.125 (same as inactive)
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let predicted = Tensor::<B, 2>::from_floats(
+            [[0.5_f32, 0.5, 0.5, 0.5], [0.5_f32, 0.5, 0.5, 0.5]],
+            &device,
+        );
+        // Row 0 active at column 1, row 1 active at column 2.
+        let indices = Tensor::<B, 2, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(vec![1_i64, 2_i64], [2, 1]),
+            &device,
+        );
+        // Target log_count = 1.5 at the active bin -> delta = 0.5 - 1.5 = -1.0.
+        let log_counts =
+            Tensor::<B, 2>::from_data(TensorData::new(vec![1.5_f32, 1.5], [2, 1]), &device);
+        // Counts are unused by the helper but the struct requires them.
+        let counts =
+            Tensor::<B, 2>::from_data(TensorData::new(vec![1.0_f32, 1.0], [2, 1]), &device);
+        let mask = Tensor::<B, 2>::from_data(TensorData::new(vec![1.0_f32, 1.0], [2, 1]), &device);
+        let target = crate::batch::SparseFingerprintBatch::<B> {
+            indices,
+            counts,
+            log_counts,
+            mask,
+            fingerprint_size: 4,
+            max_nnz: 1,
+        };
+
+        let balance = weighted_sparse_log_count_huber_balance_per_row(predicted, &target, 1.0);
+
+        let active_sums = balance
+            .active_huber_sum_per_row
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32 data");
+        let inactive_sums = balance
+            .inactive_huber_sum_per_row
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32 data");
+        let active_counts = balance
+            .active_count_per_row
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32 data");
+        let inactive_counts = balance
+            .inactive_count_per_row
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32 data");
+
+        // One active bin per row at the configured delta.
+        assert!(
+            (active_sums[0] - 0.5).abs() < 1.0e-5,
+            "got {}",
+            active_sums[0]
+        );
+        assert!(
+            (active_sums[1] - 0.5).abs() < 1.0e-5,
+            "got {}",
+            active_sums[1]
+        );
+        // Three inactive cells per row, each contributing 0.125 ->
+        // total per row = 0.375.
+        assert!(
+            (inactive_sums[0] - 0.375).abs() < 1.0e-5,
+            "got {}",
+            inactive_sums[0]
+        );
+        assert!(
+            (inactive_sums[1] - 0.375).abs() < 1.0e-5,
+            "got {}",
+            inactive_sums[1]
+        );
+        // Bin counts: 1 active, 3 inactive in both rows.
+        assert_eq!(active_counts, vec![1.0, 1.0]);
+        assert_eq!(inactive_counts, vec![3.0, 3.0]);
     }
 }

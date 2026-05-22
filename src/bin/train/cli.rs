@@ -158,6 +158,10 @@ impl SourceSelection {
     about = "Train the molecular autoencoder on cached SMILES shards",
     disable_help_subcommand = true
 )]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "clap flag aggregator: each bool is a discrete CLI switch and refactoring to enums would obscure the user-facing interface"
+)]
 pub struct Args {
     /// Cached shards directory, or path to an existing manifest.json file.
     pub shards: PathBuf,
@@ -380,6 +384,32 @@ pub struct Args {
     /// phase; ignored when `--reconstruction-loss-warmup` is unset.
     #[arg(long, default_value_t = 0)]
     pub reconstruction_loss_warmup_epochs: usize,
+
+    /// Enable the adaptive reconstruction-loss-kind scheduler. When
+    /// set, the model tracks an EMA of `active-bin / inactive-bin`
+    /// symmetric-Huber error and swaps between
+    /// `--reconstruction-loss-warmup` (Warmup) and
+    /// `--reconstruction-loss` (Main) based on hysteresis thresholds.
+    /// Requires `--reconstruction-loss-warmup` to be set.
+    #[arg(long, default_value_t = false)]
+    pub reconstruction_loss_adaptive: bool,
+
+    /// While in Warmup, swap to the Main kind when the EMA drops below
+    /// this ratio.
+    #[arg(long, default_value_t = 1.0)]
+    pub reconstruction_loss_adaptive_switch_to_main: f64,
+
+    /// While in Main, swap back to the Warmup kind when the EMA climbs
+    /// above this ratio.
+    #[arg(long, default_value_t = 2.0)]
+    pub reconstruction_loss_adaptive_switch_to_warmup: f64,
+
+    /// EMA decay applied to each metric-sampled batch's
+    /// `active / inactive` ratio. Half-life is roughly
+    /// `ln(0.5) / ln(decay)` sampled batches; default 0.95 gives
+    /// ~14 samples ≈ ~140 batches at default `--metric-every 10`.
+    #[arg(long, default_value_t = 0.95)]
+    pub reconstruction_loss_adaptive_ema_decay: f64,
 }
 
 /// CLI mirror of [`molecular_autoencoder::ReconstructionLossKind`]
@@ -440,6 +470,47 @@ impl Args {
             Some(warmup) if epoch <= self.reconstruction_loss_warmup_epochs => warmup.into(),
             _ => self.reconstruction_loss.into(),
         }
+    }
+
+    /// Validates the adaptive-scheduler flags after clap parsing.
+    /// `--reconstruction-loss-adaptive` requires a Warmup kind to swap
+    /// between, and the two ratio thresholds must form a proper
+    /// hysteresis window (`switch_to_main < switch_to_warmup`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError`] (via `invalid_input`) when the
+    /// adaptive flag is set without `--reconstruction-loss-warmup`,
+    /// or when the thresholds are inverted, non-finite, or the EMA
+    /// decay sits outside `(0, 1)`.
+    pub fn validate_adaptive_loss(&self) -> AppResult<()> {
+        if !self.reconstruction_loss_adaptive {
+            return Ok(());
+        }
+        if self.reconstruction_loss_warmup.is_none() {
+            return Err(invalid_input(
+                "--reconstruction-loss-adaptive requires --reconstruction-loss-warmup to be set so the controller knows which kind to swap back to",
+            ));
+        }
+        let switch_to_main = self.reconstruction_loss_adaptive_switch_to_main;
+        let switch_to_warmup = self.reconstruction_loss_adaptive_switch_to_warmup;
+        if !switch_to_main.is_finite() || !switch_to_warmup.is_finite() {
+            return Err(invalid_input(format!(
+                "adaptive thresholds must be finite, got switch-to-main={switch_to_main}, switch-to-warmup={switch_to_warmup}",
+            )));
+        }
+        if switch_to_main >= switch_to_warmup {
+            return Err(invalid_input(format!(
+                "--reconstruction-loss-adaptive-switch-to-main ({switch_to_main}) must be strictly less than --reconstruction-loss-adaptive-switch-to-warmup ({switch_to_warmup}) to form a hysteresis window",
+            )));
+        }
+        let decay = self.reconstruction_loss_adaptive_ema_decay;
+        if !decay.is_finite() || !(0.0..1.0).contains(&decay) {
+            return Err(invalid_input(format!(
+                "--reconstruction-loss-adaptive-ema-decay must lie in (0, 1), got {decay}",
+            )));
+        }
+        Ok(())
     }
 
     /// Resolves the manifest path and source selection from the raw flags.
@@ -939,6 +1010,81 @@ mod tests {
             args.reconstruction_loss_kind_for_epoch(100),
             ReconstructionLossKind::Huber
         );
+    }
+
+    #[test]
+    fn adaptive_loss_requires_warmup_kind_to_be_set() {
+        let args = Args::try_parse_from([
+            "train",
+            "shards",
+            "checkpoints",
+            "--reconstruction-loss-adaptive",
+        ])
+        .expect("parse");
+        let err = args
+            .validate_adaptive_loss()
+            .expect_err("adaptive without warmup must be rejected");
+        assert!(format!("{err:?}").contains("--reconstruction-loss-warmup"));
+    }
+
+    #[test]
+    fn adaptive_loss_rejects_inverted_thresholds() {
+        let args = Args::try_parse_from([
+            "train",
+            "shards",
+            "checkpoints",
+            "--reconstruction-loss-warmup",
+            "huber-symmetric",
+            "--reconstruction-loss-adaptive",
+            "--reconstruction-loss-adaptive-switch-to-main",
+            "2.0",
+            "--reconstruction-loss-adaptive-switch-to-warmup",
+            "1.0",
+        ])
+        .expect("parse");
+        let err = args
+            .validate_adaptive_loss()
+            .expect_err("inverted thresholds must be rejected");
+        assert!(format!("{err:?}").contains("hysteresis"));
+    }
+
+    #[test]
+    fn adaptive_loss_accepts_valid_configuration() {
+        let args = Args::try_parse_from([
+            "train",
+            "shards",
+            "checkpoints",
+            "--reconstruction-loss-warmup",
+            "huber-symmetric",
+            "--reconstruction-loss-adaptive",
+            "--reconstruction-loss-adaptive-switch-to-main",
+            "1.0",
+            "--reconstruction-loss-adaptive-switch-to-warmup",
+            "2.5",
+            "--reconstruction-loss-adaptive-ema-decay",
+            "0.9",
+        ])
+        .expect("parse");
+        args.validate_adaptive_loss().expect("valid args");
+    }
+
+    #[test]
+    fn adaptive_loss_rejects_out_of_range_decay() {
+        let args = Args::try_parse_from([
+            "train",
+            "shards",
+            "checkpoints",
+            "--reconstruction-loss-warmup",
+            "huber-symmetric",
+            "--reconstruction-loss-adaptive",
+            "--reconstruction-loss-adaptive-ema-decay",
+            "1.2",
+        ])
+        .expect("parse");
+        let err = args
+            .validate_adaptive_loss()
+            .expect_err("decay above 1 must be rejected");
+        assert!(format!("{err:?}").contains("ema-decay"));
     }
 
     #[test]

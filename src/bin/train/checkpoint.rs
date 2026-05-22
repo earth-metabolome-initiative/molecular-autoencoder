@@ -9,7 +9,8 @@ use burn::{
     tensor::backend::AutodiffBackend,
 };
 use molecular_autoencoder::{
-    MoleculeAutoencoder, MoleculeAutoencoderBatcher, ShardManifest, SparseMoleculeShard,
+    MoleculeAutoencoder, MoleculeAutoencoderBatcher, ReconstructionLossKind, ShardManifest,
+    SparseMoleculeShard,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,27 @@ pub struct CheckpointState {
     pub global_step: usize,
     /// Best validation loss observed so far (used for `--save-best`).
     pub best_validation_loss: Option<f32>,
+    /// Persisted state of the adaptive reconstruction-loss-kind
+    /// scheduler. `None` when the controller is disabled or when
+    /// resuming from a pre-feature checkpoint.
+    #[serde(default)]
+    pub adaptive_scheduler: Option<AdaptiveSchedulerState>,
+}
+
+/// Persistable view of the adaptive reconstruction-loss-kind
+/// scheduler's runtime state.
+///
+/// `current_kind` is the reconstruction loss the controller was using
+/// at the time of the snapshot; `ema` is its running average of
+/// `active_huber_mean / inactive_huber_mean` across metric-sampled
+/// batches. Restored on `--resume` so the controller does not have to
+/// re-learn its operating point.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveSchedulerState {
+    /// EMA of `active / inactive` symmetric-Huber ratio.
+    pub ema: f32,
+    /// Reconstruction-loss kind active when the snapshot was taken.
+    pub current_kind: ReconstructionLossKind,
 }
 
 /// Builds the list of cached shards referenced by the manifest, resolving
@@ -231,6 +253,7 @@ mod tests {
             completed_epoch: 17,
             global_step: 12_345,
             best_validation_loss: Some(0.421),
+            adaptive_scheduler: None,
         };
         write_state_json(&path, &state).expect("write state");
         let loaded = read_state_json(&path).expect("read state");
@@ -247,6 +270,7 @@ mod tests {
             completed_epoch: 0,
             global_step: 0,
             best_validation_loss: None,
+            adaptive_scheduler: None,
         };
         write_state_json(&path, &state).expect("write state");
         let loaded = read_state_json(&path).expect("read state");
@@ -265,5 +289,51 @@ mod tests {
         // Surface check — if SHARD_MANIFEST_VERSION changes, downstream
         // checkpoint readers need to be aware.
         const _: () = assert!(SHARD_MANIFEST_VERSION >= 1);
+    }
+
+    #[test]
+    fn state_json_round_trip_preserves_adaptive_scheduler_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let state = CheckpointState {
+            completed_epoch: 4,
+            global_step: 1_024,
+            best_validation_loss: None,
+            adaptive_scheduler: Some(AdaptiveSchedulerState {
+                ema: 1.3,
+                current_kind: ReconstructionLossKind::HuberSymmetric,
+            }),
+        };
+        write_state_json(&path, &state).expect("write state");
+        let loaded = read_state_json(&path).expect("read state");
+        let scheduler = loaded
+            .adaptive_scheduler
+            .expect("adaptive scheduler field should survive the round trip");
+        assert!((scheduler.ema - 1.3).abs() < f32::EPSILON);
+        assert_eq!(
+            scheduler.current_kind,
+            ReconstructionLossKind::HuberSymmetric
+        );
+    }
+
+    #[test]
+    fn state_json_deserialises_pre_feature_payload_with_none_scheduler() {
+        // A pre-feature `state.json` would not carry the
+        // `adaptive_scheduler` key at all. The `#[serde(default)]` on
+        // the field must make that payload deserialise cleanly with
+        // `adaptive_scheduler = None`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let raw = r#"{
+            "completed_epoch": 9,
+            "global_step": 42,
+            "best_validation_loss": 0.31
+        }"#;
+        std::fs::write(&path, raw).expect("write legacy state.json");
+        let loaded = read_state_json(&path).expect("read legacy state");
+        assert_eq!(loaded.completed_epoch, 9);
+        assert_eq!(loaded.global_step, 42);
+        assert_eq!(loaded.best_validation_loss, Some(0.31));
+        assert!(loaded.adaptive_scheduler.is_none());
     }
 }
