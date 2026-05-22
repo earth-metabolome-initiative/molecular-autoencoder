@@ -83,10 +83,6 @@ pub struct BatchLossMetrics {
     /// in the batch has both positive and negative samples (the
     /// standard `sklearn`-style degenerate-case convention).
     pub violation_mcc: f32,
-    /// Fraction of `(sample, class)` cells where the thresholded
-    /// violation prediction matches the target bit, averaged over the
-    /// flattened `batch * 8` matrix.
-    pub violation_accuracy: f32,
 }
 
 /// Polarity-split per-row Tanimoto / Huber / BCE sums plus the matching
@@ -283,7 +279,6 @@ where
         correction_rows,
         violation_bce: scalar_data(&data[16], "violation BCE loss")?,
         violation_mcc: violation_quality.mcc_macro,
-        violation_accuracy: violation_quality.accuracy,
     })
 }
 

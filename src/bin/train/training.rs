@@ -1186,7 +1186,6 @@ mod tests {
             correction_rows,
             violation_bce: 0.0,
             violation_mcc: 0.0,
-            violation_accuracy: 0.0,
         }
     }
 

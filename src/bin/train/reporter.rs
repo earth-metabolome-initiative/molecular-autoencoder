@@ -246,11 +246,6 @@ impl TrainingReporter {
                     metrics.violation_mcc,
                     examples,
                 ));
-                renderer.update_train(metric_state(
-                    self.metric_ids.violation_accuracy.clone(),
-                    metrics.violation_accuracy,
-                    examples,
-                ));
             }
             renderer.render_train(
                 training_progress(
@@ -420,11 +415,6 @@ impl TrainingReporter {
                     metrics.violation_mcc,
                     examples,
                 ));
-                renderer.update_valid(metric_state(
-                    self.metric_ids.violation_accuracy.clone(),
-                    metrics.violation_accuracy,
-                    examples,
-                ));
             }
             renderer.render_valid(
                 training_progress(
@@ -529,7 +519,7 @@ impl IndicatifTrainingBars {
         let step_ms = step_time.as_secs_f64() * 1000.0;
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} recon_pos={} recon_neg={} bce_pos={} bce_neg={} viol={:.4} viol_mcc={:.3} viol_acc={:.3} data_ms={data_ms:.1} step_ms={step_ms:.1}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} recon_pos={} recon_neg={} bce_pos={} bce_neg={} viol={:.4} viol_mcc={:.3} data_ms={data_ms:.1} step_ms={step_ms:.1}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.reconstruction_bce,
@@ -549,7 +539,6 @@ impl IndicatifTrainingBars {
                 format_polarity(metrics.bce_correction),
                 metrics.violation_bce,
                 metrics.violation_mcc,
-                metrics.violation_accuracy,
             )),
             None => bar.set_message(format!("data_ms={data_ms:.1} step_ms={step_ms:.1}")),
         }
@@ -568,7 +557,7 @@ impl IndicatifTrainingBars {
         bar.set_position(processed as u64);
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} recon_pos={} recon_neg={} bce_pos={} bce_neg={} viol={:.4} viol_mcc={:.3} viol_acc={:.3}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} recon_pos={} recon_neg={} bce_pos={} bce_neg={} viol={:.4} viol_mcc={:.3}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.reconstruction_bce,
@@ -588,7 +577,6 @@ impl IndicatifTrainingBars {
                 format_polarity(metrics.bce_correction),
                 metrics.violation_bce,
                 metrics.violation_mcc,
-                metrics.violation_accuracy,
             )),
             None => {
                 bar.set_message(String::new());
@@ -680,14 +668,11 @@ enum ReporterMetric {
     /// Macro-averaged Matthews correlation coefficient over the eight
     /// violation classes.
     ViolationMcc,
-    /// Multi-label accuracy of the violation classifier (per-cell
-    /// agreement across the flattened batch * class matrix).
-    ViolationAccuracy,
 }
 
 impl ReporterMetric {
     /// All gauges in the canonical order the reporter renders them.
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 19] = [
         Self::Loss,
         Self::Reconstruction,
         Self::ReconstructionBce,
@@ -707,7 +692,6 @@ impl ReporterMetric {
         Self::BceCorrection,
         Self::Violation,
         Self::ViolationMcc,
-        Self::ViolationAccuracy,
     ];
 
     /// Short human-readable label for the gauge.
@@ -732,7 +716,6 @@ impl ReporterMetric {
             Self::BceCorrection => "Reconstruction BCE (Correction)",
             Self::Violation => "Violation BCE",
             Self::ViolationMcc => "Violation MCC",
-            Self::ViolationAccuracy => "Violation Accuracy",
         }
     }
 
@@ -784,9 +767,6 @@ impl ReporterMetric {
             Self::ViolationMcc => {
                 "macro-averaged Matthews correlation coefficient across the 8 violation classes"
             }
-            Self::ViolationAccuracy => {
-                "fraction of (sample, class) cells where the violation prediction matches the target bit"
-            }
         }
     }
 
@@ -804,7 +784,6 @@ impl ReporterMetric {
                 | Self::TanimotoRankingPearson
                 | Self::TanimotoRankingSpearman
                 | Self::ViolationMcc
-                | Self::ViolationAccuracy
         )
     }
 
@@ -865,8 +844,6 @@ struct ReporterMetricIds {
     violation: MetricId,
     /// Metric ID for the macro-MCC violation-classifier quality gauge.
     violation_mcc: MetricId,
-    /// Metric ID for the per-cell violation-accuracy gauge.
-    violation_accuracy: MetricId,
 }
 
 impl ReporterMetricIds {
@@ -892,7 +869,6 @@ impl ReporterMetricIds {
             bce_correction: metric_id(ReporterMetric::BceCorrection),
             violation: metric_id(ReporterMetric::Violation),
             violation_mcc: metric_id(ReporterMetric::ViolationMcc),
-            violation_accuracy: metric_id(ReporterMetric::ViolationAccuracy),
         }
     }
 
@@ -922,7 +898,6 @@ impl ReporterMetricIds {
             ReporterMetric::BceCorrection => self.bce_correction.clone(),
             ReporterMetric::Violation => self.violation.clone(),
             ReporterMetric::ViolationMcc => self.violation_mcc.clone(),
-            ReporterMetric::ViolationAccuracy => self.violation_accuracy.clone(),
         }
     }
 }
@@ -1060,7 +1035,6 @@ mod tests {
             correction_rows: 1,
             violation_bce: 0.07,
             violation_mcc: 0.62,
-            violation_accuracy: 0.88,
         }
     }
 
