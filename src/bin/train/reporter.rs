@@ -180,16 +180,34 @@ impl TrainingReporter {
                     metrics.tanimoto_ranking_spearman,
                     examples,
                 ));
-                renderer.update_train(metric_state(
-                    self.metric_ids.count_tanimoto.clone(),
-                    metrics.count_tanimoto,
-                    examples,
-                ));
-                renderer.update_train(metric_state(
-                    self.metric_ids.binary_tanimoto.clone(),
-                    metrics.binary_tanimoto,
-                    examples,
-                ));
+                if let Some(value) = metrics.count_tanimoto_reconstruction {
+                    renderer.update_train(metric_state(
+                        self.metric_ids.count_tanimoto_reconstruction.clone(),
+                        value,
+                        metrics.reconstruction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.count_tanimoto_correction {
+                    renderer.update_train(metric_state(
+                        self.metric_ids.count_tanimoto_correction.clone(),
+                        value,
+                        metrics.correction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.binary_tanimoto_reconstruction {
+                    renderer.update_train(metric_state(
+                        self.metric_ids.binary_tanimoto_reconstruction.clone(),
+                        value,
+                        metrics.reconstruction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.binary_tanimoto_correction {
+                    renderer.update_train(metric_state(
+                        self.metric_ids.binary_tanimoto_correction.clone(),
+                        value,
+                        metrics.correction_rows,
+                    ));
+                }
                 renderer.update_train(metric_state(
                     self.metric_ids.violation.clone(),
                     metrics.violation_bce,
@@ -244,7 +262,6 @@ impl TrainingReporter {
 
     /// Records one validation batch on the renderer and indicatif
     /// fallback. Returns whether the loop should continue or stop.
-    #[allow(clippy::too_many_arguments)]
     pub fn valid_batch(
         &mut self,
         epoch: usize,
@@ -252,8 +269,6 @@ impl TrainingReporter {
         iteration: usize,
         examples: usize,
         metrics: Option<BatchLossMetrics>,
-        count_tanimoto: f32,
-        binary_tanimoto: f32,
     ) -> BatchControl {
         if self.valid_epoch != Some(epoch) {
             self.valid_epoch = Some(epoch);
@@ -311,6 +326,34 @@ impl TrainingReporter {
                     metrics.tanimoto_ranking_spearman,
                     examples,
                 ));
+                if let Some(value) = metrics.count_tanimoto_reconstruction {
+                    renderer.update_valid(metric_state(
+                        self.metric_ids.count_tanimoto_reconstruction.clone(),
+                        value,
+                        metrics.reconstruction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.count_tanimoto_correction {
+                    renderer.update_valid(metric_state(
+                        self.metric_ids.count_tanimoto_correction.clone(),
+                        value,
+                        metrics.correction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.binary_tanimoto_reconstruction {
+                    renderer.update_valid(metric_state(
+                        self.metric_ids.binary_tanimoto_reconstruction.clone(),
+                        value,
+                        metrics.reconstruction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.binary_tanimoto_correction {
+                    renderer.update_valid(metric_state(
+                        self.metric_ids.binary_tanimoto_correction.clone(),
+                        value,
+                        metrics.correction_rows,
+                    ));
+                }
                 renderer.update_valid(metric_state(
                     self.metric_ids.violation.clone(),
                     metrics.violation_bce,
@@ -327,16 +370,6 @@ impl TrainingReporter {
                     examples,
                 ));
             }
-            renderer.update_valid(metric_state(
-                self.metric_ids.count_tanimoto.clone(),
-                count_tanimoto,
-                examples,
-            ));
-            renderer.update_valid(metric_state(
-                self.metric_ids.binary_tanimoto.clone(),
-                binary_tanimoto,
-                examples,
-            ));
             renderer.render_valid(
                 training_progress(
                     self.valid_processed,
@@ -361,8 +394,6 @@ impl TrainingReporter {
                 self.valid_processed,
                 self.valid_total,
                 metrics,
-                count_tanimoto,
-                binary_tanimoto,
             );
         }
 
@@ -442,7 +473,7 @@ impl IndicatifTrainingBars {
         let step_ms = step_time.as_secs_f64() * 1000.0;
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan={:.4} bin_tan={:.4} viol={:.4} viol_mcc={:.3} viol_acc={:.3} data_ms={data_ms:.1} step_ms={step_ms:.1}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} viol={:.4} viol_mcc={:.3} viol_acc={:.3} data_ms={data_ms:.1} step_ms={step_ms:.1}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.reconstruction_bce,
@@ -452,8 +483,10 @@ impl IndicatifTrainingBars {
                 metrics.tanimoto_ranking_mrr,
                 metrics.tanimoto_ranking_pearson,
                 metrics.tanimoto_ranking_spearman,
-                metrics.count_tanimoto,
-                metrics.binary_tanimoto,
+                format_polarity(metrics.count_tanimoto_reconstruction),
+                format_polarity(metrics.count_tanimoto_correction),
+                format_polarity(metrics.binary_tanimoto_reconstruction),
+                format_polarity(metrics.binary_tanimoto_correction),
                 metrics.violation_bce,
                 metrics.violation_mcc,
                 metrics.violation_accuracy,
@@ -463,7 +496,6 @@ impl IndicatifTrainingBars {
     }
 
     /// Renders one validation batch on the indicatif bar.
-    #[allow(clippy::too_many_arguments)]
     fn valid_batch(
         &mut self,
         epoch: usize,
@@ -471,14 +503,12 @@ impl IndicatifTrainingBars {
         processed: usize,
         total: usize,
         metrics: Option<BatchLossMetrics>,
-        count_tanimoto: f32,
-        binary_tanimoto: f32,
     ) {
         let bar = self.phase_bar(ProgressKind::Valid, epoch, epoch_total, total);
         bar.set_position(processed as u64);
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} viol={:.4} viol_mcc={:.3} viol_acc={:.3} count_tan={count_tanimoto:.4} bin_tan={binary_tanimoto:.4}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} viol={:.4} viol_mcc={:.3} viol_acc={:.3}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.reconstruction_bce,
@@ -488,14 +518,16 @@ impl IndicatifTrainingBars {
                 metrics.tanimoto_ranking_mrr,
                 metrics.tanimoto_ranking_pearson,
                 metrics.tanimoto_ranking_spearman,
+                format_polarity(metrics.count_tanimoto_reconstruction),
+                format_polarity(metrics.count_tanimoto_correction),
+                format_polarity(metrics.binary_tanimoto_reconstruction),
+                format_polarity(metrics.binary_tanimoto_correction),
                 metrics.violation_bce,
                 metrics.violation_mcc,
                 metrics.violation_accuracy,
             )),
             None => {
-                bar.set_message(format!(
-                    "count_tan={count_tanimoto:.4} bin_tan={binary_tanimoto:.4}"
-                ));
+                bar.set_message(String::new());
             }
         }
     }
@@ -559,10 +591,14 @@ enum ReporterMetric {
     TanimotoRankingPearson,
     /// Per-anchor Spearman rank correlation for the geometry head.
     TanimotoRankingSpearman,
-    /// Counted-Tanimoto reconstruction quality metric.
-    CountTanimoto,
-    /// Binary-Tanimoto reconstruction quality metric.
-    BinaryTanimoto,
+    /// Counted-Tanimoto quality on positive (reconstruction) rows.
+    CountTanimotoReconstruction,
+    /// Counted-Tanimoto quality on negative (correction) rows.
+    CountTanimotoCorrection,
+    /// Binary-Tanimoto quality on positive (reconstruction) rows.
+    BinaryTanimotoReconstruction,
+    /// Binary-Tanimoto quality on negative (correction) rows.
+    BinaryTanimotoCorrection,
     /// Multi-label violation-classification BCE loss.
     Violation,
     /// Macro-averaged Matthews correlation coefficient over the eight
@@ -575,7 +611,7 @@ enum ReporterMetric {
 
 impl ReporterMetric {
     /// All gauges in the canonical order the reporter renders them.
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 16] = [
         Self::Loss,
         Self::Reconstruction,
         Self::ReconstructionBce,
@@ -585,8 +621,10 @@ impl ReporterMetric {
         Self::TanimotoRankingMrr,
         Self::TanimotoRankingPearson,
         Self::TanimotoRankingSpearman,
-        Self::CountTanimoto,
-        Self::BinaryTanimoto,
+        Self::CountTanimotoReconstruction,
+        Self::CountTanimotoCorrection,
+        Self::BinaryTanimotoReconstruction,
+        Self::BinaryTanimotoCorrection,
         Self::Violation,
         Self::ViolationMcc,
         Self::ViolationAccuracy,
@@ -604,8 +642,10 @@ impl ReporterMetric {
             Self::TanimotoRankingMrr => "Tanimoto Ranking MRR",
             Self::TanimotoRankingPearson => "Tanimoto Ranking Pearson",
             Self::TanimotoRankingSpearman => "Tanimoto Ranking Spearman",
-            Self::CountTanimoto => "Count Tanimoto",
-            Self::BinaryTanimoto => "Binary Tanimoto",
+            Self::CountTanimotoReconstruction => "Count Tanimoto (Reconstruction)",
+            Self::CountTanimotoCorrection => "Count Tanimoto (Correction)",
+            Self::BinaryTanimotoReconstruction => "Binary Tanimoto (Reconstruction)",
+            Self::BinaryTanimotoCorrection => "Binary Tanimoto (Correction)",
             Self::Violation => "Violation BCE",
             Self::ViolationMcc => "Violation MCC",
             Self::ViolationAccuracy => "Violation Accuracy",
@@ -632,8 +672,18 @@ impl ReporterMetric {
             Self::TanimotoRankingSpearman => {
                 "per-anchor Spearman rank correlation between latent cosine logits and Tanimoto scores"
             }
-            Self::CountTanimoto => "counted fingerprint Tanimoto reconstruction metric",
-            Self::BinaryTanimoto => "binary fingerprint Tanimoto reconstruction metric",
+            Self::CountTanimotoReconstruction => {
+                "counted fingerprint Tanimoto over positive (reconstruction) rows"
+            }
+            Self::CountTanimotoCorrection => {
+                "counted fingerprint Tanimoto over negative (correction / denoising) rows"
+            }
+            Self::BinaryTanimotoReconstruction => {
+                "binary fingerprint Tanimoto over positive (reconstruction) rows"
+            }
+            Self::BinaryTanimotoCorrection => {
+                "binary fingerprint Tanimoto over negative (correction / denoising) rows"
+            }
             Self::Violation => "multi-label violation-classifier BCE loss on the latent",
             Self::ViolationMcc => {
                 "macro-averaged Matthews correlation coefficient across the 8 violation classes"
@@ -649,8 +699,10 @@ impl ReporterMetric {
     const fn higher_is_better(self) -> bool {
         matches!(
             self,
-            Self::CountTanimoto
-                | Self::BinaryTanimoto
+            Self::CountTanimotoReconstruction
+                | Self::CountTanimotoCorrection
+                | Self::BinaryTanimotoReconstruction
+                | Self::BinaryTanimotoCorrection
                 | Self::TanimotoRankingAccuracy
                 | Self::TanimotoRankingMrr
                 | Self::TanimotoRankingPearson
@@ -697,10 +749,14 @@ struct ReporterMetricIds {
     tanimoto_ranking_pearson: MetricId,
     /// Metric ID for the Tanimoto ranking Spearman gauge.
     tanimoto_ranking_spearman: MetricId,
-    /// Metric ID for the counted-Tanimoto reconstruction gauge.
-    count_tanimoto: MetricId,
-    /// Metric ID for the binary-Tanimoto reconstruction gauge.
-    binary_tanimoto: MetricId,
+    /// Metric ID for the positive-row counted-Tanimoto gauge.
+    count_tanimoto_reconstruction: MetricId,
+    /// Metric ID for the negative-row counted-Tanimoto gauge.
+    count_tanimoto_correction: MetricId,
+    /// Metric ID for the positive-row binary-Tanimoto gauge.
+    binary_tanimoto_reconstruction: MetricId,
+    /// Metric ID for the negative-row binary-Tanimoto gauge.
+    binary_tanimoto_correction: MetricId,
     /// Metric ID for the multi-label violation-classifier BCE gauge.
     violation: MetricId,
     /// Metric ID for the macro-MCC violation-classifier quality gauge.
@@ -722,8 +778,10 @@ impl ReporterMetricIds {
             tanimoto_ranking_mrr: metric_id(ReporterMetric::TanimotoRankingMrr),
             tanimoto_ranking_pearson: metric_id(ReporterMetric::TanimotoRankingPearson),
             tanimoto_ranking_spearman: metric_id(ReporterMetric::TanimotoRankingSpearman),
-            count_tanimoto: metric_id(ReporterMetric::CountTanimoto),
-            binary_tanimoto: metric_id(ReporterMetric::BinaryTanimoto),
+            count_tanimoto_reconstruction: metric_id(ReporterMetric::CountTanimotoReconstruction),
+            count_tanimoto_correction: metric_id(ReporterMetric::CountTanimotoCorrection),
+            binary_tanimoto_reconstruction: metric_id(ReporterMetric::BinaryTanimotoReconstruction),
+            binary_tanimoto_correction: metric_id(ReporterMetric::BinaryTanimotoCorrection),
             violation: metric_id(ReporterMetric::Violation),
             violation_mcc: metric_id(ReporterMetric::ViolationMcc),
             violation_accuracy: metric_id(ReporterMetric::ViolationAccuracy),
@@ -742,13 +800,25 @@ impl ReporterMetricIds {
             ReporterMetric::TanimotoRankingMrr => self.tanimoto_ranking_mrr.clone(),
             ReporterMetric::TanimotoRankingPearson => self.tanimoto_ranking_pearson.clone(),
             ReporterMetric::TanimotoRankingSpearman => self.tanimoto_ranking_spearman.clone(),
-            ReporterMetric::CountTanimoto => self.count_tanimoto.clone(),
-            ReporterMetric::BinaryTanimoto => self.binary_tanimoto.clone(),
+            ReporterMetric::CountTanimotoReconstruction => {
+                self.count_tanimoto_reconstruction.clone()
+            }
+            ReporterMetric::CountTanimotoCorrection => self.count_tanimoto_correction.clone(),
+            ReporterMetric::BinaryTanimotoReconstruction => {
+                self.binary_tanimoto_reconstruction.clone()
+            }
+            ReporterMetric::BinaryTanimotoCorrection => self.binary_tanimoto_correction.clone(),
             ReporterMetric::Violation => self.violation.clone(),
             ReporterMetric::ViolationMcc => self.violation_mcc.clone(),
             ReporterMetric::ViolationAccuracy => self.violation_accuracy.clone(),
         }
     }
+}
+
+/// Renders an optional polarity-specific Tanimoto mean as a 4-decimal
+/// number, or `n/a` when the batch had no rows of that polarity.
+fn format_polarity(value: Option<f32>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.4}"))
 }
 
 /// Allocates a Burn [`MetricId`] keyed on the gauge's display name.
@@ -866,8 +936,12 @@ mod tests {
             tanimoto_ranking_mrr: 0.6,
             tanimoto_ranking_pearson: 0.4,
             tanimoto_ranking_spearman: 0.45,
-            count_tanimoto: 0.75,
-            binary_tanimoto: 0.80,
+            count_tanimoto_reconstruction: Some(0.75),
+            count_tanimoto_correction: Some(0.32),
+            binary_tanimoto_reconstruction: Some(0.80),
+            binary_tanimoto_correction: Some(0.40),
+            reconstruction_rows: 3,
+            correction_rows: 1,
             violation_bce: 0.07,
             violation_mcc: 0.62,
             violation_accuracy: 0.88,
@@ -924,8 +998,10 @@ mod tests {
         assert!(!ReporterMetric::Descriptors.higher_is_better());
         assert!(!ReporterMetric::TanimotoRanking.higher_is_better());
         assert!(ReporterMetric::TanimotoRankingAccuracy.higher_is_better());
-        assert!(ReporterMetric::CountTanimoto.higher_is_better());
-        assert!(ReporterMetric::BinaryTanimoto.higher_is_better());
+        assert!(ReporterMetric::CountTanimotoReconstruction.higher_is_better());
+        assert!(ReporterMetric::CountTanimotoCorrection.higher_is_better());
+        assert!(ReporterMetric::BinaryTanimotoReconstruction.higher_is_better());
+        assert!(ReporterMetric::BinaryTanimotoCorrection.higher_is_better());
     }
 
     #[test]
@@ -1044,10 +1120,16 @@ mod tests {
         // Repeating the same epoch reuses the bar.
         bars.train_batch(1, 5, 32, 64, None, Duration::ZERO, Duration::ZERO);
         // Switching kinds finishes the train bar and starts the valid one.
-        bars.valid_batch(1, 5, 8, 32, Some(fixture_metrics()), 0.5, 0.6);
-        bars.valid_batch(1, 5, 16, 32, None, 0.5, 0.6);
+        bars.valid_batch(1, 5, 8, 32, Some(fixture_metrics()));
+        bars.valid_batch(1, 5, 16, 32, None);
         bars.finish();
         // A second finish is a no-op.
         bars.finish();
+    }
+
+    #[test]
+    fn format_polarity_renders_some_and_none() {
+        assert_eq!(format_polarity(Some(0.5)), "0.5000");
+        assert_eq!(format_polarity(None), "n/a");
     }
 }

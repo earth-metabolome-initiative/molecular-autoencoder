@@ -38,12 +38,26 @@ pub struct BatchLossMetrics {
     /// Per-anchor Spearman rank correlation, averaged over valid
     /// anchors. Range `[-1, 1]`; higher is better.
     pub tanimoto_ranking_spearman: f32,
-    /// Counted-fingerprint Tanimoto similarity between reconstruction and
-    /// target.
-    pub count_tanimoto: f32,
-    /// Binary-fingerprint Tanimoto similarity between reconstruction and
-    /// target.
-    pub binary_tanimoto: f32,
+    /// Mean counted-fingerprint Tanimoto over the positive (reconstruction)
+    /// rows of the batch. `None` when the batch had no positive rows.
+    pub count_tanimoto_reconstruction: Option<f32>,
+    /// Mean counted-fingerprint Tanimoto over the negative (correction /
+    /// denoising) rows of the batch. `None` when the batch had no
+    /// negative rows.
+    pub count_tanimoto_correction: Option<f32>,
+    /// Mean binary-fingerprint Tanimoto over the positive (reconstruction)
+    /// rows of the batch. `None` when the batch had no positive rows.
+    pub binary_tanimoto_reconstruction: Option<f32>,
+    /// Mean binary-fingerprint Tanimoto over the negative (correction /
+    /// denoising) rows of the batch. `None` when the batch had no
+    /// negative rows.
+    pub binary_tanimoto_correction: Option<f32>,
+    /// Number of positive rows that contributed to the reconstruction
+    /// Tanimoto means.
+    pub reconstruction_rows: usize,
+    /// Number of negative rows that contributed to the correction
+    /// Tanimoto means.
+    pub correction_rows: usize,
     /// Mean multi-label BCE-with-logits between the violation classifier
     /// head and the per-sample [`finge_rs::ViolationLabel`] bitset.
     pub violation_bce: f32,
@@ -58,6 +72,28 @@ pub struct BatchLossMetrics {
     /// violation prediction matches the target bit, averaged over the
     /// flattened `batch * 8` matrix.
     pub violation_accuracy: f32,
+}
+
+/// Polarity-split per-row Tanimoto sums + counts produced backend-side and
+/// flushed through the metrics [`Transaction`] together with the loss
+/// scalars. Each `*_sum` field is the per-row Tanimoto summed over the
+/// matching polarity (positives for `reconstruction`, negatives for
+/// `correction`); dividing by the matching row count yields the mean.
+pub struct TanimotoSplitTensors<B: Backend> {
+    /// Sum of per-row counted Tanimoto over positive (reconstruction) rows.
+    pub count_reconstruction_sum: Tensor<B, 1>,
+    /// Sum of per-row counted Tanimoto over negative (correction) rows.
+    pub count_correction_sum: Tensor<B, 1>,
+    /// Sum of per-row binary Tanimoto over positive (reconstruction) rows.
+    pub binary_reconstruction_sum: Tensor<B, 1>,
+    /// Sum of per-row binary Tanimoto over negative (correction) rows.
+    pub binary_correction_sum: Tensor<B, 1>,
+    /// Number of positive (reconstruction) rows in the batch, as a scalar
+    /// `f32` tensor.
+    pub reconstruction_count: Tensor<B, 1>,
+    /// Number of negative (correction) rows in the batch, as a scalar
+    /// `f32` tensor.
+    pub correction_count: Tensor<B, 1>,
 }
 
 /// Returns `"train"` or `"valid"` for the given split.
@@ -77,12 +113,47 @@ pub const fn should_sample_metrics(batch_index: usize, every: usize) -> bool {
 pub fn loss_metrics<B>(
     loss: Tensor<B, 1>,
     losses: &MoleculeLossBreakdown<B>,
-    count_tanimoto: Tensor<B, 1>,
-    binary_tanimoto: Tensor<B, 1>,
+    tanimoto_split: TanimotoSplitTensors<B>,
 ) -> AppResult<BatchLossMetrics>
 where
     B: Backend<FloatElem = f32>,
 {
+    extract_batch_loss_metrics(loss, losses, tanimoto_split, "training")
+}
+
+/// Computes batch loss metrics for the validation path. Mirrors
+/// [`loss_metrics`] except for the error label.
+pub fn validation_metrics<B>(
+    loss: Tensor<B, 1>,
+    losses: &MoleculeLossBreakdown<B>,
+    tanimoto_split: TanimotoSplitTensors<B>,
+) -> AppResult<BatchLossMetrics>
+where
+    B: Backend<FloatElem = f32>,
+{
+    extract_batch_loss_metrics(loss, losses, tanimoto_split, "validation")
+}
+
+/// Shared body for [`loss_metrics`] / [`validation_metrics`]: registers the
+/// loss + Tanimoto split + diagnostic tensors in a single Transaction,
+/// reads them back, and assembles a [`BatchLossMetrics`].
+fn extract_batch_loss_metrics<B>(
+    loss: Tensor<B, 1>,
+    losses: &MoleculeLossBreakdown<B>,
+    tanimoto_split: TanimotoSplitTensors<B>,
+    phase: &'static str,
+) -> AppResult<BatchLossMetrics>
+where
+    B: Backend<FloatElem = f32>,
+{
+    let TanimotoSplitTensors {
+        count_reconstruction_sum,
+        count_correction_sum,
+        binary_reconstruction_sum,
+        binary_correction_sum,
+        reconstruction_count,
+        correction_count,
+    } = tanimoto_split;
     let diagnostics = &losses.tanimoto_diagnostics;
     let pair_count = diagnostics.pair_count;
     let candidate_count = diagnostics.candidate_count;
@@ -96,8 +167,12 @@ where
         .register(losses.descriptors.clone())
         .register(losses.tanimoto_ranking.clone())
         .register(losses.tanimoto_ranking_accuracy.clone())
-        .register(count_tanimoto)
-        .register(binary_tanimoto)
+        .register(count_reconstruction_sum)
+        .register(count_correction_sum)
+        .register(binary_reconstruction_sum)
+        .register(binary_correction_sum)
+        .register(reconstruction_count)
+        .register(correction_count)
         .register(losses.violation_bce.clone())
         .register(diagnostics.latent_logits.clone())
         .register(diagnostics.candidate_scores.clone())
@@ -106,16 +181,37 @@ where
         .register(violation_diagnostics.logits.clone())
         .register(violation_diagnostics.targets.clone())
         .try_execute()
-        .map_err(|source| invalid_input(format!("failed to read training metrics: {source}")))?;
-    if data.len() != 15 {
+        .map_err(|source| invalid_input(format!("failed to read {phase} metrics: {source}")))?;
+    if data.len() != 19 {
         return Err(invalid_input(format!(
-            "training metrics transaction returned {} tensors instead of 15",
+            "{phase} metrics transaction returned {} tensors instead of 19",
             data.len()
         )));
     }
-    let quality = ranking_quality_from_data(&data[9..13], pair_count, candidate_count)?;
+    let reconstruction_rows = scalar_data_as_count(
+        &data[10],
+        "reconstruction row count",
+    )?;
+    let correction_rows = scalar_data_as_count(&data[11], "correction row count")?;
+    let count_tanimoto_reconstruction = polarity_mean(
+        scalar_data(&data[6], "count Tanimoto reconstruction sum")?,
+        reconstruction_rows,
+    );
+    let count_tanimoto_correction = polarity_mean(
+        scalar_data(&data[7], "count Tanimoto correction sum")?,
+        correction_rows,
+    );
+    let binary_tanimoto_reconstruction = polarity_mean(
+        scalar_data(&data[8], "binary Tanimoto reconstruction sum")?,
+        reconstruction_rows,
+    );
+    let binary_tanimoto_correction = polarity_mean(
+        scalar_data(&data[9], "binary Tanimoto correction sum")?,
+        correction_rows,
+    );
+    let quality = ranking_quality_from_data(&data[13..17], pair_count, candidate_count)?;
     let violation_quality =
-        violation_quality_from_data(&data[13..15], violation_batch, violation_classes)?;
+        violation_quality_from_data(&data[17..19], violation_batch, violation_classes)?;
     Ok(BatchLossMetrics {
         loss: scalar_data(&data[0], "loss")?,
         reconstruction: scalar_data(&data[1], "reconstruction loss")?,
@@ -126,80 +222,26 @@ where
         tanimoto_ranking_mrr: quality.mrr,
         tanimoto_ranking_pearson: quality.pearson,
         tanimoto_ranking_spearman: quality.spearman,
-        count_tanimoto: scalar_data(&data[6], "count Tanimoto")?,
-        binary_tanimoto: scalar_data(&data[7], "binary Tanimoto")?,
-        violation_bce: scalar_data(&data[8], "violation BCE loss")?,
+        count_tanimoto_reconstruction,
+        count_tanimoto_correction,
+        binary_tanimoto_reconstruction,
+        binary_tanimoto_correction,
+        reconstruction_rows,
+        correction_rows,
+        violation_bce: scalar_data(&data[12], "violation BCE loss")?,
         violation_mcc: violation_quality.mcc_macro,
         violation_accuracy: violation_quality.accuracy,
     })
 }
 
-/// Computes batch loss metrics plus the count- and binary-Tanimoto scalars
-/// for validation.
-pub fn validation_metrics<B>(
-    loss: Tensor<B, 1>,
-    losses: &MoleculeLossBreakdown<B>,
-    count_tanimoto: Tensor<B, 1>,
-    binary_tanimoto: Tensor<B, 1>,
-) -> AppResult<(BatchLossMetrics, f32, f32)>
-where
-    B: Backend<FloatElem = f32>,
-{
-    let diagnostics = &losses.tanimoto_diagnostics;
-    let pair_count = diagnostics.pair_count;
-    let candidate_count = diagnostics.candidate_count;
-    let violation_diagnostics = &losses.violation_diagnostics;
-    let violation_batch = violation_diagnostics.batch_size;
-    let violation_classes = violation_diagnostics.class_count;
-    let data = Transaction::default()
-        .register(loss)
-        .register(losses.reconstruction.clone())
-        .register(losses.reconstruction_bce.clone())
-        .register(losses.descriptors.clone())
-        .register(losses.tanimoto_ranking.clone())
-        .register(losses.tanimoto_ranking_accuracy.clone())
-        .register(count_tanimoto)
-        .register(binary_tanimoto)
-        .register(losses.violation_bce.clone())
-        .register(diagnostics.latent_logits.clone())
-        .register(diagnostics.candidate_scores.clone())
-        .register(diagnostics.best_positions.clone().float())
-        .register(diagnostics.valid_mask.clone())
-        .register(violation_diagnostics.logits.clone())
-        .register(violation_diagnostics.targets.clone())
-        .try_execute()
-        .map_err(|source| invalid_input(format!("failed to read validation metrics: {source}")))?;
-    if data.len() != 15 {
-        return Err(invalid_input(format!(
-            "validation metrics transaction returned {} tensors instead of 15",
-            data.len()
-        )));
+/// Returns the polarity-specific Tanimoto mean (`sum / rows`) or `None`
+/// when no rows of that polarity were in the batch.
+fn polarity_mean(sum: f32, rows: usize) -> Option<f32> {
+    if rows == 0 {
+        None
+    } else {
+        Some(sum / rows as f32)
     }
-    let count_tanimoto = scalar_data(&data[6], "count Tanimoto")?;
-    let binary_tanimoto = scalar_data(&data[7], "binary Tanimoto")?;
-    let quality = ranking_quality_from_data(&data[9..13], pair_count, candidate_count)?;
-    let violation_quality =
-        violation_quality_from_data(&data[13..15], violation_batch, violation_classes)?;
-    Ok((
-        BatchLossMetrics {
-            loss: scalar_data(&data[0], "loss")?,
-            reconstruction: scalar_data(&data[1], "reconstruction loss")?,
-            reconstruction_bce: scalar_data(&data[2], "reconstruction BCE loss")?,
-            descriptors: scalar_data(&data[3], "descriptor loss")?,
-            tanimoto_ranking: scalar_data(&data[4], "Tanimoto geometry loss")?,
-            tanimoto_ranking_accuracy: scalar_data(&data[5], "Tanimoto geometry accuracy")?,
-            tanimoto_ranking_mrr: quality.mrr,
-            tanimoto_ranking_pearson: quality.pearson,
-            tanimoto_ranking_spearman: quality.spearman,
-            count_tanimoto,
-            binary_tanimoto,
-            violation_bce: scalar_data(&data[8], "violation BCE loss")?,
-            violation_mcc: violation_quality.mcc_macro,
-            violation_accuracy: violation_quality.accuracy,
-        },
-        count_tanimoto,
-        binary_tanimoto,
-    ))
 }
 
 /// Extracts the violation-classification quality scalars from the
@@ -288,6 +330,25 @@ fn scalar_data(data: &TensorData, label: &str) -> AppResult<f32> {
         .first()
         .copied()
         .ok_or_else(|| invalid_input(format!("{label} tensor did not contain an f32 scalar")))
+}
+
+/// Reads a non-negative `f32` row-count scalar and rounds it to `usize`.
+/// The source tensor is `(1.0 * mask).sum()` so the value is structurally
+/// non-negative and integral up to floating-point rounding error.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "value is a row-count sum produced by (mask).sum() so it is non-negative and within usize range; rounding handles f32 representation noise"
+)]
+fn scalar_data_as_count(data: &TensorData, label: &str) -> AppResult<usize> {
+    Ok(scalar_data(data, label)?.round().max(0.0) as usize)
+}
+
+/// Renders an optional polarity-specific Tanimoto mean as a 6-decimal
+/// number, or `n/a` when the validation pass had no rows of that
+/// polarity. Shared between the single-GPU and DDP epoch print lines.
+pub fn format_summary_metric(value: Option<f32>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.6}"))
 }
 
 /// Examples-per-second helper, returning 0.0 if elapsed is zero.

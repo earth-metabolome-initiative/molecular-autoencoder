@@ -21,7 +21,7 @@ use crate::{
     checkpoint::{CheckpointState, read_state_json, save_checkpoint, shard_infos},
     cli::Args,
     invalid_input,
-    metrics::{examples_per_second, millis_per_batch},
+    metrics::{examples_per_second, format_summary_metric, millis_per_batch},
     preprocess::prepare_manifest,
     ranking::{TanimotoMetricBackend, effective_device_prefetch_batches},
     reporter::TrainingReporter,
@@ -230,9 +230,13 @@ where
                     let valid_loss = valid.mean_loss();
                     if !reporter.is_active() {
                         println!(
-                            "epoch={epoch} valid_loss={valid_loss:.6} valid_count_tanimoto={:.6} valid_binary_tanimoto={:.6} valid_batches={} valid_examples={} valid_data_wait_ms_per_batch={:.3} valid_step_ms_per_batch={:.3}",
-                            valid.mean_count_tanimoto(),
-                            valid.mean_binary_tanimoto(),
+                            "epoch={epoch} valid_loss={valid_loss:.6} valid_count_tanimoto_reconstruction={} valid_count_tanimoto_correction={} valid_binary_tanimoto_reconstruction={} valid_binary_tanimoto_correction={} valid_reconstruction_rows={} valid_correction_rows={} valid_batches={} valid_examples={} valid_data_wait_ms_per_batch={:.3} valid_step_ms_per_batch={:.3}",
+                            format_summary_metric(valid.mean_count_tanimoto_reconstruction()),
+                            format_summary_metric(valid.mean_count_tanimoto_correction()),
+                            format_summary_metric(valid.mean_binary_tanimoto_reconstruction()),
+                            format_summary_metric(valid.mean_binary_tanimoto_correction()),
+                            valid.reconstruction_rows,
+                            valid.correction_rows,
                             valid.batches,
                             valid.examples,
                             millis_per_batch(valid.data_time, valid.batches),

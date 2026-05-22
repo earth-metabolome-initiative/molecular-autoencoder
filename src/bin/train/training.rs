@@ -28,7 +28,10 @@ use crate::{
     cli::Args,
     dataloader::{BatchControl, BatchIterationContext, for_each_batch},
     invalid_input,
-    metrics::{BatchLossMetrics, loss_metrics, should_sample_metrics, validation_metrics},
+    metrics::{
+        BatchLossMetrics, TanimotoSplitTensors, loss_metrics, should_sample_metrics,
+        validation_metrics,
+    },
     ranking::{TanimotoMetricBackend, attach_tanimoto_ranking, tanimoto_ranking_seed},
     reporter::TrainingReporter,
 };
@@ -91,10 +94,22 @@ pub struct EvaluationSummary {
     pub examples: usize,
     /// Sum of per-batch validation loss scalars.
     pub loss_sum: f64,
-    /// Sum of per-batch counted-Tanimoto reconstruction scores.
-    pub count_tanimoto_sum: f64,
-    /// Sum of per-batch binary-Tanimoto reconstruction scores.
-    pub binary_tanimoto_sum: f64,
+    /// Sum of counted-Tanimoto scores over every positive
+    /// (reconstruction) row seen across all batches.
+    pub count_tanimoto_reconstruction_sum: f64,
+    /// Sum of counted-Tanimoto scores over every negative
+    /// (correction / denoising) row seen across all batches.
+    pub count_tanimoto_correction_sum: f64,
+    /// Sum of binary-Tanimoto scores over every positive (reconstruction)
+    /// row seen across all batches.
+    pub binary_tanimoto_reconstruction_sum: f64,
+    /// Sum of binary-Tanimoto scores over every negative (correction)
+    /// row seen across all batches.
+    pub binary_tanimoto_correction_sum: f64,
+    /// Total positive (reconstruction) rows seen across all batches.
+    pub reconstruction_rows: usize,
+    /// Total negative (correction) rows seen across all batches.
+    pub correction_rows: usize,
     /// Cumulative dataloader wait time across validation batches.
     pub data_time: Duration,
     /// Cumulative forward-only step time across validation batches.
@@ -107,8 +122,7 @@ impl EvaluationSummary {
         &mut self,
         examples: usize,
         loss: Option<f32>,
-        count_tanimoto: f32,
-        binary_tanimoto: f32,
+        metrics: &BatchLossMetrics,
         data_time: Duration,
         step_time: Duration,
     ) {
@@ -118,8 +132,22 @@ impl EvaluationSummary {
             self.loss_batches += 1;
             self.loss_sum += f64::from(loss);
         }
-        self.count_tanimoto_sum += f64::from(count_tanimoto);
-        self.binary_tanimoto_sum += f64::from(binary_tanimoto);
+        if let Some(mean) = metrics.count_tanimoto_reconstruction {
+            self.count_tanimoto_reconstruction_sum +=
+                f64::from(mean) * metrics.reconstruction_rows as f64;
+        }
+        if let Some(mean) = metrics.binary_tanimoto_reconstruction {
+            self.binary_tanimoto_reconstruction_sum +=
+                f64::from(mean) * metrics.reconstruction_rows as f64;
+        }
+        if let Some(mean) = metrics.count_tanimoto_correction {
+            self.count_tanimoto_correction_sum += f64::from(mean) * metrics.correction_rows as f64;
+        }
+        if let Some(mean) = metrics.binary_tanimoto_correction {
+            self.binary_tanimoto_correction_sum += f64::from(mean) * metrics.correction_rows as f64;
+        }
+        self.reconstruction_rows += metrics.reconstruction_rows;
+        self.correction_rows += metrics.correction_rows;
         self.data_time += data_time;
         self.step_time += step_time;
     }
@@ -133,22 +161,43 @@ impl EvaluationSummary {
         }
     }
 
-    /// Mean per-batch counted-Tanimoto reconstruction score.
-    pub fn mean_count_tanimoto(self) -> f32 {
-        if self.batches == 0 {
-            0.0
-        } else {
-            (self.count_tanimoto_sum / self.batches as f64) as f32
-        }
+    /// Row-weighted mean counted-Tanimoto over positive (reconstruction)
+    /// rows. Returns `None` when no positive rows were seen.
+    pub fn mean_count_tanimoto_reconstruction(self) -> Option<f32> {
+        weighted_mean(
+            self.count_tanimoto_reconstruction_sum,
+            self.reconstruction_rows,
+        )
     }
 
-    /// Mean per-batch binary-Tanimoto reconstruction score.
-    pub fn mean_binary_tanimoto(self) -> f32 {
-        if self.batches == 0 {
-            0.0
-        } else {
-            (self.binary_tanimoto_sum / self.batches as f64) as f32
-        }
+    /// Row-weighted mean counted-Tanimoto over negative (correction)
+    /// rows. Returns `None` when no negative rows were seen.
+    pub fn mean_count_tanimoto_correction(self) -> Option<f32> {
+        weighted_mean(self.count_tanimoto_correction_sum, self.correction_rows)
+    }
+
+    /// Row-weighted mean binary-Tanimoto over positive (reconstruction)
+    /// rows. Returns `None` when no positive rows were seen.
+    pub fn mean_binary_tanimoto_reconstruction(self) -> Option<f32> {
+        weighted_mean(
+            self.binary_tanimoto_reconstruction_sum,
+            self.reconstruction_rows,
+        )
+    }
+
+    /// Row-weighted mean binary-Tanimoto over negative (correction)
+    /// rows. Returns `None` when no negative rows were seen.
+    pub fn mean_binary_tanimoto_correction(self) -> Option<f32> {
+        weighted_mean(self.binary_tanimoto_correction_sum, self.correction_rows)
+    }
+}
+
+/// `Some(sum / rows)` when `rows > 0`, `None` otherwise.
+fn weighted_mean(sum: f64, rows: usize) -> Option<f32> {
+    if rows == 0 {
+        None
+    } else {
+        Some((sum / rows as f64) as f32)
     }
 }
 
@@ -185,10 +234,6 @@ pub struct ValidBatchPayload {
     pub batch_size: usize,
     /// Sampled loss / accuracy / quality scalars, when sampled.
     pub metrics: Option<BatchLossMetrics>,
-    /// Per-batch counted-Tanimoto reconstruction score.
-    pub count_tanimoto: f32,
-    /// Per-batch binary-Tanimoto reconstruction score.
-    pub binary_tanimoto: f32,
 }
 
 /// Inter-peer message envelope (worker → lead).
@@ -321,8 +366,6 @@ fn forward_valid(
         payload.batch_index,
         payload.batch_size,
         payload.metrics,
-        payload.count_tanimoto,
-        payload.binary_tanimoto,
     );
     if matches!(control, BatchControl::Stop) {
         stop_flag.store(true, Ordering::Release);
@@ -482,8 +525,11 @@ where
             // Reconstruction-quality metrics compare the decoder output
             // to the decoder target (which equals the encoder input on
             // positive rows and the source positive's fingerprint on
-            // negative rows under the denoising framing).
+            // negative rows under the denoising framing). The Tanimoto
+            // means are split by polarity so positive (reconstruction)
+            // and negative (correction) rows are reported separately.
             let fingerprints_for_metrics = sample_metrics.then(|| target_fingerprints.clone());
+            let polarity_for_metrics = sample_metrics.then(|| polarity_mask(&violation_targets));
             let output = current.forward(&fingerprints);
             let reconstructed_for_metrics =
                 sample_metrics.then(|| output.reconstructed_log_counts.clone());
@@ -496,19 +542,18 @@ where
                 violation_targets,
             );
             let loss = losses.total();
-            let batch_metrics = match (fingerprints_for_metrics, reconstructed_for_metrics) {
-                (Some(fingerprints), Some(reconstructed)) => {
-                    let count_tanimoto =
-                        batch_sparse_log_count_tanimoto(&fingerprints, reconstructed.clone())
-                            .mean();
-                    let binary_tanimoto =
-                        batch_sparse_log_count_binary_tanimoto(&fingerprints, reconstructed).mean();
-                    Some(loss_metrics(
-                        loss.clone(),
-                        &losses,
-                        count_tanimoto,
-                        binary_tanimoto,
-                    )?)
+            let batch_metrics = match (
+                fingerprints_for_metrics,
+                reconstructed_for_metrics,
+                polarity_for_metrics,
+            ) {
+                (Some(fingerprints), Some(reconstructed), Some(correction_mask)) => {
+                    let count_per_row =
+                        batch_sparse_log_count_tanimoto(&fingerprints, reconstructed.clone());
+                    let binary_per_row =
+                        batch_sparse_log_count_binary_tanimoto(&fingerprints, reconstructed);
+                    let split = polarity_split(correction_mask, count_per_row, binary_per_row);
+                    Some(loss_metrics(loss.clone(), &losses, split)?)
                 }
                 _ => None,
             };
@@ -605,8 +650,12 @@ where
             let output = model.forward(&fingerprints);
             let reconstructed = output.reconstructed_log_counts.clone();
             // Reconstruction quality is measured against the decoder
-            // target, not the encoder input (denoising framing).
+            // target, not the encoder input (denoising framing). The
+            // Tanimoto means are split by polarity so positives
+            // (reconstruction) and negatives (correction) are reported
+            // separately.
             let fingerprints_for_metrics = target_fingerprints.clone();
+            let correction_mask = polarity_mask(&violation_targets);
             let losses = model.loss_from_output(
                 output,
                 fingerprints,
@@ -616,18 +665,12 @@ where
                 violation_targets,
             );
             let total_loss = losses.total();
-            let count_tanimoto_tensor =
-                batch_sparse_log_count_tanimoto(&fingerprints_for_metrics, reconstructed.clone())
-                    .mean();
-            let binary_tanimoto_tensor =
-                batch_sparse_log_count_binary_tanimoto(&fingerprints_for_metrics, reconstructed)
-                    .mean();
-            let (batch_metrics, count_tanimoto, binary_tanimoto) = validation_metrics(
-                total_loss.clone(),
-                &losses,
-                count_tanimoto_tensor,
-                binary_tanimoto_tensor,
-            )?;
+            let count_per_row =
+                batch_sparse_log_count_tanimoto(&fingerprints_for_metrics, reconstructed.clone());
+            let binary_per_row =
+                batch_sparse_log_count_binary_tanimoto(&fingerprints_for_metrics, reconstructed);
+            let split = polarity_split(correction_mask, count_per_row, binary_per_row);
+            let batch_metrics = validation_metrics(total_loss.clone(), &losses, split)?;
             if !batch_metrics.loss.is_finite() {
                 return Err(invalid_input("non-finite validation loss"));
             }
@@ -635,8 +678,7 @@ where
             summary.record(
                 rows,
                 Some(batch_metrics.loss),
-                count_tanimoto,
-                binary_tanimoto,
+                &batch_metrics,
                 data_time,
                 step_time,
             );
@@ -646,8 +688,6 @@ where
                 batch_index: summary.batches,
                 batch_size: rows,
                 metrics: Some(batch_metrics),
-                count_tanimoto,
-                binary_tanimoto,
             }))
         },
     )?;
@@ -696,6 +736,50 @@ where
     B: AutodiffBackend<FloatElem = f32>,
 {
     Ok(grads)
+}
+
+/// Returns a `[batch]` mask that is `1.0` on negative (correction)
+/// rows and `0.0` on positive (reconstruction) rows.
+///
+/// Polarity is derived from `violation_targets`, the multi-hot
+/// `[batch, 8]` matrix expanded from each sample's
+/// `finge_rs::ViolationLabel` bitset: a row is a negative iff any
+/// violation class bit is set.
+fn polarity_mask<B: Backend>(violation_targets: &Tensor<B, 2>) -> Tensor<B, 1> {
+    violation_targets
+        .clone()
+        .sum_dim(1)
+        .squeeze_dim(1)
+        .greater_elem(0.0)
+        .float()
+}
+
+/// Splits the per-row count- and binary-Tanimoto vectors into
+/// polarity-specific sums and row counts, ready to be flushed through
+/// the metrics [`Transaction`].
+///
+/// `correction_mask` carries `1.0` on negative rows and `0.0` on
+/// positive rows (the convention used by [`polarity_mask`]).
+fn polarity_split<B: Backend>(
+    correction_mask: Tensor<B, 1>,
+    count_per_row: Tensor<B, 1>,
+    binary_per_row: Tensor<B, 1>,
+) -> TanimotoSplitTensors<B> {
+    let reconstruction_mask = correction_mask.clone() * -1.0 + 1.0;
+    let reconstruction_count = reconstruction_mask.clone().sum();
+    let correction_count = correction_mask.clone().sum();
+    let count_reconstruction_sum = (count_per_row.clone() * reconstruction_mask.clone()).sum();
+    let count_correction_sum = (count_per_row * correction_mask.clone()).sum();
+    let binary_reconstruction_sum = (binary_per_row.clone() * reconstruction_mask).sum();
+    let binary_correction_sum = (binary_per_row * correction_mask).sum();
+    TanimotoSplitTensors {
+        count_reconstruction_sum,
+        count_correction_sum,
+        binary_reconstruction_sum,
+        binary_correction_sum,
+        reconstruction_count,
+        correction_count,
+    }
 }
 
 #[cfg(test)]
@@ -938,8 +1022,19 @@ mod tests {
 
         assert!(summary.batches >= 1);
         assert!(summary.mean_loss().is_finite());
-        assert!((0.0..=1.0).contains(&summary.mean_count_tanimoto()));
-        assert!((0.0..=1.0).contains(&summary.mean_binary_tanimoto()));
+        // The default fixture shard only has positive rows so the
+        // reconstruction polarity should always be populated and the
+        // correction polarity should always be absent.
+        let count_reconstruction = summary
+            .mean_count_tanimoto_reconstruction()
+            .expect("reconstruction Tanimoto should be set on positive-only fixture");
+        let binary_reconstruction = summary
+            .mean_binary_tanimoto_reconstruction()
+            .expect("binary reconstruction Tanimoto should be set on positive-only fixture");
+        assert!((0.0..=1.0).contains(&count_reconstruction));
+        assert!((0.0..=1.0).contains(&binary_reconstruction));
+        assert!(summary.mean_count_tanimoto_correction().is_none());
+        assert!(summary.mean_binary_tanimoto_correction().is_none());
     }
 
     #[test]
@@ -978,33 +1073,87 @@ mod tests {
     fn evaluation_summary_means_handle_zero_batches() {
         let summary = EvaluationSummary::default();
         assert_eq!(summary.mean_loss(), 0.0);
-        assert_eq!(summary.mean_count_tanimoto(), 0.0);
-        assert_eq!(summary.mean_binary_tanimoto(), 0.0);
+        assert!(summary.mean_count_tanimoto_reconstruction().is_none());
+        assert!(summary.mean_binary_tanimoto_reconstruction().is_none());
+        assert!(summary.mean_count_tanimoto_correction().is_none());
+        assert!(summary.mean_binary_tanimoto_correction().is_none());
+    }
+
+    fn fixture_batch_metrics(
+        loss: f32,
+        count_reconstruction: Option<f32>,
+        binary_reconstruction: Option<f32>,
+        count_correction: Option<f32>,
+        binary_correction: Option<f32>,
+        reconstruction_rows: usize,
+        correction_rows: usize,
+    ) -> BatchLossMetrics {
+        BatchLossMetrics {
+            loss,
+            reconstruction: 0.0,
+            reconstruction_bce: 0.0,
+            descriptors: 0.0,
+            tanimoto_ranking: 0.0,
+            tanimoto_ranking_accuracy: 0.0,
+            tanimoto_ranking_mrr: 0.0,
+            tanimoto_ranking_pearson: 0.0,
+            tanimoto_ranking_spearman: 0.0,
+            count_tanimoto_reconstruction: count_reconstruction,
+            count_tanimoto_correction: count_correction,
+            binary_tanimoto_reconstruction: binary_reconstruction,
+            binary_tanimoto_correction: binary_correction,
+            reconstruction_rows,
+            correction_rows,
+            violation_bce: 0.0,
+            violation_mcc: 0.0,
+            violation_accuracy: 0.0,
+        }
     }
 
     #[test]
     fn evaluation_summary_aggregates_loss_and_tanimoto() {
         let mut summary = EvaluationSummary::default();
+        // First batch: 3 positives + 1 negative. Per-polarity means
+        // collapse to the per-row Tanimoto on the corresponding rows.
         summary.record(
             4,
             Some(0.3),
-            0.8,
-            0.7,
+            &fixture_batch_metrics(0.3, Some(0.8), Some(0.7), Some(0.4), Some(0.3), 3, 1),
             Duration::from_millis(1),
             Duration::from_millis(2),
         );
+        // Second batch: 2 positives + 2 negatives.
         summary.record(
             4,
             Some(0.5),
-            0.6,
-            0.5,
+            &fixture_batch_metrics(0.5, Some(0.6), Some(0.5), Some(0.2), Some(0.1), 2, 2),
             Duration::from_millis(1),
             Duration::from_millis(2),
         );
         assert_eq!(summary.batches, 2);
+        assert_eq!(summary.reconstruction_rows, 5);
+        assert_eq!(summary.correction_rows, 3);
         assert!((summary.mean_loss() - 0.4).abs() < 1.0e-6);
-        assert!((summary.mean_count_tanimoto() - 0.7).abs() < 1.0e-6);
-        assert!((summary.mean_binary_tanimoto() - 0.6).abs() < 1.0e-6);
+        // Row-weighted means: positives = (0.8*3 + 0.6*2) / 5 = 0.72,
+        // negatives = (0.4*1 + 0.2*2) / 3 ≈ 0.2666667.
+        let count_reconstruction = summary
+            .mean_count_tanimoto_reconstruction()
+            .expect("positives present");
+        let count_correction = summary
+            .mean_count_tanimoto_correction()
+            .expect("negatives present");
+        let binary_reconstruction = summary
+            .mean_binary_tanimoto_reconstruction()
+            .expect("positives present");
+        let binary_correction = summary
+            .mean_binary_tanimoto_correction()
+            .expect("negatives present");
+        assert!((count_reconstruction - 0.72).abs() < 1.0e-6);
+        assert!((count_correction - ((0.4 + 0.4) / 3.0)).abs() < 1.0e-6);
+        // binary positives = (0.7*3 + 0.5*2) / 5 = 0.62
+        assert!((binary_reconstruction - 0.62).abs() < 1.0e-6);
+        // binary negatives = (0.3*1 + 0.1*2) / 3 ≈ 0.1666667
+        assert!((binary_correction - ((0.3 + 0.2) / 3.0)).abs() < 1.0e-6);
     }
 
     #[test]
@@ -1030,8 +1179,6 @@ mod tests {
             batch_index: 1,
             batch_size: 2,
             metrics: None,
-            count_tanimoto: 0.5,
-            binary_tanimoto: 0.4,
         };
         assert!(matches!(
             sink.train_batch(train_payload),
@@ -1086,8 +1233,6 @@ mod tests {
             batch_index: 1,
             batch_size: 2,
             metrics: None,
-            count_tanimoto: 0.3,
-            binary_tanimoto: 0.4,
         }))
         .expect("send valid");
         tx.send(BatchUpdate::TrainEpochComplete)
