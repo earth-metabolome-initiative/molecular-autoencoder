@@ -364,6 +364,22 @@ pub struct Args {
     /// `--reconstruction-loss huber`.
     #[arg(long, default_value_t = DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT)]
     pub reconstruction_poisson_max_log_count: f64,
+
+    /// Optional curriculum warmup: when set, the model is trained under
+    /// this reconstruction loss kind for the first
+    /// `--reconstruction-loss-warmup-epochs` epochs before swapping to
+    /// `--reconstruction-loss` for the rest of the run. Omit (or pair
+    /// with `--reconstruction-loss-warmup-epochs 0`) to disable the
+    /// warmup phase.
+    #[arg(long, value_enum)]
+    pub reconstruction_loss_warmup: Option<ReconstructionLossKindArg>,
+
+    /// Number of epochs to spend under
+    /// `--reconstruction-loss-warmup` before swapping to the main
+    /// `--reconstruction-loss`. `0` (default) disables the warmup
+    /// phase; ignored when `--reconstruction-loss-warmup` is unset.
+    #[arg(long, default_value_t = 0)]
+    pub reconstruction_loss_warmup_epochs: usize,
 }
 
 /// CLI mirror of [`molecular_autoencoder::ReconstructionLossKind`]
@@ -413,6 +429,19 @@ impl From<TanimotoLossKindArg> for TanimotoLossKind {
 }
 
 impl Args {
+    /// Resolves the active reconstruction-loss kind for a given
+    /// 1-based training epoch, honouring the
+    /// `--reconstruction-loss-warmup` curriculum.
+    ///
+    /// Falls back to `--reconstruction-loss` when the warmup variant is
+    /// unset or the warmup window has elapsed.
+    pub fn reconstruction_loss_kind_for_epoch(&self, epoch: usize) -> ReconstructionLossKind {
+        match self.reconstruction_loss_warmup {
+            Some(warmup) if epoch <= self.reconstruction_loss_warmup_epochs => warmup.into(),
+            _ => self.reconstruction_loss.into(),
+        }
+    }
+
     /// Resolves the manifest path and source selection from the raw flags.
     pub fn manifest_paths(&self) -> AppResult<ResolvedPaths> {
         let shards_path = self.shards.clone();
@@ -876,5 +905,62 @@ mod tests {
         assert!(positive_u8("0").is_err());
         assert_eq!(positive_u8("3").expect("nonzero"), 3);
         assert!(positive_u8("not-a-number").is_err());
+    }
+
+    #[test]
+    fn reconstruction_loss_warmup_schedules_kind_switch_at_boundary() {
+        let args = Args::try_parse_from([
+            "train",
+            "shards",
+            "checkpoints",
+            "--reconstruction-loss",
+            "huber",
+            "--reconstruction-loss-warmup",
+            "huber-symmetric",
+            "--reconstruction-loss-warmup-epochs",
+            "2",
+        ])
+        .expect("parse warmup args");
+        // First two epochs run under the warmup kind, then the loop
+        // swaps to the main kind from epoch 3 onward.
+        assert_eq!(
+            args.reconstruction_loss_kind_for_epoch(1),
+            ReconstructionLossKind::HuberSymmetric
+        );
+        assert_eq!(
+            args.reconstruction_loss_kind_for_epoch(2),
+            ReconstructionLossKind::HuberSymmetric
+        );
+        assert_eq!(
+            args.reconstruction_loss_kind_for_epoch(3),
+            ReconstructionLossKind::Huber
+        );
+        assert_eq!(
+            args.reconstruction_loss_kind_for_epoch(100),
+            ReconstructionLossKind::Huber
+        );
+    }
+
+    #[test]
+    fn reconstruction_loss_warmup_disabled_when_warmup_kind_unset() {
+        let args = Args::try_parse_from([
+            "train",
+            "shards",
+            "checkpoints",
+            "--reconstruction-loss",
+            "poisson",
+            "--reconstruction-loss-warmup-epochs",
+            "5",
+        ])
+        .expect("parse args without warmup kind");
+        // Setting only the epoch count is a no-op without a warmup kind.
+        assert_eq!(
+            args.reconstruction_loss_kind_for_epoch(1),
+            ReconstructionLossKind::Poisson
+        );
+        assert_eq!(
+            args.reconstruction_loss_kind_for_epoch(6),
+            ReconstructionLossKind::Poisson
+        );
     }
 }

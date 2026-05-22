@@ -335,6 +335,10 @@ where
     let mut state = initial_state;
 
     for epoch in (state.completed_epoch + 1)..=args.epochs {
+        let epoch_kind = args.reconstruction_loss_kind_for_epoch(epoch);
+        if model.reconstruction_loss_kind() != epoch_kind {
+            model.set_reconstruction_loss_kind(epoch_kind);
+        }
         let sink = BatchSink::Worker {
             tx: batch_tx.clone(),
             stop_flag: stop_flag.clone(),
@@ -493,6 +497,15 @@ where
     let workers = world_size.saturating_sub(1) as usize;
 
     for epoch in (state.completed_epoch + 1)..=args.epochs {
+        let epoch_kind = args.reconstruction_loss_kind_for_epoch(epoch);
+        if model.reconstruction_loss_kind() != epoch_kind {
+            println!(
+                "reconstruction_loss_kind_swap epoch={epoch} from={:?} to={:?}",
+                model.reconstruction_loss_kind(),
+                epoch_kind,
+            );
+            model.set_reconstruction_loss_kind(epoch_kind);
+        }
         let epoch_start = Instant::now();
         let (next_model, summary) = train_epoch(
             model,

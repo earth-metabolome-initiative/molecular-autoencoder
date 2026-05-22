@@ -127,7 +127,7 @@ where
         args.loader_profile_every
     };
     println!(
-        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_latent_temperature={} tanimoto_ranking_metric_temperature={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={} tanimoto_ranking_loss={:?} tanimoto_ranking_softrank_temperature={} reconstruction_loss={:?} reconstruction_poisson_max_log_count={} bce_weight={} bce_zero_weight={} bce_nonzero_weight={}",
+        "training manifest={} shards={} checkpoint_dir={} start_epoch={} epochs={} batch_size={} loader_workers={} device_prefetch_batches={} requested_device_prefetch_batches={} metric_every={} loader_profile_every={} lr={} latent_noise_std={} descriptor_weight={} tanimoto_ranking_weight={} tanimoto_ranking_latent_temperature={} tanimoto_ranking_metric_temperature={} tanimoto_ranking_min_gap={} tanimoto_ranking_candidates={} tanimoto_ranking_pairs_per_batch={} tanimoto_ranking_loss={:?} tanimoto_ranking_softrank_temperature={} reconstruction_loss={:?} reconstruction_loss_warmup={:?} reconstruction_loss_warmup_epochs={} reconstruction_poisson_max_log_count={} bce_weight={} bce_zero_weight={} bce_nonzero_weight={}",
         manifest_path.display(),
         shards.len(),
         args.checkpoint_dir.display(),
@@ -151,6 +151,8 @@ where
         tanimoto_ranking.loss_kind(),
         tanimoto_ranking.softrank_temperature(),
         model_config.reconstruction_loss().loss_kind(),
+        args.reconstruction_loss_warmup,
+        args.reconstruction_loss_warmup_epochs,
         model_config.reconstruction_loss().poisson_max_log_count(),
         model_config.reconstruction_loss().bce_weight(),
         model_config.reconstruction_loss().bce_zero_weight(),
@@ -160,6 +162,19 @@ where
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     for epoch in (state.completed_epoch + 1)..=args.epochs {
+        // Reconstruction-loss curriculum: epochs in the warmup window
+        // run under the warmup kind, then the loop swaps to the main
+        // kind. Recomputed per epoch so `--resume` lands on the right
+        // kind based on `state.completed_epoch`.
+        let epoch_kind = args.reconstruction_loss_kind_for_epoch(epoch);
+        if model.reconstruction_loss_kind() != epoch_kind {
+            println!(
+                "reconstruction_loss_kind_swap epoch={epoch} from={:?} to={:?}",
+                model.reconstruction_loss_kind(),
+                epoch_kind,
+            );
+            model.set_reconstruction_loss_kind(epoch_kind);
+        }
         let epoch_start = Instant::now();
         let (next_model, summary) = train_epoch(
             model,

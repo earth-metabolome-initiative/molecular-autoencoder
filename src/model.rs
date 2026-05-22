@@ -2052,6 +2052,16 @@ impl<B: Backend> MoleculeAutoencoder<B> {
         self.reconstruction_loss_kind
     }
 
+    /// Swaps the active reconstruction loss kind in place. Used by the
+    /// train binary's curriculum scheduler to transition from a warmup
+    /// kind (e.g. `HuberSymmetric`) to a main kind (e.g. `Huber` with
+    /// BCE) after a configurable number of epochs. Only the flat scalar
+    /// field is mutated; no tensor parameters are touched, so this is
+    /// safe to call between epochs.
+    pub const fn set_reconstruction_loss_kind(&mut self, kind: ReconstructionLossKind) {
+        self.reconstruction_loss_kind = kind;
+    }
+
     /// Runs the full autoencoder from sparse counted fingerprints.
     pub fn forward(
         &self,
