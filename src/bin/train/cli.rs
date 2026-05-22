@@ -7,10 +7,11 @@ use molecular_autoencoder::{
     DEFAULT_BCE_NONZERO_WEIGHT, DEFAULT_BCE_WEIGHT, DEFAULT_BCE_ZERO_WEIGHT,
     DEFAULT_DESCRIPTOR_WEIGHT, DEFAULT_ECFP_RADIUS, DEFAULT_HIDDEN_WIDTHS,
     DEFAULT_LATENT_NOISE_STD, DEFAULT_LATENT_WIDTH, DEFAULT_NEGATIVES_PER_POSITIVE,
-    DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR, DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE,
-    DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_MIN_GAP,
-    DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH, DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE,
-    DEFAULT_TANIMOTO_RANKING_WEIGHT, DEFAULT_VIOLATION_WEIGHT, MoleculeAutoencoderConfig,
+    DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT, DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
+    DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE,
+    DEFAULT_TANIMOTO_RANKING_MIN_GAP, DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
+    DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_WEIGHT,
+    DEFAULT_VIOLATION_WEIGHT, MoleculeAutoencoderConfig, ReconstructionLossKind,
     SmilesQualityFilter, TanimotoLossKind,
 };
 
@@ -348,6 +349,42 @@ pub struct Args {
     /// (ignored when `--tanimoto-ranking-loss` is `softmax-ce`).
     #[arg(long, default_value_t = DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE)]
     pub tanimoto_ranking_softrank_temperature: f64,
+
+    /// Reconstruction loss kind. `huber` is the shipping baseline
+    /// (weighted Huber on `log1p(count)` plus the auxiliary bit-presence
+    /// BCE term); `poisson` swaps in Poisson NLL on raw counts, which
+    /// structurally avoids the "predict zero everywhere" trivial
+    /// minimum the one-sided Huber + one-sided BCE pair invites.
+    #[arg(long, value_enum, default_value_t = ReconstructionLossKindArg::Huber)]
+    pub reconstruction_loss: ReconstructionLossKindArg,
+
+    /// Clamp ceiling applied to predicted log-rates before `exp` inside
+    /// the Poisson NLL branch. Prevents an early-training logit spike
+    /// from overflowing `f32` in `exp(z)`. Ignored under
+    /// `--reconstruction-loss huber`.
+    #[arg(long, default_value_t = DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT)]
+    pub reconstruction_poisson_max_log_count: f64,
+}
+
+/// CLI mirror of [`molecular_autoencoder::ReconstructionLossKind`]
+/// derived as [`clap::ValueEnum`] so the library does not need a
+/// `clap` dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ReconstructionLossKindArg {
+    /// Weighted Huber on `log1p(count)` (with the auxiliary BCE term).
+    Huber,
+    /// Poisson NLL on raw counts (model output reinterpreted as
+    /// `log(rate)`).
+    Poisson,
+}
+
+impl From<ReconstructionLossKindArg> for ReconstructionLossKind {
+    fn from(value: ReconstructionLossKindArg) -> Self {
+        match value {
+            ReconstructionLossKindArg::Huber => Self::Huber,
+            ReconstructionLossKindArg::Poisson => Self::Poisson,
+        }
+    }
 }
 
 /// CLI mirror of [`molecular_autoencoder::TanimotoLossKind`] derived as
@@ -472,6 +509,8 @@ impl Args {
             .bce_weight(self.bce_weight)
             .bce_zero_weight(self.bce_zero_weight)
             .bce_nonzero_weight(self.bce_nonzero_weight)
+            .reconstruction_loss_kind(self.reconstruction_loss.into())
+            .reconstruction_poisson_max_log_count(self.reconstruction_poisson_max_log_count)
             .build()
             .map_err(Into::into)
     }

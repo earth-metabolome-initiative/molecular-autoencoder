@@ -87,6 +87,40 @@ pub const DEFAULT_BCE_ZERO_WEIGHT: f64 = 4.0;
 /// Default per-position weight applied to active bins inside the BCE term.
 pub const DEFAULT_BCE_NONZERO_WEIGHT: f64 = 1.0;
 
+/// Default clamp ceiling applied to predicted log-rates before the
+/// `exp` step inside the Poisson NLL reconstruction loss.
+///
+/// `exp(20) ≈ 4.85e8` is well within `f32` range even when summed across
+/// `[batch=10240, width=4096]` cells (≈ 2e16 worst case), but it is high
+/// enough that the optimizer can drive z anywhere a sensible learned
+/// log-rate would land for typical small-integer ECFP counts. Real
+/// training settles deep into the negatives at inactive bins and within
+/// `[0, log(small_int)]` at active bins, so the clamp only fires on
+/// pathological early-training spikes.
+pub const DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT: f64 = 20.0;
+
+/// Selectable reconstruction loss kind.
+///
+/// Switches between the existing weighted Huber on `log1p(count)` (with
+/// the auxiliary bit-presence BCE term) and a Poisson NLL on the raw
+/// counts. Under Poisson the model output is reinterpreted as
+/// `log(rate)`; the metric path applies `softplus` before decoding so
+/// the existing Tanimoto helpers (which expect `log1p(count)`) stay
+/// numerically equivalent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReconstructionLossKind {
+    /// Weighted Huber on `log1p(count)` (with the auxiliary bit-presence
+    /// BCE term applied alongside per `bce_weight`). Shipping baseline.
+    #[default]
+    Huber,
+    /// Poisson NLL on raw counts (`exp(z) - count · z` per cell, averaged
+    /// over `batch × width`). No `bce_*` knobs apply (Poisson already
+    /// handles both presence and magnitude); `--bce-weight 0` is the
+    /// natural pairing to keep the BCE term out of the total loss.
+    Poisson,
+}
+
 // Serde requires `#[serde(default = "fn")]` to point at a callable, not a
 // `const`, so these tiny shim fns exist solely so deserializers can default
 // missing JSON fields. Their bodies must stay in sync with the public consts
@@ -174,6 +208,18 @@ const fn default_bce_zero_weight() -> f64 {
 /// Serde fallback for the active-bin BCE per-position weight.
 const fn default_bce_nonzero_weight() -> f64 {
     DEFAULT_BCE_NONZERO_WEIGHT
+}
+
+/// Serde fallback for the reconstruction loss kind. Returns the
+/// shipping baseline (`Huber`) so old configs deserialise to the
+/// existing behaviour.
+const fn default_reconstruction_loss_kind() -> ReconstructionLossKind {
+    ReconstructionLossKind::Huber
+}
+
+/// Serde fallback for the Poisson clamp ceiling.
+const fn default_reconstruction_poisson_max_log_count() -> f64 {
+    DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT
 }
 
 /// Encoder model configuration. Construct via [`EncoderConfig::builder`].
@@ -491,6 +537,14 @@ pub struct ReconstructionLossConfig {
     /// Per-position weight applied to active bins inside the BCE term.
     #[serde(default = "default_bce_nonzero_weight")]
     bce_nonzero_weight: f64,
+    /// Which reconstruction-loss kind the training loop should optimise.
+    /// Defaults to the shipping Huber baseline.
+    #[serde(default = "default_reconstruction_loss_kind")]
+    loss_kind: ReconstructionLossKind,
+    /// Clamp ceiling applied to predicted log-rates before `exp` inside
+    /// the Poisson NLL branch. Ignored under [`ReconstructionLossKind::Huber`].
+    #[serde(default = "default_reconstruction_poisson_max_log_count")]
+    poisson_max_log_count: f64,
 }
 
 impl Default for ReconstructionLossConfig {
@@ -544,6 +598,19 @@ impl ReconstructionLossConfig {
     pub const fn bce_nonzero_weight(&self) -> f64 {
         self.bce_nonzero_weight
     }
+
+    /// Active reconstruction loss kind.
+    #[must_use]
+    pub const fn loss_kind(&self) -> ReconstructionLossKind {
+        self.loss_kind
+    }
+
+    /// Clamp ceiling applied to predicted log-rates before `exp` in the
+    /// Poisson branch.
+    #[must_use]
+    pub const fn poisson_max_log_count(&self) -> f64 {
+        self.poisson_max_log_count
+    }
 }
 
 /// Fluent builder for [`ReconstructionLossConfig`].
@@ -561,6 +628,10 @@ pub struct ReconstructionLossConfigBuilder {
     bce_zero_weight: f64,
     /// Pending per-position BCE weight for active bins.
     bce_nonzero_weight: f64,
+    /// Pending reconstruction loss kind.
+    loss_kind: ReconstructionLossKind,
+    /// Pending Poisson NLL exp clamp ceiling.
+    poisson_max_log_count: f64,
 }
 
 impl Default for ReconstructionLossConfigBuilder {
@@ -580,6 +651,8 @@ impl ReconstructionLossConfigBuilder {
             bce_weight: DEFAULT_BCE_WEIGHT,
             bce_zero_weight: DEFAULT_BCE_ZERO_WEIGHT,
             bce_nonzero_weight: DEFAULT_BCE_NONZERO_WEIGHT,
+            loss_kind: ReconstructionLossKind::Huber,
+            poisson_max_log_count: DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT,
         }
     }
 
@@ -625,6 +698,21 @@ impl ReconstructionLossConfigBuilder {
         self
     }
 
+    /// Sets the reconstruction loss kind (Huber baseline vs Poisson NLL).
+    #[must_use]
+    pub const fn loss_kind(mut self, value: ReconstructionLossKind) -> Self {
+        self.loss_kind = value;
+        self
+    }
+
+    /// Sets the clamp ceiling applied to predicted log-rates before
+    /// `exp` in the Poisson branch.
+    #[must_use]
+    pub const fn poisson_max_log_count(mut self, value: f64) -> Self {
+        self.poisson_max_log_count = value;
+        self
+    }
+
     /// Validates and builds the immutable [`ReconstructionLossConfig`].
     ///
     /// # Errors
@@ -653,6 +741,14 @@ impl ReconstructionLossConfigBuilder {
                 });
             }
         }
+        if !self.poisson_max_log_count.is_finite() || self.poisson_max_log_count <= 0.0 {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "poisson_max_log_count must be positive and finite, got {}",
+                    self.poisson_max_log_count
+                ),
+            });
+        }
         Ok(ReconstructionLossConfig {
             beta: self.beta,
             zero_weight: self.zero_weight,
@@ -660,6 +756,8 @@ impl ReconstructionLossConfigBuilder {
             bce_weight: self.bce_weight,
             bce_zero_weight: self.bce_zero_weight,
             bce_nonzero_weight: self.bce_nonzero_weight,
+            loss_kind: self.loss_kind,
+            poisson_max_log_count: self.poisson_max_log_count,
         })
     }
 }
@@ -1405,6 +1503,8 @@ impl MoleculeAutoencoderConfig {
             bce_weight: self.reconstruction_loss.bce_weight,
             bce_zero_weight: self.reconstruction_loss.bce_zero_weight,
             bce_nonzero_weight: self.reconstruction_loss.bce_nonzero_weight,
+            reconstruction_loss_kind: self.reconstruction_loss.loss_kind,
+            reconstruction_poisson_max_log_count: self.reconstruction_loss.poisson_max_log_count,
             descriptor_weight: self.auxiliary_weights.descriptors,
             tanimoto_ranking_weight: self.auxiliary_weights.tanimoto_ranking,
             violation_weight: self.auxiliary_weights.violation,
@@ -1472,6 +1572,11 @@ pub struct MoleculeAutoencoderConfigBuilder {
     tanimoto_ranking_loss_kind: TanimotoLossKind,
     /// SoftRank Spearman surrogate temperature.
     tanimoto_ranking_softrank_temperature: f64,
+    /// Reconstruction loss kind (Huber baseline vs Poisson NLL).
+    reconstruction_loss_kind: ReconstructionLossKind,
+    /// Clamp ceiling applied to predicted log-rates inside the Poisson
+    /// branch.
+    reconstruction_poisson_max_log_count: f64,
 }
 
 impl Default for MoleculeAutoencoderConfigBuilder {
@@ -1503,6 +1608,8 @@ impl MoleculeAutoencoderConfigBuilder {
             bce_nonzero_weight: DEFAULT_BCE_NONZERO_WEIGHT,
             tanimoto_ranking_loss_kind: TanimotoLossKind::SoftmaxCe,
             tanimoto_ranking_softrank_temperature: DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE,
+            reconstruction_loss_kind: ReconstructionLossKind::Huber,
+            reconstruction_poisson_max_log_count: DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT,
         }
     }
 
@@ -1605,6 +1712,22 @@ impl MoleculeAutoencoderConfigBuilder {
         self
     }
 
+    /// Sets the reconstruction loss kind (Huber baseline vs Poisson NLL).
+    #[must_use]
+    pub const fn reconstruction_loss_kind(mut self, value: ReconstructionLossKind) -> Self {
+        self.reconstruction_loss_kind = value;
+        self
+    }
+
+    /// Sets the Poisson NLL exp clamp ceiling. Ignored when
+    /// [`Self::reconstruction_loss_kind`] is
+    /// [`ReconstructionLossKind::Huber`].
+    #[must_use]
+    pub const fn reconstruction_poisson_max_log_count(mut self, value: f64) -> Self {
+        self.reconstruction_poisson_max_log_count = value;
+        self
+    }
+
     /// Sets the Morgan/ECFP radius the cached fingerprints were built with.
     #[must_use]
     pub const fn ecfp_radius(mut self, value: u8) -> Self {
@@ -1661,6 +1784,8 @@ impl MoleculeAutoencoderConfigBuilder {
                 .bce_weight(self.bce_weight)
                 .bce_zero_weight(self.bce_zero_weight)
                 .bce_nonzero_weight(self.bce_nonzero_weight)
+                .loss_kind(self.reconstruction_loss_kind)
+                .poisson_max_log_count(self.reconstruction_poisson_max_log_count)
                 .build()?,
             auxiliary_weights: AuxiliaryLossWeights {
                 descriptors: self.descriptor_weight,
@@ -1875,6 +2000,14 @@ pub struct MoleculeAutoencoder<B: Backend> {
     /// SoftRank Spearman surrogate temperature; ignored under
     /// [`TanimotoLossKind::SoftmaxCe`].
     tanimoto_ranking_softrank_temperature: f64,
+    /// Active reconstruction loss kind (Huber baseline vs Poisson NLL).
+    /// Stored on the module so the forward path can dispatch without
+    /// re-reading the model config.
+    reconstruction_loss_kind: ReconstructionLossKind,
+    /// Clamp ceiling applied to predicted log-rates before `exp` in the
+    /// Poisson branch; ignored under
+    /// [`ReconstructionLossKind::Huber`].
+    reconstruction_poisson_max_log_count: f64,
     /// Standard deviation of the Gaussian noise injected into the
     /// decoder-side latent at training time.
     latent_noise_std: f64,
@@ -1892,7 +2025,17 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             bce_weight: self.bce_weight,
             bce_zero_weight: self.bce_zero_weight,
             bce_nonzero_weight: self.bce_nonzero_weight,
+            loss_kind: self.reconstruction_loss_kind,
+            poisson_max_log_count: self.reconstruction_poisson_max_log_count,
         }
+    }
+
+    /// Active reconstruction loss kind. Exposed so the train binary's
+    /// metric path can adapt the model output (Huber expects
+    /// `log1p(count)`, Poisson outputs `log(rate)`).
+    #[must_use]
+    pub const fn reconstruction_loss_kind(&self) -> ReconstructionLossKind {
+        self.reconstruction_loss_kind
     }
 
     /// Runs the full autoencoder from sparse counted fingerprints.
@@ -1976,7 +2119,12 @@ impl<B: Backend> MoleculeAutoencoder<B> {
         let device = output.reconstructed_log_counts.device();
         let batch_size = output.reconstructed_log_counts.dims()[0];
         let latent = output.latent;
-        let reconstruction_bce_per_row = if self.bce_weight > 0.0 {
+        // Under Huber the auxiliary BCE term is meaningful; under
+        // Poisson the NLL already handles both presence and magnitude,
+        // so the BCE branch is force-zeroed regardless of bce_weight.
+        let reconstruction_bce_per_row = if self.bce_weight > 0.0
+            && self.reconstruction_loss_kind == ReconstructionLossKind::Huber
+        {
             weighted_sparse_log_count_bce_loss_per_row(
                 output.reconstructed_log_counts.clone(),
                 &target_fingerprints,
@@ -1987,11 +2135,18 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             Tensor::zeros([batch_size], &device)
         };
         let reconstruction_bce = reconstruction_bce_per_row.clone().mean();
-        let reconstruction_per_row = weighted_sparse_log_count_huber_loss_per_row(
-            output.reconstructed_log_counts,
-            target_fingerprints,
-            self.reconstruction_loss_config(),
-        );
+        let reconstruction_per_row = match self.reconstruction_loss_kind {
+            ReconstructionLossKind::Huber => weighted_sparse_log_count_huber_loss_per_row(
+                output.reconstructed_log_counts,
+                target_fingerprints,
+                self.reconstruction_loss_config(),
+            ),
+            ReconstructionLossKind::Poisson => weighted_sparse_log_count_poisson_loss_per_row(
+                output.reconstructed_log_counts,
+                target_fingerprints,
+                self.reconstruction_poisson_max_log_count,
+            ),
+        };
         let reconstruction = reconstruction_per_row.clone().mean();
         let _ = fingerprints; // retained for symmetry; unused once recon
         // is computed against the decoder target.
@@ -2279,6 +2434,74 @@ pub fn weighted_sparse_log_count_huber_loss_per_row<B: Backend>(
     let correction_per_row: Tensor<B, 1> = correction.sum_dim(1).squeeze_dim(1);
 
     (zero_per_row * config.zero_weight + correction_per_row) / width
+}
+
+/// Poisson NLL on raw counts, with the model output interpreted as
+/// `log(rate)`.
+///
+/// Per-cell loss is `exp(z) - count · z` (the count-dependent `log(count!)`
+/// constant is dropped since it has no gradient). Sparse formulation:
+/// the `count · z` term is non-zero only at active bins, so we sum
+/// `exp(z)` densely and subtract a sparse correction.
+///
+/// Predicted log-rates are clamped to `clamp_max(max_log_count)` before
+/// `exp` to keep the `f32` reduction safe even when the optimizer briefly
+/// drives a logit very high during early training.
+///
+/// # Panics
+///
+/// Panics when the predicted dense reconstruction shape does not match
+/// the sparse target batch size and fingerprint width.
+#[must_use]
+pub fn weighted_sparse_log_count_poisson_loss<B: Backend>(
+    predicted_log_counts: Tensor<B, 2>,
+    target: SparseFingerprintBatch<B>,
+    max_log_count: f64,
+) -> Tensor<B, 1> {
+    weighted_sparse_log_count_poisson_loss_per_row(predicted_log_counts, target, max_log_count)
+        .mean()
+}
+
+/// Per-row variant of [`weighted_sparse_log_count_poisson_loss`].
+///
+/// Returns a `Tensor<B, 1>` of shape `[batch]` where each element is the
+/// per-cell mean Poisson NLL for that row, matching the shape contract
+/// of [`weighted_sparse_log_count_huber_loss_per_row`] so the train-time
+/// polarity split can sum it against the same gap weights.
+///
+/// # Panics
+///
+/// Panics when the predicted dense reconstruction shape does not match
+/// the sparse target batch size and fingerprint width.
+pub fn weighted_sparse_log_count_poisson_loss_per_row<B: Backend>(
+    predicted_log_counts: Tensor<B, 2>,
+    target: SparseFingerprintBatch<B>,
+    max_log_count: f64,
+) -> Tensor<B, 1> {
+    let predicted_dims = predicted_log_counts.dims();
+    assert_eq!(
+        predicted_dims[0],
+        target.batch_size(),
+        "predicted and target batches must have the same row count"
+    );
+    assert_eq!(
+        predicted_dims[1], target.fingerprint_size,
+        "predicted reconstruction width must match sparse fingerprint width"
+    );
+
+    let width = predicted_dims[1] as f64;
+    let clamped = predicted_log_counts.clamp_max(max_log_count);
+    // exp(z) summed over every cell; this is the "all cells are inactive
+    // (count = 0)" baseline contribution to the NLL.
+    let exp_z_per_row: Tensor<B, 1> = clamped.clone().exp().sum_dim(1).squeeze_dim(1);
+    // At active bins the NLL gains a -count * z term. Pull the model's
+    // logits at the sparse active indices, weight by the (mask-zeroed)
+    // raw counts, and sum per row.
+    let z_at_active = clamped.gather(1, target.indices.clone());
+    let count_z = target.counts * z_at_active * target.mask;
+    let count_z_per_row: Tensor<B, 1> = count_z.sum_dim(1).squeeze_dim(1);
+
+    (exp_z_per_row - count_z_per_row) / width
 }
 
 #[cfg(all(test, feature = "ndarray"))]
@@ -3326,6 +3549,108 @@ mod tests {
         assert_eq!(config.pairs_per_batch(), 11);
         assert_eq!(config.loss_kind(), TanimotoLossKind::SoftRankSpearman);
         assert!((config.softrank_temperature() - 0.33).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn reconstruction_loss_kind_serde_round_trip_matches_cli_spelling() {
+        // Both variants must round-trip with the CLI flag spellings so
+        // a config dumped during training reloads cleanly through the
+        // CLI parser.
+        assert_eq!(
+            serde_json::to_string(&ReconstructionLossKind::Huber).expect("serialize"),
+            "\"huber\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReconstructionLossKind::Poisson).expect("serialize"),
+            "\"poisson\""
+        );
+        let parsed: ReconstructionLossKind =
+            serde_json::from_str("\"poisson\"").expect("deserialize");
+        assert_eq!(parsed, ReconstructionLossKind::Poisson);
+    }
+
+    #[test]
+    fn poisson_loss_hand_computed_values_match_formula() {
+        type B = burn::backend::NdArray<f32, i64>;
+        // Two-row batch with a 4-bin "fingerprint". Hand-construct the
+        // sparse target so position 0 has count=2 in row 0, position 2
+        // has count=1 in row 1.
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let predicted_log_counts =
+            Tensor::<B, 2>::from_floats([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]], &device);
+        let indices = Tensor::<B, 2, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(vec![0_i64, 0, 2, 0], [2, 2]),
+            &device,
+        );
+        let counts = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![2.0_f32, 0.0, 1.0, 0.0], [2, 2]),
+            &device,
+        );
+        let log_counts =
+            Tensor::<B, 2>::from_data(TensorData::new(vec![0.0_f32; 4], [2, 2]), &device);
+        let mask = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![1.0_f32, 0.0, 1.0, 0.0], [2, 2]),
+            &device,
+        );
+        let target = crate::batch::SparseFingerprintBatch::<B> {
+            indices,
+            counts,
+            log_counts,
+            mask,
+            fingerprint_size: 4,
+            max_nnz: 2,
+        };
+        // Per-cell NLL with z=0 everywhere: exp(0)=1 at every cell, and
+        // the count*z subtraction is 0 (z=0). So per-row NLL =
+        // (4 * 1 - 0) / 4 = 1.0 for both rows.
+        let per_row =
+            weighted_sparse_log_count_poisson_loss_per_row(predicted_log_counts, target, 20.0)
+                .into_data()
+                .to_vec::<f32>()
+                .expect("f32 data");
+        assert!((per_row[0] - 1.0).abs() < 1.0e-6, "row 0 = {}", per_row[0]);
+        assert!((per_row[1] - 1.0).abs() < 1.0e-6, "row 1 = {}", per_row[1]);
+    }
+
+    #[test]
+    fn poisson_loss_optimum_lands_at_log_count() {
+        type B = burn::backend::NdArray<f32, i64>;
+        // Row 0 active position has count=2 -> Poisson NLL minimum at
+        // z = log(2). Picking z = log(2) at the active bin and z very
+        // negative elsewhere should give a clearly lower per-row NLL
+        // than the trivial-zero baseline of 1.0 / cell.
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let predicted_log_counts =
+            Tensor::<B, 2>::from_floats([[2.0_f32.ln(), -10.0, -10.0, -10.0]], &device);
+        let indices = Tensor::<B, 2, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(vec![0_i64, 0], [1, 2]),
+            &device,
+        );
+        let counts =
+            Tensor::<B, 2>::from_data(TensorData::new(vec![2.0_f32, 0.0], [1, 2]), &device);
+        let log_counts =
+            Tensor::<B, 2>::from_data(TensorData::new(vec![0.0_f32; 2], [1, 2]), &device);
+        let mask = Tensor::<B, 2>::from_data(TensorData::new(vec![1.0_f32, 0.0], [1, 2]), &device);
+        let target = crate::batch::SparseFingerprintBatch::<B> {
+            indices,
+            counts,
+            log_counts,
+            mask,
+            fingerprint_size: 4,
+            max_nnz: 2,
+        };
+        let per_row =
+            weighted_sparse_log_count_poisson_loss_per_row(predicted_log_counts, target, 20.0)
+                .into_data()
+                .to_vec::<f32>()
+                .expect("f32 data");
+        // Per-row NLL ≈ (exp(log(2)) + 3·exp(-10) - 2·log(2)) / 4
+        //            ≈ (2 + 0 - 1.386) / 4 ≈ 0.153.
+        assert!(
+            per_row[0] < 0.2,
+            "optimized row should be well below the trivial-zero 1.0 baseline, got {}",
+            per_row[0]
+        );
     }
 
     #[test]

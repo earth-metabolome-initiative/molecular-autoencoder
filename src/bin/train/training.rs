@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use burn::tensor::activation::softplus;
 use burn::{
     optim::{GradientsParams, Optimizer},
     prelude::*,
@@ -18,7 +19,7 @@ use burn::{
 use burn_collective::{PeerId, ReduceOperation};
 use molecular_autoencoder::{
     DataSplit, MoleculeAutoencoder, MoleculeAutoencoderBatch, MoleculeAutoencoderBatcher,
-    TanimotoRankingRuntimeConfig, batch_sparse_log_count_binary_tanimoto,
+    ReconstructionLossKind, TanimotoRankingRuntimeConfig, batch_sparse_log_count_binary_tanimoto,
     batch_sparse_log_count_tanimoto,
 };
 
@@ -602,10 +603,12 @@ where
                 polarity_for_metrics,
             ) {
                 (Some(fingerprints), Some(reconstructed), Some(correction_mask)) => {
+                    let metric_log_counts =
+                        adapt_to_log1p_count(reconstructed, current.reconstruction_loss_kind());
                     let count_per_row =
-                        batch_sparse_log_count_tanimoto(&fingerprints, reconstructed.clone());
+                        batch_sparse_log_count_tanimoto(&fingerprints, metric_log_counts.clone());
                     let binary_per_row =
-                        batch_sparse_log_count_binary_tanimoto(&fingerprints, reconstructed);
+                        batch_sparse_log_count_binary_tanimoto(&fingerprints, metric_log_counts);
                     let split = polarity_split(
                         correction_mask,
                         count_per_row,
@@ -725,10 +728,16 @@ where
                 violation_targets,
             );
             let total_loss = losses.total();
-            let count_per_row =
-                batch_sparse_log_count_tanimoto(&fingerprints_for_metrics, reconstructed.clone());
-            let binary_per_row =
-                batch_sparse_log_count_binary_tanimoto(&fingerprints_for_metrics, reconstructed);
+            let metric_log_counts =
+                adapt_to_log1p_count(reconstructed, model.reconstruction_loss_kind());
+            let count_per_row = batch_sparse_log_count_tanimoto(
+                &fingerprints_for_metrics,
+                metric_log_counts.clone(),
+            );
+            let binary_per_row = batch_sparse_log_count_binary_tanimoto(
+                &fingerprints_for_metrics,
+                metric_log_counts,
+            );
             let split = polarity_split(
                 correction_mask,
                 count_per_row,
@@ -818,6 +827,26 @@ fn polarity_mask<B: Backend>(violation_targets: &Tensor<B, 2>) -> Tensor<B, 1> {
         .squeeze_dim(1)
         .greater_elem(0.0)
         .float()
+}
+
+/// Reinterprets the model's raw decoder output as `log1p(count)` so it
+/// can be fed straight into the Tanimoto metric helpers, which assume
+/// that shape (they undo via `exp(z) - 1`).
+///
+/// Under [`ReconstructionLossKind::Huber`] the model is already
+/// emitting `log1p(count)`, so the output passes through unchanged.
+/// Under [`ReconstructionLossKind::Poisson`] the output is the
+/// Poisson `log(rate)`; `softplus` converts it to `log1p(exp(z))`,
+/// which satisfies `exp(softplus(z)) − 1 == exp(z)` and so feeds the
+/// existing Tanimoto helpers their expected count decoding.
+fn adapt_to_log1p_count<B: Backend>(
+    reconstructed: Tensor<B, 2>,
+    kind: ReconstructionLossKind,
+) -> Tensor<B, 2> {
+    match kind {
+        ReconstructionLossKind::Huber => reconstructed,
+        ReconstructionLossKind::Poisson => softplus(reconstructed, 1.0),
+    }
 }
 
 /// Splits the per-row Tanimoto, Huber, and BCE vectors into
