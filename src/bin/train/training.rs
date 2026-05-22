@@ -845,7 +845,7 @@ fn adapt_to_log1p_count<B: Backend>(
     kind: ReconstructionLossKind,
 ) -> Tensor<B, 2> {
     match kind {
-        ReconstructionLossKind::Huber => reconstructed,
+        ReconstructionLossKind::Huber | ReconstructionLossKind::HuberSymmetric => reconstructed,
         ReconstructionLossKind::Poisson => softplus(reconstructed, 1.0),
     }
 }

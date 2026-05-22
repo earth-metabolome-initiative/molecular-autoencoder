@@ -373,6 +373,9 @@ pub struct Args {
 pub enum ReconstructionLossKindArg {
     /// Weighted Huber on `log1p(count)` (with the auxiliary BCE term).
     Huber,
+    /// Two-sided weighted Huber on `log1p(count)` (penalizes both leak
+    /// directions at zero-target bins). BCE branch is force-zeroed.
+    HuberSymmetric,
     /// Poisson NLL on raw counts (model output reinterpreted as
     /// `log(rate)`).
     Poisson,
@@ -382,6 +385,7 @@ impl From<ReconstructionLossKindArg> for ReconstructionLossKind {
     fn from(value: ReconstructionLossKindArg) -> Self {
         match value {
             ReconstructionLossKindArg::Huber => Self::Huber,
+            ReconstructionLossKindArg::HuberSymmetric => Self::HuberSymmetric,
             ReconstructionLossKindArg::Poisson => Self::Poisson,
         }
     }

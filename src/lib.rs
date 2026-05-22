@@ -68,7 +68,8 @@ pub use model::{
     ReconstructionLossConfig, ReconstructionLossConfigBuilder, ReconstructionLossKind,
     TanimotoLossKind, TanimotoRankingConfig, TanimotoRankingConfigBuilder,
     TanimotoRankingRuntimeConfig, apply_latent_noise, weighted_sparse_log_count_bce_loss,
-    weighted_sparse_log_count_huber_loss, weighted_sparse_log_count_poisson_loss,
+    weighted_sparse_log_count_huber_loss, weighted_sparse_log_count_huber_loss_symmetric,
+    weighted_sparse_log_count_poisson_loss,
 };
 pub use ranking::{
     TanimotoRankingBatch, TanimotoRankingDiagnostics, TanimotoRankingOutput,

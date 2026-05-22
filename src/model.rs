@@ -118,8 +118,16 @@ pub const DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT: f64 = 5.0;
 pub enum ReconstructionLossKind {
     /// Weighted Huber on `log1p(count)` (with the auxiliary bit-presence
     /// BCE term applied alongside per `bce_weight`). Shipping baseline.
+    /// One-sided at zero-target bins: only positive leak `max(ẑ, 0)` is
+    /// penalized so the Huber does not fight the BCE there.
     #[default]
     Huber,
+    /// Two-sided weighted Huber on `log1p(count)`. Penalizes both
+    /// positive overshoot and negative dips at zero-target bins (i.e.,
+    /// pre-`d05c72a` behaviour). The BCE branch is force-zeroed under
+    /// this kind because the Huber is the only term that drives
+    /// inactive bins toward zero from both sides.
+    HuberSymmetric,
     /// Poisson NLL on raw counts (`exp(z) - count · z` per cell, averaged
     /// over `batch × width`). No `bce_*` knobs apply (Poisson already
     /// handles both presence and magnitude); `--bce-weight 0` is the
@@ -2125,9 +2133,11 @@ impl<B: Backend> MoleculeAutoencoder<B> {
         let device = output.reconstructed_log_counts.device();
         let batch_size = output.reconstructed_log_counts.dims()[0];
         let latent = output.latent;
-        // Under Huber the auxiliary BCE term is meaningful; under
-        // Poisson the NLL already handles both presence and magnitude,
-        // so the BCE branch is force-zeroed regardless of bce_weight.
+        // Under one-sided Huber the auxiliary BCE drives inactive bins
+        // negative. HuberSymmetric handles both leak directions on its
+        // own and Poisson NLL already covers both presence and magnitude,
+        // so the BCE branch is force-zeroed under those two kinds
+        // regardless of `bce_weight`.
         let reconstruction_bce_per_row = if self.bce_weight > 0.0
             && self.reconstruction_loss_kind == ReconstructionLossKind::Huber
         {
@@ -2147,6 +2157,13 @@ impl<B: Backend> MoleculeAutoencoder<B> {
                 target_fingerprints,
                 self.reconstruction_loss_config(),
             ),
+            ReconstructionLossKind::HuberSymmetric => {
+                weighted_sparse_log_count_huber_loss_symmetric_per_row(
+                    output.reconstructed_log_counts,
+                    target_fingerprints,
+                    self.reconstruction_loss_config(),
+                )
+            }
             ReconstructionLossKind::Poisson => weighted_sparse_log_count_poisson_loss_per_row(
                 output.reconstructed_log_counts,
                 target_fingerprints,
@@ -2434,6 +2451,70 @@ pub fn weighted_sparse_log_count_huber_loss_per_row<B: Backend>(
         config.beta,
     );
     let zero_nonzero_huber = huber_from_delta(predicted_nonzero.clamp_min(0.0), config.beta);
+    let correction = (nonzero_huber * config.nonzero_weight
+        - zero_nonzero_huber * config.zero_weight)
+        * target.mask;
+    let correction_per_row: Tensor<B, 1> = correction.sum_dim(1).squeeze_dim(1);
+
+    (zero_per_row * config.zero_weight + correction_per_row) / width
+}
+
+/// Two-sided weighted Huber on sparse `log1p(count)` targets.
+///
+/// Same per-bin weighting as [`weighted_sparse_log_count_huber_loss`],
+/// but penalizes Huber symmetrically at zero-target bins (`|ẑ|` instead
+/// of `max(ẑ, 0)`). Used by [`ReconstructionLossKind::HuberSymmetric`].
+///
+/// # Panics
+///
+/// Panics when the predicted dense reconstruction shape does not match
+/// the sparse target batch size and fingerprint width.
+pub fn weighted_sparse_log_count_huber_loss_symmetric<B: Backend>(
+    predicted_log_counts: Tensor<B, 2>,
+    target: SparseFingerprintBatch<B>,
+    config: ReconstructionLossConfig,
+) -> Tensor<B, 1> {
+    weighted_sparse_log_count_huber_loss_symmetric_per_row(predicted_log_counts, target, config)
+        .mean()
+}
+
+/// Per-row variant of [`weighted_sparse_log_count_huber_loss_symmetric`].
+///
+/// Returns a `Tensor<B, 1>` of shape `[batch]` where each element is the
+/// per-cell mean two-sided Huber for that row.
+///
+/// # Panics
+///
+/// Panics when the predicted dense reconstruction shape does not match
+/// the sparse target batch size and fingerprint width.
+pub fn weighted_sparse_log_count_huber_loss_symmetric_per_row<B: Backend>(
+    predicted_log_counts: Tensor<B, 2>,
+    target: SparseFingerprintBatch<B>,
+    config: ReconstructionLossConfig,
+) -> Tensor<B, 1> {
+    let predicted_dims = predicted_log_counts.dims();
+    assert_eq!(
+        predicted_dims[0],
+        target.batch_size(),
+        "predicted and target batches must have the same row count"
+    );
+    assert_eq!(
+        predicted_dims[1], target.fingerprint_size,
+        "predicted reconstruction width must match sparse fingerprint width"
+    );
+
+    let width = predicted_dims[1] as f64;
+    // Penalize both leak directions at inactive bins via `|ẑ|`.
+    let zero_huber = huber_from_delta(predicted_log_counts.clone().abs(), config.beta);
+    let zero_per_row: Tensor<B, 1> = zero_huber.sum_dim(1).squeeze_dim(1);
+    let predicted_nonzero = predicted_log_counts.gather(1, target.indices.clone());
+    let nonzero_huber = huber_from_delta(
+        (predicted_nonzero.clone() - target.log_counts).abs(),
+        config.beta,
+    );
+    // Subtract the "assumed inactive" two-sided contribution at the
+    // same active indices, matching the sparse-correction pattern.
+    let zero_nonzero_huber = huber_from_delta(predicted_nonzero.abs(), config.beta);
     let correction = (nonzero_huber * config.nonzero_weight
         - zero_nonzero_huber * config.zero_weight)
         * target.mask;
@@ -3567,6 +3648,10 @@ mod tests {
             "\"huber\""
         );
         assert_eq!(
+            serde_json::to_string(&ReconstructionLossKind::HuberSymmetric).expect("serialize"),
+            "\"huber-symmetric\""
+        );
+        assert_eq!(
             serde_json::to_string(&ReconstructionLossKind::Poisson).expect("serialize"),
             "\"poisson\""
         );
@@ -3656,6 +3741,62 @@ mod tests {
             per_row[0] < 0.2,
             "optimized row should be well below the trivial-zero 1.0 baseline, got {}",
             per_row[0]
+        );
+    }
+
+    #[test]
+    fn huber_symmetric_penalizes_negative_dips_at_inactive_bins() {
+        type B = burn::backend::NdArray<f32, i64>;
+        // One row, four cells, zero active bins (so the entire loss is
+        // the inactive baseline). Predicting `-0.5` everywhere should
+        // be silent under the one-sided helper (it only penalizes
+        // positive overshoot) but cost a positive amount under the
+        // symmetric helper.
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let predicted = Tensor::<B, 2>::from_floats([[-0.5_f32, -0.5, -0.5, -0.5]], &device);
+        let indices = Tensor::<B, 2, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(vec![0_i64], [1, 1]),
+            &device,
+        );
+        let counts = Tensor::<B, 2>::from_data(TensorData::new(vec![0.0_f32], [1, 1]), &device);
+        let log_counts = Tensor::<B, 2>::from_data(TensorData::new(vec![0.0_f32], [1, 1]), &device);
+        let mask = Tensor::<B, 2>::from_data(TensorData::new(vec![0.0_f32], [1, 1]), &device);
+        let target = crate::batch::SparseFingerprintBatch::<B> {
+            indices,
+            counts,
+            log_counts,
+            mask,
+            fingerprint_size: 4,
+            max_nnz: 1,
+        };
+        let config = ReconstructionLossConfig::builder()
+            .build()
+            .expect("valid default reconstruction loss config");
+
+        let one_sided =
+            weighted_sparse_log_count_huber_loss_per_row(predicted.clone(), target.clone(), config)
+                .into_data()
+                .to_vec::<f32>()
+                .expect("f32 data");
+        let symmetric =
+            weighted_sparse_log_count_huber_loss_symmetric_per_row(predicted, target, config)
+                .into_data()
+                .to_vec::<f32>()
+                .expect("f32 data");
+
+        // One-sided: clamp_min(0.0) zeroes the negative dip, so loss = 0.
+        assert!(
+            one_sided[0].abs() < 1.0e-6,
+            "one-sided Huber should ignore negative dips at inactive bins, got {}",
+            one_sided[0]
+        );
+        // Symmetric: 4 cells at |ẑ| = 0.5 each contribute Huber(0.5, β=1) =
+        // 0.5 · 0.5² · (1/1) = 0.125 per cell, times the default
+        // zero_weight = 0.05, mean over 4 cells = 0.125 * 0.05 = 0.00625.
+        assert!(
+            (symmetric[0] - 0.006_25).abs() < 1.0e-5,
+            "symmetric Huber should bill the negative leak symmetrically, got {}",
+            symmetric[0]
         );
     }
 
