@@ -52,11 +52,26 @@ pub struct BatchLossMetrics {
     /// denoising) rows of the batch. `None` when the batch had no
     /// negative rows.
     pub binary_tanimoto_correction: Option<f32>,
+    /// Mean reconstruction Huber loss over the positive (reconstruction)
+    /// rows of the batch. `None` when the batch had no positive rows.
+    pub huber_reconstruction: Option<f32>,
+    /// Mean reconstruction Huber loss over the negative (correction /
+    /// denoising) rows of the batch. `None` when the batch had no
+    /// negative rows.
+    pub huber_correction: Option<f32>,
+    /// Mean bit-presence BCE loss (already multiplied by `bce_weight`)
+    /// over the positive (reconstruction) rows of the batch. `None`
+    /// when the batch had no positive rows.
+    pub bce_reconstruction: Option<f32>,
+    /// Mean bit-presence BCE loss (already multiplied by `bce_weight`)
+    /// over the negative (correction / denoising) rows of the batch.
+    /// `None` when the batch had no negative rows.
+    pub bce_correction: Option<f32>,
     /// Number of positive rows that contributed to the reconstruction
-    /// Tanimoto means.
+    /// polarity means.
     pub reconstruction_rows: usize,
     /// Number of negative rows that contributed to the correction
-    /// Tanimoto means.
+    /// polarity means.
     pub correction_rows: usize,
     /// Mean multi-label BCE-with-logits between the violation classifier
     /// head and the per-sample [`finge_rs::ViolationLabel`] bitset.
@@ -74,12 +89,13 @@ pub struct BatchLossMetrics {
     pub violation_accuracy: f32,
 }
 
-/// Polarity-split per-row Tanimoto sums + counts produced backend-side and
-/// flushed through the metrics [`Transaction`] together with the loss
-/// scalars. Each `*_sum` field is the per-row Tanimoto summed over the
-/// matching polarity (positives for `reconstruction`, negatives for
-/// `correction`); dividing by the matching row count yields the mean.
-pub struct TanimotoSplitTensors<B: Backend> {
+/// Polarity-split per-row Tanimoto / Huber / BCE sums plus the matching
+/// row counts, produced backend-side and flushed through the metrics
+/// [`Transaction`] together with the loss scalars. Each `*_sum` field is
+/// the per-row scalar summed over the matching polarity (positives for
+/// `reconstruction`, negatives for `correction`); dividing by the
+/// matching row count yields the mean.
+pub struct PolaritySplitTensors<B: Backend> {
     /// Sum of per-row counted Tanimoto over positive (reconstruction) rows.
     pub count_reconstruction_sum: Tensor<B, 1>,
     /// Sum of per-row counted Tanimoto over negative (correction) rows.
@@ -88,6 +104,18 @@ pub struct TanimotoSplitTensors<B: Backend> {
     pub binary_reconstruction_sum: Tensor<B, 1>,
     /// Sum of per-row binary Tanimoto over negative (correction) rows.
     pub binary_correction_sum: Tensor<B, 1>,
+    /// Sum of per-row reconstruction Huber loss over positive
+    /// (reconstruction) rows.
+    pub huber_reconstruction_sum: Tensor<B, 1>,
+    /// Sum of per-row reconstruction Huber loss over negative
+    /// (correction) rows.
+    pub huber_correction_sum: Tensor<B, 1>,
+    /// Sum of per-row bit-presence BCE loss over positive
+    /// (reconstruction) rows. Already multiplied by `bce_weight`.
+    pub bce_reconstruction_sum: Tensor<B, 1>,
+    /// Sum of per-row bit-presence BCE loss over negative (correction)
+    /// rows. Already multiplied by `bce_weight`.
+    pub bce_correction_sum: Tensor<B, 1>,
     /// Number of positive (reconstruction) rows in the batch, as a scalar
     /// `f32` tensor.
     pub reconstruction_count: Tensor<B, 1>,
@@ -113,12 +141,12 @@ pub const fn should_sample_metrics(batch_index: usize, every: usize) -> bool {
 pub fn loss_metrics<B>(
     loss: Tensor<B, 1>,
     losses: &MoleculeLossBreakdown<B>,
-    tanimoto_split: TanimotoSplitTensors<B>,
+    polarity_split: PolaritySplitTensors<B>,
 ) -> AppResult<BatchLossMetrics>
 where
     B: Backend<FloatElem = f32>,
 {
-    extract_batch_loss_metrics(loss, losses, tanimoto_split, "training")
+    extract_batch_loss_metrics(loss, losses, polarity_split, "training")
 }
 
 /// Computes batch loss metrics for the validation path. Mirrors
@@ -126,34 +154,38 @@ where
 pub fn validation_metrics<B>(
     loss: Tensor<B, 1>,
     losses: &MoleculeLossBreakdown<B>,
-    tanimoto_split: TanimotoSplitTensors<B>,
+    polarity_split: PolaritySplitTensors<B>,
 ) -> AppResult<BatchLossMetrics>
 where
     B: Backend<FloatElem = f32>,
 {
-    extract_batch_loss_metrics(loss, losses, tanimoto_split, "validation")
+    extract_batch_loss_metrics(loss, losses, polarity_split, "validation")
 }
 
 /// Shared body for [`loss_metrics`] / [`validation_metrics`]: registers the
-/// loss + Tanimoto split + diagnostic tensors in a single Transaction,
+/// loss + polarity-split + diagnostic tensors in a single Transaction,
 /// reads them back, and assembles a [`BatchLossMetrics`].
 fn extract_batch_loss_metrics<B>(
     loss: Tensor<B, 1>,
     losses: &MoleculeLossBreakdown<B>,
-    tanimoto_split: TanimotoSplitTensors<B>,
+    polarity_split: PolaritySplitTensors<B>,
     phase: &'static str,
 ) -> AppResult<BatchLossMetrics>
 where
     B: Backend<FloatElem = f32>,
 {
-    let TanimotoSplitTensors {
+    let PolaritySplitTensors {
         count_reconstruction_sum,
         count_correction_sum,
         binary_reconstruction_sum,
         binary_correction_sum,
+        huber_reconstruction_sum,
+        huber_correction_sum,
+        bce_reconstruction_sum,
+        bce_correction_sum,
         reconstruction_count,
         correction_count,
-    } = tanimoto_split;
+    } = polarity_split;
     let diagnostics = &losses.tanimoto_diagnostics;
     let pair_count = diagnostics.pair_count;
     let candidate_count = diagnostics.candidate_count;
@@ -171,6 +203,10 @@ where
         .register(count_correction_sum)
         .register(binary_reconstruction_sum)
         .register(binary_correction_sum)
+        .register(huber_reconstruction_sum)
+        .register(huber_correction_sum)
+        .register(bce_reconstruction_sum)
+        .register(bce_correction_sum)
         .register(reconstruction_count)
         .register(correction_count)
         .register(losses.violation_bce.clone())
@@ -182,17 +218,14 @@ where
         .register(violation_diagnostics.targets.clone())
         .try_execute()
         .map_err(|source| invalid_input(format!("failed to read {phase} metrics: {source}")))?;
-    if data.len() != 19 {
+    if data.len() != 23 {
         return Err(invalid_input(format!(
-            "{phase} metrics transaction returned {} tensors instead of 19",
+            "{phase} metrics transaction returned {} tensors instead of 23",
             data.len()
         )));
     }
-    let reconstruction_rows = scalar_data_as_count(
-        &data[10],
-        "reconstruction row count",
-    )?;
-    let correction_rows = scalar_data_as_count(&data[11], "correction row count")?;
+    let reconstruction_rows = scalar_data_as_count(&data[14], "reconstruction row count")?;
+    let correction_rows = scalar_data_as_count(&data[15], "correction row count")?;
     let count_tanimoto_reconstruction = polarity_mean(
         scalar_data(&data[6], "count Tanimoto reconstruction sum")?,
         reconstruction_rows,
@@ -209,9 +242,25 @@ where
         scalar_data(&data[9], "binary Tanimoto correction sum")?,
         correction_rows,
     );
-    let quality = ranking_quality_from_data(&data[13..17], pair_count, candidate_count)?;
+    let huber_reconstruction = polarity_mean(
+        scalar_data(&data[10], "Huber reconstruction sum")?,
+        reconstruction_rows,
+    );
+    let huber_correction = polarity_mean(
+        scalar_data(&data[11], "Huber correction sum")?,
+        correction_rows,
+    );
+    let bce_reconstruction = polarity_mean(
+        scalar_data(&data[12], "BCE reconstruction sum")?,
+        reconstruction_rows,
+    );
+    let bce_correction = polarity_mean(
+        scalar_data(&data[13], "BCE correction sum")?,
+        correction_rows,
+    );
+    let quality = ranking_quality_from_data(&data[17..21], pair_count, candidate_count)?;
     let violation_quality =
-        violation_quality_from_data(&data[17..19], violation_batch, violation_classes)?;
+        violation_quality_from_data(&data[21..23], violation_batch, violation_classes)?;
     Ok(BatchLossMetrics {
         loss: scalar_data(&data[0], "loss")?,
         reconstruction: scalar_data(&data[1], "reconstruction loss")?,
@@ -226,9 +275,13 @@ where
         count_tanimoto_correction,
         binary_tanimoto_reconstruction,
         binary_tanimoto_correction,
+        huber_reconstruction,
+        huber_correction,
+        bce_reconstruction,
+        bce_correction,
         reconstruction_rows,
         correction_rows,
-        violation_bce: scalar_data(&data[12], "violation BCE loss")?,
+        violation_bce: scalar_data(&data[16], "violation BCE loss")?,
         violation_mcc: violation_quality.mcc_macro,
         violation_accuracy: violation_quality.accuracy,
     })

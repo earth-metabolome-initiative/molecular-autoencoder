@@ -208,6 +208,34 @@ impl TrainingReporter {
                         metrics.correction_rows,
                     ));
                 }
+                if let Some(value) = metrics.huber_reconstruction {
+                    renderer.update_train(metric_state(
+                        self.metric_ids.huber_reconstruction.clone(),
+                        value,
+                        metrics.reconstruction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.huber_correction {
+                    renderer.update_train(metric_state(
+                        self.metric_ids.huber_correction.clone(),
+                        value,
+                        metrics.correction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.bce_reconstruction {
+                    renderer.update_train(metric_state(
+                        self.metric_ids.bce_reconstruction.clone(),
+                        value,
+                        metrics.reconstruction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.bce_correction {
+                    renderer.update_train(metric_state(
+                        self.metric_ids.bce_correction.clone(),
+                        value,
+                        metrics.correction_rows,
+                    ));
+                }
                 renderer.update_train(metric_state(
                     self.metric_ids.violation.clone(),
                     metrics.violation_bce,
@@ -354,6 +382,34 @@ impl TrainingReporter {
                         metrics.correction_rows,
                     ));
                 }
+                if let Some(value) = metrics.huber_reconstruction {
+                    renderer.update_valid(metric_state(
+                        self.metric_ids.huber_reconstruction.clone(),
+                        value,
+                        metrics.reconstruction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.huber_correction {
+                    renderer.update_valid(metric_state(
+                        self.metric_ids.huber_correction.clone(),
+                        value,
+                        metrics.correction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.bce_reconstruction {
+                    renderer.update_valid(metric_state(
+                        self.metric_ids.bce_reconstruction.clone(),
+                        value,
+                        metrics.reconstruction_rows,
+                    ));
+                }
+                if let Some(value) = metrics.bce_correction {
+                    renderer.update_valid(metric_state(
+                        self.metric_ids.bce_correction.clone(),
+                        value,
+                        metrics.correction_rows,
+                    ));
+                }
                 renderer.update_valid(metric_state(
                     self.metric_ids.violation.clone(),
                     metrics.violation_bce,
@@ -473,7 +529,7 @@ impl IndicatifTrainingBars {
         let step_ms = step_time.as_secs_f64() * 1000.0;
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} viol={:.4} viol_mcc={:.3} viol_acc={:.3} data_ms={data_ms:.1} step_ms={step_ms:.1}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} recon_pos={} recon_neg={} bce_pos={} bce_neg={} viol={:.4} viol_mcc={:.3} viol_acc={:.3} data_ms={data_ms:.1} step_ms={step_ms:.1}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.reconstruction_bce,
@@ -487,6 +543,10 @@ impl IndicatifTrainingBars {
                 format_polarity(metrics.count_tanimoto_correction),
                 format_polarity(metrics.binary_tanimoto_reconstruction),
                 format_polarity(metrics.binary_tanimoto_correction),
+                format_polarity(metrics.huber_reconstruction),
+                format_polarity(metrics.huber_correction),
+                format_polarity(metrics.bce_reconstruction),
+                format_polarity(metrics.bce_correction),
                 metrics.violation_bce,
                 metrics.violation_mcc,
                 metrics.violation_accuracy,
@@ -508,7 +568,7 @@ impl IndicatifTrainingBars {
         bar.set_position(processed as u64);
         match metrics {
             Some(metrics) => bar.set_message(format!(
-                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} viol={:.4} viol_mcc={:.3} viol_acc={:.3}",
+                "loss={:.4} recon={:.4} bce={:.4} desc={:.4} tanrank={:.4} acc={:.3} mrr={:.3} pearson={:.3} spearman={:.3} count_tan_recon={} count_tan_corr={} bin_tan_recon={} bin_tan_corr={} recon_pos={} recon_neg={} bce_pos={} bce_neg={} viol={:.4} viol_mcc={:.3} viol_acc={:.3}",
                 metrics.loss,
                 metrics.reconstruction,
                 metrics.reconstruction_bce,
@@ -522,6 +582,10 @@ impl IndicatifTrainingBars {
                 format_polarity(metrics.count_tanimoto_correction),
                 format_polarity(metrics.binary_tanimoto_reconstruction),
                 format_polarity(metrics.binary_tanimoto_correction),
+                format_polarity(metrics.huber_reconstruction),
+                format_polarity(metrics.huber_correction),
+                format_polarity(metrics.bce_reconstruction),
+                format_polarity(metrics.bce_correction),
                 metrics.violation_bce,
                 metrics.violation_mcc,
                 metrics.violation_accuracy,
@@ -599,6 +663,18 @@ enum ReporterMetric {
     BinaryTanimotoReconstruction,
     /// Binary-Tanimoto quality on negative (correction) rows.
     BinaryTanimotoCorrection,
+    /// Reconstruction Huber loss restricted to positive (reconstruction)
+    /// rows.
+    HuberReconstruction,
+    /// Reconstruction Huber loss restricted to negative (correction)
+    /// rows.
+    HuberCorrection,
+    /// Bit-presence BCE loss restricted to positive (reconstruction)
+    /// rows (already multiplied by `bce_weight`).
+    BceReconstruction,
+    /// Bit-presence BCE loss restricted to negative (correction) rows
+    /// (already multiplied by `bce_weight`).
+    BceCorrection,
     /// Multi-label violation-classification BCE loss.
     Violation,
     /// Macro-averaged Matthews correlation coefficient over the eight
@@ -611,7 +687,7 @@ enum ReporterMetric {
 
 impl ReporterMetric {
     /// All gauges in the canonical order the reporter renders them.
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 20] = [
         Self::Loss,
         Self::Reconstruction,
         Self::ReconstructionBce,
@@ -625,6 +701,10 @@ impl ReporterMetric {
         Self::CountTanimotoCorrection,
         Self::BinaryTanimotoReconstruction,
         Self::BinaryTanimotoCorrection,
+        Self::HuberReconstruction,
+        Self::HuberCorrection,
+        Self::BceReconstruction,
+        Self::BceCorrection,
         Self::Violation,
         Self::ViolationMcc,
         Self::ViolationAccuracy,
@@ -646,6 +726,10 @@ impl ReporterMetric {
             Self::CountTanimotoCorrection => "Count Tanimoto (Correction)",
             Self::BinaryTanimotoReconstruction => "Binary Tanimoto (Reconstruction)",
             Self::BinaryTanimotoCorrection => "Binary Tanimoto (Correction)",
+            Self::HuberReconstruction => "Reconstruction Huber (Reconstruction)",
+            Self::HuberCorrection => "Reconstruction Huber (Correction)",
+            Self::BceReconstruction => "Reconstruction BCE (Reconstruction)",
+            Self::BceCorrection => "Reconstruction BCE (Correction)",
             Self::Violation => "Violation BCE",
             Self::ViolationMcc => "Violation MCC",
             Self::ViolationAccuracy => "Violation Accuracy",
@@ -683,6 +767,18 @@ impl ReporterMetric {
             }
             Self::BinaryTanimotoCorrection => {
                 "binary fingerprint Tanimoto over negative (correction / denoising) rows"
+            }
+            Self::HuberReconstruction => {
+                "counted ECFP reconstruction Huber loss restricted to positive (reconstruction) rows"
+            }
+            Self::HuberCorrection => {
+                "counted ECFP reconstruction Huber loss restricted to negative (correction / denoising) rows"
+            }
+            Self::BceReconstruction => {
+                "bit-presence BCE loss (already multiplied by bce_weight) restricted to positive (reconstruction) rows"
+            }
+            Self::BceCorrection => {
+                "bit-presence BCE loss (already multiplied by bce_weight) restricted to negative (correction / denoising) rows"
             }
             Self::Violation => "multi-label violation-classifier BCE loss on the latent",
             Self::ViolationMcc => {
@@ -757,6 +853,14 @@ struct ReporterMetricIds {
     binary_tanimoto_reconstruction: MetricId,
     /// Metric ID for the negative-row binary-Tanimoto gauge.
     binary_tanimoto_correction: MetricId,
+    /// Metric ID for the positive-row reconstruction Huber gauge.
+    huber_reconstruction: MetricId,
+    /// Metric ID for the negative-row reconstruction Huber gauge.
+    huber_correction: MetricId,
+    /// Metric ID for the positive-row reconstruction BCE gauge.
+    bce_reconstruction: MetricId,
+    /// Metric ID for the negative-row reconstruction BCE gauge.
+    bce_correction: MetricId,
     /// Metric ID for the multi-label violation-classifier BCE gauge.
     violation: MetricId,
     /// Metric ID for the macro-MCC violation-classifier quality gauge.
@@ -782,6 +886,10 @@ impl ReporterMetricIds {
             count_tanimoto_correction: metric_id(ReporterMetric::CountTanimotoCorrection),
             binary_tanimoto_reconstruction: metric_id(ReporterMetric::BinaryTanimotoReconstruction),
             binary_tanimoto_correction: metric_id(ReporterMetric::BinaryTanimotoCorrection),
+            huber_reconstruction: metric_id(ReporterMetric::HuberReconstruction),
+            huber_correction: metric_id(ReporterMetric::HuberCorrection),
+            bce_reconstruction: metric_id(ReporterMetric::BceReconstruction),
+            bce_correction: metric_id(ReporterMetric::BceCorrection),
             violation: metric_id(ReporterMetric::Violation),
             violation_mcc: metric_id(ReporterMetric::ViolationMcc),
             violation_accuracy: metric_id(ReporterMetric::ViolationAccuracy),
@@ -808,6 +916,10 @@ impl ReporterMetricIds {
                 self.binary_tanimoto_reconstruction.clone()
             }
             ReporterMetric::BinaryTanimotoCorrection => self.binary_tanimoto_correction.clone(),
+            ReporterMetric::HuberReconstruction => self.huber_reconstruction.clone(),
+            ReporterMetric::HuberCorrection => self.huber_correction.clone(),
+            ReporterMetric::BceReconstruction => self.bce_reconstruction.clone(),
+            ReporterMetric::BceCorrection => self.bce_correction.clone(),
             ReporterMetric::Violation => self.violation.clone(),
             ReporterMetric::ViolationMcc => self.violation_mcc.clone(),
             ReporterMetric::ViolationAccuracy => self.violation_accuracy.clone(),
@@ -940,6 +1052,10 @@ mod tests {
             count_tanimoto_correction: Some(0.32),
             binary_tanimoto_reconstruction: Some(0.80),
             binary_tanimoto_correction: Some(0.40),
+            huber_reconstruction: Some(0.2),
+            huber_correction: Some(0.5),
+            bce_reconstruction: Some(0.1),
+            bce_correction: Some(0.4),
             reconstruction_rows: 3,
             correction_rows: 1,
             violation_bce: 0.07,

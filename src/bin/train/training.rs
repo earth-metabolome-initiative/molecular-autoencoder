@@ -29,7 +29,7 @@ use crate::{
     dataloader::{BatchControl, BatchIterationContext, for_each_batch},
     invalid_input,
     metrics::{
-        BatchLossMetrics, TanimotoSplitTensors, loss_metrics, should_sample_metrics,
+        BatchLossMetrics, PolaritySplitTensors, loss_metrics, should_sample_metrics,
         validation_metrics,
     },
     ranking::{TanimotoMetricBackend, attach_tanimoto_ranking, tanimoto_ranking_seed},
@@ -106,6 +106,20 @@ pub struct EvaluationSummary {
     /// Sum of binary-Tanimoto scores over every negative (correction)
     /// row seen across all batches.
     pub binary_tanimoto_correction_sum: f64,
+    /// Sum of reconstruction Huber per-row scores over every positive
+    /// (reconstruction) row seen across all batches.
+    pub huber_reconstruction_sum: f64,
+    /// Sum of reconstruction Huber per-row scores over every negative
+    /// (correction) row seen across all batches.
+    pub huber_correction_sum: f64,
+    /// Sum of bit-presence BCE per-row scores (already multiplied by
+    /// `bce_weight`) over every positive (reconstruction) row seen
+    /// across all batches.
+    pub bce_reconstruction_sum: f64,
+    /// Sum of bit-presence BCE per-row scores (already multiplied by
+    /// `bce_weight`) over every negative (correction) row seen across
+    /// all batches.
+    pub bce_correction_sum: f64,
     /// Total positive (reconstruction) rows seen across all batches.
     pub reconstruction_rows: usize,
     /// Total negative (correction) rows seen across all batches.
@@ -145,6 +159,18 @@ impl EvaluationSummary {
         }
         if let Some(mean) = metrics.binary_tanimoto_correction {
             self.binary_tanimoto_correction_sum += f64::from(mean) * metrics.correction_rows as f64;
+        }
+        if let Some(mean) = metrics.huber_reconstruction {
+            self.huber_reconstruction_sum += f64::from(mean) * metrics.reconstruction_rows as f64;
+        }
+        if let Some(mean) = metrics.huber_correction {
+            self.huber_correction_sum += f64::from(mean) * metrics.correction_rows as f64;
+        }
+        if let Some(mean) = metrics.bce_reconstruction {
+            self.bce_reconstruction_sum += f64::from(mean) * metrics.reconstruction_rows as f64;
+        }
+        if let Some(mean) = metrics.bce_correction {
+            self.bce_correction_sum += f64::from(mean) * metrics.correction_rows as f64;
         }
         self.reconstruction_rows += metrics.reconstruction_rows;
         self.correction_rows += metrics.correction_rows;
@@ -189,6 +215,34 @@ impl EvaluationSummary {
     /// rows. Returns `None` when no negative rows were seen.
     pub fn mean_binary_tanimoto_correction(self) -> Option<f32> {
         weighted_mean(self.binary_tanimoto_correction_sum, self.correction_rows)
+    }
+
+    /// Row-weighted mean reconstruction Huber over positive
+    /// (reconstruction) rows. Returns `None` when no positive rows
+    /// were seen.
+    pub fn mean_huber_reconstruction(self) -> Option<f32> {
+        weighted_mean(self.huber_reconstruction_sum, self.reconstruction_rows)
+    }
+
+    /// Row-weighted mean reconstruction Huber over negative
+    /// (correction) rows. Returns `None` when no negative rows were
+    /// seen.
+    pub fn mean_huber_correction(self) -> Option<f32> {
+        weighted_mean(self.huber_correction_sum, self.correction_rows)
+    }
+
+    /// Row-weighted mean bit-presence BCE (already multiplied by
+    /// `bce_weight`) over positive (reconstruction) rows. Returns
+    /// `None` when no positive rows were seen.
+    pub fn mean_bce_reconstruction(self) -> Option<f32> {
+        weighted_mean(self.bce_reconstruction_sum, self.reconstruction_rows)
+    }
+
+    /// Row-weighted mean bit-presence BCE (already multiplied by
+    /// `bce_weight`) over negative (correction) rows. Returns `None`
+    /// when no negative rows were seen.
+    pub fn mean_bce_correction(self) -> Option<f32> {
+        weighted_mean(self.bce_correction_sum, self.correction_rows)
     }
 }
 
@@ -552,7 +606,13 @@ where
                         batch_sparse_log_count_tanimoto(&fingerprints, reconstructed.clone());
                     let binary_per_row =
                         batch_sparse_log_count_binary_tanimoto(&fingerprints, reconstructed);
-                    let split = polarity_split(correction_mask, count_per_row, binary_per_row);
+                    let split = polarity_split(
+                        correction_mask,
+                        count_per_row,
+                        binary_per_row,
+                        losses.reconstruction_per_row.clone(),
+                        losses.reconstruction_bce_per_row.clone(),
+                    );
                     Some(loss_metrics(loss.clone(), &losses, split)?)
                 }
                 _ => None,
@@ -669,7 +729,13 @@ where
                 batch_sparse_log_count_tanimoto(&fingerprints_for_metrics, reconstructed.clone());
             let binary_per_row =
                 batch_sparse_log_count_binary_tanimoto(&fingerprints_for_metrics, reconstructed);
-            let split = polarity_split(correction_mask, count_per_row, binary_per_row);
+            let split = polarity_split(
+                correction_mask,
+                count_per_row,
+                binary_per_row,
+                losses.reconstruction_per_row.clone(),
+                losses.reconstruction_bce_per_row.clone(),
+            );
             let batch_metrics = validation_metrics(total_loss.clone(), &losses, split)?;
             if !batch_metrics.loss.is_finite() {
                 return Err(invalid_input("non-finite validation loss"));
@@ -754,7 +820,7 @@ fn polarity_mask<B: Backend>(violation_targets: &Tensor<B, 2>) -> Tensor<B, 1> {
         .float()
 }
 
-/// Splits the per-row count- and binary-Tanimoto vectors into
+/// Splits the per-row Tanimoto, Huber, and BCE vectors into
 /// polarity-specific sums and row counts, ready to be flushed through
 /// the metrics [`Transaction`].
 ///
@@ -764,19 +830,29 @@ fn polarity_split<B: Backend>(
     correction_mask: Tensor<B, 1>,
     count_per_row: Tensor<B, 1>,
     binary_per_row: Tensor<B, 1>,
-) -> TanimotoSplitTensors<B> {
+    huber_per_row: Tensor<B, 1>,
+    bce_per_row: Tensor<B, 1>,
+) -> PolaritySplitTensors<B> {
     let reconstruction_mask = correction_mask.clone() * -1.0 + 1.0;
     let reconstruction_count = reconstruction_mask.clone().sum();
     let correction_count = correction_mask.clone().sum();
     let count_reconstruction_sum = (count_per_row.clone() * reconstruction_mask.clone()).sum();
     let count_correction_sum = (count_per_row * correction_mask.clone()).sum();
-    let binary_reconstruction_sum = (binary_per_row.clone() * reconstruction_mask).sum();
-    let binary_correction_sum = (binary_per_row * correction_mask).sum();
-    TanimotoSplitTensors {
+    let binary_reconstruction_sum = (binary_per_row.clone() * reconstruction_mask.clone()).sum();
+    let binary_correction_sum = (binary_per_row * correction_mask.clone()).sum();
+    let huber_reconstruction_sum = (huber_per_row.clone() * reconstruction_mask.clone()).sum();
+    let huber_correction_sum = (huber_per_row * correction_mask.clone()).sum();
+    let bce_reconstruction_sum = (bce_per_row.clone() * reconstruction_mask).sum();
+    let bce_correction_sum = (bce_per_row * correction_mask).sum();
+    PolaritySplitTensors {
         count_reconstruction_sum,
         count_correction_sum,
         binary_reconstruction_sum,
         binary_correction_sum,
+        huber_reconstruction_sum,
+        huber_correction_sum,
+        bce_reconstruction_sum,
+        bce_correction_sum,
         reconstruction_count,
         correction_count,
     }
@@ -1102,6 +1178,10 @@ mod tests {
             count_tanimoto_correction: count_correction,
             binary_tanimoto_reconstruction: binary_reconstruction,
             binary_tanimoto_correction: binary_correction,
+            huber_reconstruction: None,
+            huber_correction: None,
+            bce_reconstruction: None,
+            bce_correction: None,
             reconstruction_rows,
             correction_rows,
             violation_bce: 0.0,

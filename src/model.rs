@@ -1634,10 +1634,20 @@ pub struct MoleculeAutoencoderOutput<B: Backend> {
 pub struct MoleculeLossBreakdown<B: Backend> {
     /// Main counted ECFP reconstruction Huber loss.
     pub reconstruction: Tensor<B, 1>,
+    /// Per-row counterpart of [`Self::reconstruction`], shape `[batch]`,
+    /// surfaced so the train-time metrics pipeline can split the
+    /// reported reconstruction loss by sample polarity (positive
+    /// "reconstruction" rows vs. negative "correction / denoising"
+    /// rows) without affecting the gradient.
+    pub reconstruction_per_row: Tensor<B, 1>,
     /// Auxiliary bit-presence BCE-with-logits loss over the same logits as
     /// the reconstruction term. Already multiplied by the configured
     /// `bce_weight`; zero when the BCE term is disabled.
     pub reconstruction_bce: Tensor<B, 1>,
+    /// Per-row counterpart of [`Self::reconstruction_bce`], shape
+    /// `[batch]`, already multiplied by `bce_weight`. Zero everywhere
+    /// when the BCE term is disabled.
+    pub reconstruction_bce_per_row: Tensor<B, 1>,
     /// Weighted descriptor regression loss.
     pub descriptors: Tensor<B, 1>,
     /// Weighted latent Tanimoto sampled softmax cross-entropy loss.
@@ -1813,22 +1823,25 @@ impl<B: Backend> MoleculeAutoencoder<B> {
         violation_targets: Tensor<B, 2>,
     ) -> MoleculeLossBreakdown<B> {
         let device = output.reconstructed_log_counts.device();
+        let batch_size = output.reconstructed_log_counts.dims()[0];
         let latent = output.latent;
-        let reconstruction_bce = if self.bce_weight > 0.0 {
-            weighted_sparse_log_count_bce_loss(
+        let reconstruction_bce_per_row = if self.bce_weight > 0.0 {
+            weighted_sparse_log_count_bce_loss_per_row(
                 output.reconstructed_log_counts.clone(),
                 &target_fingerprints,
                 self.bce_zero_weight,
                 self.bce_nonzero_weight,
             ) * self.bce_weight
         } else {
-            Tensor::zeros([1], &device)
+            Tensor::zeros([batch_size], &device)
         };
-        let reconstruction = weighted_sparse_log_count_huber_loss(
+        let reconstruction_bce = reconstruction_bce_per_row.clone().mean();
+        let reconstruction_per_row = weighted_sparse_log_count_huber_loss_per_row(
             output.reconstructed_log_counts,
             target_fingerprints,
             self.reconstruction_loss_config(),
         );
+        let reconstruction = reconstruction_per_row.clone().mean();
         let _ = fingerprints; // retained for symmetry; unused once recon
         // is computed against the decoder target.
         let descriptors = if self.descriptor_weight > 0.0 {
@@ -1865,7 +1878,9 @@ impl<B: Backend> MoleculeAutoencoder<B> {
 
         MoleculeLossBreakdown {
             reconstruction,
+            reconstruction_per_row,
             reconstruction_bce,
+            reconstruction_bce_per_row,
             descriptors,
             tanimoto_ranking: tanimoto.loss,
             tanimoto_ranking_accuracy: tanimoto.accuracy,
@@ -1993,6 +2008,33 @@ pub fn weighted_sparse_log_count_bce_loss<B: Backend>(
     zero_weight: f64,
     nonzero_weight: f64,
 ) -> Tensor<B, 1> {
+    weighted_sparse_log_count_bce_loss_per_row(
+        predicted_log_counts,
+        target,
+        zero_weight,
+        nonzero_weight,
+    )
+    .mean()
+}
+
+/// Per-row variant of [`weighted_sparse_log_count_bce_loss`].
+///
+/// Returns a `Tensor<B, 1>` of shape `[batch]` where each element is the
+/// per-cell mean BCE for that row, so the scalar version is `.mean()` of
+/// this and positive (reconstruction) rows can be compared against
+/// negative (correction / denoising) rows without a polarity mix-up.
+///
+/// # Panics
+///
+/// Panics when the predicted dense reconstruction shape does not match
+/// the sparse target batch size and fingerprint width.
+#[must_use]
+pub fn weighted_sparse_log_count_bce_loss_per_row<B: Backend>(
+    predicted_log_counts: Tensor<B, 2>,
+    target: &SparseFingerprintBatch<B>,
+    zero_weight: f64,
+    nonzero_weight: f64,
+) -> Tensor<B, 1> {
     let predicted_dims = predicted_log_counts.dims();
     assert_eq!(
         predicted_dims[0],
@@ -2005,10 +2047,10 @@ pub fn weighted_sparse_log_count_bce_loss<B: Backend>(
     );
 
     let log2 = std::f64::consts::LN_2;
-    let denominator = (predicted_dims[0] * predicted_dims[1]) as f64;
+    let width = predicted_dims[1] as f64;
     // y_i = 0: penalty grows when ẑ_i > 0 (positive leak).
     let zero_bce = (softplus(predicted_log_counts.clone()) - log2).clamp_min(0.0);
-    let zero_total = zero_bce.sum() * zero_weight;
+    let zero_per_row: Tensor<B, 1> = zero_bce.sum_dim(1).squeeze_dim(1);
     let predicted_nonzero = predicted_log_counts.gather(1, target.indices.clone());
     // y_i = 1: penalty grows when ẑ_i < 0 (negative dip).
     let active_bce = (softplus(predicted_nonzero.clone() * -1.0) - log2).clamp_min(0.0);
@@ -2017,8 +2059,9 @@ pub fn weighted_sparse_log_count_bce_loss<B: Backend>(
     let zero_at_active_bce = (softplus(predicted_nonzero) - log2).clamp_min(0.0);
     let correction =
         (active_bce * nonzero_weight - zero_at_active_bce * zero_weight) * target.mask.clone();
+    let correction_per_row: Tensor<B, 1> = correction.sum_dim(1).squeeze_dim(1);
 
-    (zero_total + correction.sum()) / denominator
+    (zero_per_row * zero_weight + correction_per_row) / width
 }
 
 /// Weighted Huber loss over sparse `log1p(count)` reconstruction targets.
@@ -2037,6 +2080,26 @@ pub fn weighted_sparse_log_count_huber_loss<B: Backend>(
     target: SparseFingerprintBatch<B>,
     config: ReconstructionLossConfig,
 ) -> Tensor<B, 1> {
+    weighted_sparse_log_count_huber_loss_per_row(predicted_log_counts, target, config).mean()
+}
+
+/// Per-row variant of [`weighted_sparse_log_count_huber_loss`].
+///
+/// Returns a `Tensor<B, 1>` of shape `[batch]` where each element is the
+/// per-cell mean weighted Huber for that row, so the scalar version is
+/// `.mean()` of this and positive (reconstruction) rows can be compared
+/// against negative (correction / denoising) rows without a polarity
+/// mix-up.
+///
+/// # Panics
+///
+/// Panics when the predicted dense reconstruction shape does not match
+/// the sparse target batch size and fingerprint width.
+pub fn weighted_sparse_log_count_huber_loss_per_row<B: Backend>(
+    predicted_log_counts: Tensor<B, 2>,
+    target: SparseFingerprintBatch<B>,
+    config: ReconstructionLossConfig,
+) -> Tensor<B, 1> {
     let predicted_dims = predicted_log_counts.dims();
     assert_eq!(
         predicted_dims[0],
@@ -2048,9 +2111,9 @@ pub fn weighted_sparse_log_count_huber_loss<B: Backend>(
         "predicted reconstruction width must match sparse fingerprint width"
     );
 
-    let denominator = (predicted_dims[0] * predicted_dims[1]) as f64;
+    let width = predicted_dims[1] as f64;
     let zero_huber = huber_from_delta(predicted_log_counts.clone().clamp_min(0.0), config.beta);
-    let zero_total = zero_huber.sum() * config.zero_weight;
+    let zero_per_row: Tensor<B, 1> = zero_huber.sum_dim(1).squeeze_dim(1);
     let predicted_nonzero = predicted_log_counts.gather(1, target.indices.clone());
     let nonzero_huber = huber_from_delta(
         (predicted_nonzero.clone() - target.log_counts).abs(),
@@ -2060,8 +2123,9 @@ pub fn weighted_sparse_log_count_huber_loss<B: Backend>(
     let correction = (nonzero_huber * config.nonzero_weight
         - zero_nonzero_huber * config.zero_weight)
         * target.mask;
+    let correction_per_row: Tensor<B, 1> = correction.sum_dim(1).squeeze_dim(1);
 
-    (zero_total + correction.sum()) / denominator
+    (zero_per_row * config.zero_weight + correction_per_row) / width
 }
 
 #[cfg(all(test, feature = "ndarray"))]

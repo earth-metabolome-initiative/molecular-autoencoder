@@ -60,15 +60,17 @@ impl<B: Backend> ItemLazy for MoleculeAutoencoderTrainingOutput<B> {
             reconstruction: Tensor::zeros([1, 1], device),
             losses: MoleculeLossBreakdown {
                 reconstruction: Tensor::from_data(reconstruction, device),
+                // Burn's `ItemLazy` sync surface is consumed by the
+                // `MetricEntry` display path, which only ever reads the
+                // scalar loss tensors. The per-row tensors stay empty
+                // here for the same reason the diagnostics do.
+                reconstruction_per_row: Tensor::zeros([0], device),
                 reconstruction_bce: Tensor::from_data(reconstruction_bce, device),
+                reconstruction_bce_per_row: Tensor::zeros([0], device),
                 descriptors: Tensor::from_data(descriptors, device),
                 tanimoto_ranking: Tensor::from_data(tanimoto_ranking, device),
                 tanimoto_ranking_accuracy: Tensor::from_data(tanimoto_accuracy, device),
                 tanimoto_ranking_pairs: Tensor::from_data(tanimoto_pairs, device),
-                // The sync output is consumed by Burn's MetricEntry
-                // display path, which only ever reads the scalar loss
-                // tensors. Empty diagnostics keep the type-level
-                // contract without paying for additional registers.
                 tanimoto_diagnostics: TanimotoRankingDiagnostics::empty(device),
                 violation_bce: Tensor::from_data(violation_bce, device),
                 violation_diagnostics: ViolationDiagnostics::empty(device),
@@ -197,7 +199,9 @@ mod tests {
         let reconstruction = Tensor::<B, 2>::zeros([1, 4], &device);
         let losses = MoleculeLossBreakdown {
             reconstruction: scalar::<B>(1.0, &device),
+            reconstruction_per_row: Tensor::<B, 1>::zeros([0], &device),
             reconstruction_bce: scalar::<B>(0.3, &device),
+            reconstruction_bce_per_row: Tensor::<B, 1>::zeros([0], &device),
             descriptors: scalar::<B>(0.2, &device),
             tanimoto_ranking: scalar::<B>(0.4, &device),
             tanimoto_ranking_accuracy: scalar::<B>(0.5, &device),
@@ -221,7 +225,9 @@ mod tests {
             Tensor::<B, 2>::zeros([1, 4], &device),
             MoleculeLossBreakdown {
                 reconstruction: scalar::<B>(1.0, &device),
+                reconstruction_per_row: Tensor::<B, 1>::zeros([0], &device),
                 reconstruction_bce: scalar::<B>(0.3, &device),
+                reconstruction_bce_per_row: Tensor::<B, 1>::zeros([0], &device),
                 descriptors: scalar::<B>(0.2, &device),
                 tanimoto_ranking: scalar::<B>(0.4, &device),
                 tanimoto_ranking_accuracy: scalar::<B>(0.5, &device),
