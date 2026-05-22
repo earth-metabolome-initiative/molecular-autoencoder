@@ -2,8 +2,13 @@
 
 use burn::{
     prelude::*,
-    tensor::{Int, TensorData, activation::log_softmax},
+    tensor::{
+        Int, TensorData,
+        activation::{log_softmax, sigmoid},
+    },
 };
+
+use crate::model::TanimotoLossKind;
 
 /// Metric-derived Tanimoto geometry candidates and score gaps.
 #[derive(Debug, Clone)]
@@ -236,8 +241,14 @@ fn binary_mcc(tp: u64, tn: u64, fp: u64, fn_count: u64) -> f64 {
     numerator / denominator
 }
 
-/// In-batch softmax ranking objective for counted-fingerprint Tanimoto metric order.
+/// In-batch ranking objective for counted-fingerprint Tanimoto metric
+/// order. Dispatches between gap-weighted softmax cross-entropy and the
+/// SoftRank Spearman surrogate via `loss_kind`.
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "configuration knobs are passed flat through the model's forward path rather than bundled in a config struct, matching the rest of this module's signatures"
+)]
 pub fn tanimoto_ranking_output<B: Backend>(
     latent: Tensor<B, 2>,
     batch: TanimotoRankingBatch<B>,
@@ -245,6 +256,8 @@ pub fn tanimoto_ranking_output<B: Backend>(
     latent_temperature: f64,
     _metric_temperature: f64,
     min_gap: f64,
+    loss_kind: TanimotoLossKind,
+    softrank_temperature: f64,
 ) -> TanimotoRankingOutput<B> {
     let [batch_size, latent_width] = latent.dims();
     if batch_size < 3 {
@@ -278,14 +291,6 @@ pub fn tanimoto_ranking_output<B: Backend>(
             .expand([pair_count, candidate_count, latent_width]);
     let logits =
         row_cosine_similarity_3d(anchor_latent, candidate_latent) / latent_temperature.max(1.0e-6);
-    let log_probs = log_softmax(logits.clone(), 1);
-    let target = batch
-        .best_candidate_position
-        .clone()
-        .narrow(0, 0, pair_count)
-        .one_hot::<2>(candidate_count)
-        .float();
-    let cross_entropy = (log_probs * target * -1.0).sum_dim(1);
     let target_gap = batch.top2_gap.narrow(0, 0, pair_count).detach();
     let valid = target_gap.clone().greater_elem(min_gap).float();
     let valid_pairs = valid.clone().sum();
@@ -298,10 +303,29 @@ pub fn tanimoto_ranking_output<B: Backend>(
         / valid_pairs.clone().clamp_min(1.0);
 
     let candidate_scores = batch.candidate_scores.narrow(0, 0, pair_count).detach();
-    let valid_mask: Tensor<B, 1> = valid.reshape([pair_count]);
+    let valid_mask: Tensor<B, 1> = valid.clone().reshape([pair_count]);
+
+    let loss = match loss_kind {
+        TanimotoLossKind::SoftmaxCe => {
+            let log_probs = log_softmax(logits.clone(), 1);
+            let target = best_positions.clone().one_hot::<2>(candidate_count).float();
+            let cross_entropy = (log_probs * target * -1.0).sum_dim(1);
+            (cross_entropy * gap_weights).sum() / gap_weight_sum
+        }
+        TanimotoLossKind::SoftRankSpearman => {
+            // Differentiable Spearman surrogate via Taylor-style soft ranks.
+            // Gradient flows through `logits`; the teacher side is detached.
+            let logits_soft_rank = soft_rank(logits.clone(), softrank_temperature);
+            let teacher_soft_rank = soft_rank(candidate_scores.clone(), softrank_temperature);
+            let softrank_per_row =
+                pearson_per_row(logits_soft_rank, teacher_soft_rank, candidate_count);
+            let softrank_one_minus = softrank_per_row.ones_like() - softrank_per_row;
+            (softrank_one_minus * gap_weights).sum() / gap_weight_sum
+        }
+    };
 
     TanimotoRankingOutput {
-        loss: (cross_entropy * gap_weights).sum() / gap_weight_sum,
+        loss,
         valid_pairs,
         accuracy,
         diagnostics: TanimotoRankingDiagnostics {
@@ -317,6 +341,10 @@ pub fn tanimoto_ranking_output<B: Backend>(
 
 /// Weighted Tanimoto geometry output, or zero diagnostics when disabled.
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "configuration knobs are passed flat through the model's forward path rather than bundled in a config struct, matching the rest of this module's signatures"
+)]
 pub fn weighted_tanimoto_ranking_output<B: Backend>(
     latent: Tensor<B, 2>,
     batch: TanimotoRankingBatch<B>,
@@ -325,6 +353,8 @@ pub fn weighted_tanimoto_ranking_output<B: Backend>(
     metric_temperature: f64,
     min_gap: f64,
     weight: f64,
+    loss_kind: TanimotoLossKind,
+    softrank_temperature: f64,
 ) -> TanimotoRankingOutput<B> {
     if weight > 0.0 {
         let mut output = tanimoto_ranking_output(
@@ -334,6 +364,8 @@ pub fn weighted_tanimoto_ranking_output<B: Backend>(
             latent_temperature,
             metric_temperature,
             min_gap,
+            loss_kind,
+            softrank_temperature,
         );
         output.loss = output.loss * weight;
         output
@@ -517,11 +549,103 @@ fn row_cosine_similarity_3d<B: Backend>(left: Tensor<B, 3>, right: Tensor<B, 3>)
         .reshape([batch_size, candidate_count])
 }
 
+/// Per-row Pearson correlation between two `[pair_count, candidate_count]`
+/// tensors, returned as a `[pair_count, 1]` column.
+///
+/// Used by the SoftRank Spearman surrogate to score the agreement between
+/// the soft ranks of the latent logits and the soft ranks of the teacher
+/// scores. The denominator is clamped via `clamp_min(1.0e-12)` so
+/// degenerate zero-variance rows contribute `0` rather than `NaN`.
+fn pearson_per_row<B: Backend>(
+    left: Tensor<B, 2>,
+    right: Tensor<B, 2>,
+    candidate_count: usize,
+) -> Tensor<B, 2> {
+    let inv_n = 1.0 / candidate_count as f64;
+    let left_mean = left.clone().mean_dim(1);
+    let right_mean = right.clone().mean_dim(1);
+    let left_centered = left - left_mean;
+    let right_centered = right - right_mean;
+    let covariance = (left_centered.clone() * right_centered.clone()).sum_dim(1) * inv_n;
+    let left_var = left_centered.powf_scalar(2.0).sum_dim(1) * inv_n;
+    let right_var = right_centered.powf_scalar(2.0).sum_dim(1) * inv_n;
+    let denominator = (left_var * right_var).sqrt().clamp_min(1.0e-12);
+    covariance / denominator
+}
+
+/// Taylor-style soft-rank operator from
+/// [Blondel et al. 2020, "Fast Differentiable Sorting and Ranking"][1]
+/// in its pairwise-sigmoid (non-projection) form.
+///
+/// Given a `[pair_count, candidate_count]` tensor of values and a
+/// temperature `tau`, returns a same-shape tensor where each row is the
+/// soft rank of the corresponding input row. Smaller `tau` makes the
+/// pairwise sigmoid sharper, approaching the hard ranks (plus the
+/// constant `0.5` per row from the `j == i` diagonal, which is
+/// invariant under Pearson and so cancels out of the downstream loss).
+///
+/// [1]: https://arxiv.org/abs/2002.08871
+fn soft_rank<B: Backend>(values: Tensor<B, 2>, tau: f64) -> Tensor<B, 2> {
+    let [pair_count, candidate_count] = values.dims();
+    let left = values.clone().unsqueeze_dim::<3>(2);
+    let right = values.unsqueeze_dim::<3>(1);
+    let pairwise = sigmoid((left - right) / tau.max(1.0e-6));
+    pairwise.sum_dim(2).reshape([pair_count, candidate_count])
+}
+
 #[cfg(all(test, feature = "ndarray"))]
 mod tests {
     use super::*;
 
     type B = burn::backend::NdArray<f32, i64>;
+
+    /// Test shim: calls [`tanimoto_ranking_output`] with the shipping
+    /// `SoftmaxCe` baseline and a fixed SoftRank temperature so existing
+    /// SoftmaxCe-only tests keep their original signature. SoftRank tests
+    /// call [`tanimoto_ranking_output`] directly with the explicit knobs.
+    fn softmax_ce_ranking_output(
+        latent: Tensor<B, 2>,
+        batch: TanimotoRankingBatch<B>,
+        max_pairs: usize,
+        latent_temperature: f64,
+        metric_temperature: f64,
+        min_gap: f64,
+    ) -> TanimotoRankingOutput<B> {
+        tanimoto_ranking_output(
+            latent,
+            batch,
+            max_pairs,
+            latent_temperature,
+            metric_temperature,
+            min_gap,
+            TanimotoLossKind::SoftmaxCe,
+            0.20,
+        )
+    }
+
+    /// Test shim for [`weighted_tanimoto_ranking_output`] under the
+    /// `SoftmaxCe` baseline.
+    fn softmax_ce_weighted_ranking_output(
+        latent: Tensor<B, 2>,
+        batch: TanimotoRankingBatch<B>,
+        max_pairs: usize,
+        latent_temperature: f64,
+        metric_temperature: f64,
+        min_gap: f64,
+        weight: f64,
+    ) -> TanimotoRankingOutput<B> {
+        weighted_tanimoto_ranking_output(
+            latent,
+            batch,
+            max_pairs,
+            latent_temperature,
+            metric_temperature,
+            min_gap,
+            weight,
+            TanimotoLossKind::SoftmaxCe,
+            0.20,
+        )
+    }
 
     #[test]
     fn zero_batch_has_expected_shapes() {
@@ -564,8 +688,8 @@ mod tests {
         };
 
         let preserved =
-            tanimoto_ranking_output(latent.clone(), preserved_batch, 1, 0.10, 0.10, 0.01);
-        let reversed = tanimoto_ranking_output(latent, reversed_batch, 1, 0.10, 0.10, 0.01);
+            softmax_ce_ranking_output(latent.clone(), preserved_batch, 1, 0.10, 0.10, 0.01);
+        let reversed = softmax_ce_ranking_output(latent, reversed_batch, 1, 0.10, 0.10, 0.01);
 
         assert!(preserved.loss.into_scalar() < reversed.loss.into_scalar());
         assert_eq!(preserved.valid_pairs.into_scalar(), 1.0);
@@ -590,7 +714,7 @@ mod tests {
             candidate_scores: Tensor::<B, 2>::zeros([1, 2], &device),
         };
 
-        let output = tanimoto_ranking_output(latent, batch, 1, 0.10, 0.10, 0.01);
+        let output = softmax_ce_ranking_output(latent, batch, 1, 0.10, 0.10, 0.01);
 
         assert_eq!(output.loss.into_scalar(), 0.0);
         assert_eq!(output.valid_pairs.into_scalar(), 0.0);
@@ -613,7 +737,7 @@ mod tests {
             candidate_scores: Tensor::<B, 2>::zeros([3, 2], &device),
         };
 
-        let loss = tanimoto_ranking_output(latent, batch, 0, 0.5, 0.5, 0.01)
+        let loss = softmax_ce_ranking_output(latent, batch, 0, 0.5, 0.5, 0.01)
             .loss
             .into_scalar();
         let expected = (0.9 * softmax_ce_for_class0(2.0, 0.0)
@@ -643,7 +767,7 @@ mod tests {
             candidate_scores: Tensor::<B, 2>::zeros([3, 2], &device),
         };
 
-        let output = tanimoto_ranking_output(latent, batch, 1, 0.5, 0.5, 0.01);
+        let output = softmax_ce_ranking_output(latent, batch, 1, 0.5, 0.5, 0.01);
 
         assert_eq!(output.valid_pairs.into_scalar(), 1.0);
     }
@@ -654,7 +778,7 @@ mod tests {
         let latent = Tensor::<B, 2>::zeros([2, 2], &device);
         let batch = TanimotoRankingBatch::zeros(2, &device);
 
-        let output = tanimoto_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01);
+        let output = softmax_ce_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01);
 
         assert_eq!(output.loss.into_scalar(), 0.0);
         assert_eq!(output.valid_pairs.into_scalar(), 0.0);
@@ -682,7 +806,7 @@ mod tests {
             top2_gap: Tensor::<B, 2>::zeros([3, 1], &device),
             candidate_scores: Tensor::<B, 2>::zeros([3, 1], &device),
         };
-        let output = tanimoto_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01);
+        let output = softmax_ce_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01);
         assert_eq!(output.loss.into_scalar(), 0.0);
         assert_eq!(output.valid_pairs.into_scalar(), 0.0);
         assert_eq!(output.accuracy.into_scalar(), 0.0);
@@ -693,7 +817,7 @@ mod tests {
         let device = burn::backend::ndarray::NdArrayDevice::default();
         let latent = Tensor::<B, 2>::ones([3, 2], &device);
         let batch = TanimotoRankingBatch::zeros(3, &device);
-        let output = weighted_tanimoto_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01, 0.0);
+        let output = softmax_ce_weighted_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01, 0.0);
         assert_eq!(output.loss.into_scalar(), 0.0);
         assert_eq!(output.valid_pairs.into_scalar(), 0.0);
         assert_eq!(output.accuracy.into_scalar(), 0.0);
@@ -718,10 +842,11 @@ mod tests {
             top2_gap: Tensor::<B, 2>::ones([3, 1], &device),
             candidate_scores: Tensor::<B, 2>::zeros([3, 2], &device),
         };
-        let unweighted = tanimoto_ranking_output(latent.clone(), batch.clone(), 0, 0.5, 0.5, 0.01)
-            .loss
-            .into_scalar();
-        let weighted = weighted_tanimoto_ranking_output(latent, batch, 0, 0.5, 0.5, 0.01, 2.5)
+        let unweighted =
+            softmax_ce_ranking_output(latent.clone(), batch.clone(), 0, 0.5, 0.5, 0.01)
+                .loss
+                .into_scalar();
+        let weighted = softmax_ce_weighted_ranking_output(latent, batch, 0, 0.5, 0.5, 0.01, 2.5)
             .loss
             .into_scalar();
         assert!((weighted - unweighted * 2.5).abs() < 1.0e-5);
@@ -898,5 +1023,222 @@ mod tests {
         //     = 7000 / 9949.87... = 0.7035...
         let mcc = binary_mcc(90, 80, 10, 20);
         assert!((mcc - 0.703_526).abs() < 1.0e-5, "got {mcc}");
+    }
+
+    #[test]
+    fn soft_rank_matches_hand_computed_values() {
+        // Hand computation for values [1.0, 3.0, 2.0]:
+        // soft_rank[i] = sum_j sigmoid((v[i] - v[j]) / tau), so j==i
+        // contributes a constant 0.5 per row.
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let values = Tensor::<B, 2>::from_floats([[1.0, 3.0, 2.0]], &device);
+        let ranks_tau_one = soft_rank(values.clone(), 1.0)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32 data");
+        // Hand-precise via sigmoid(-x) = 1/(1+e^x):
+        // sigmoid(-2) = 0.119_202_922
+        // sigmoid(-1) = 0.268_941_421
+        // Row 0 (v=1.0): 0.5 + 0.119_202_922 + 0.268_941_421 = 0.888_144_343
+        // Row 1 (v=3.0): 0.880_797_078 + 0.5 + 0.731_058_578 = 2.111_855_656
+        // Row 2 (v=2.0): 0.731_058_578 + 0.268_941_421 + 0.5  = 1.500_000_000
+        assert!((ranks_tau_one[0] - 0.888_144).abs() < 1.0e-4);
+        assert!((ranks_tau_one[1] - 2.111_856).abs() < 1.0e-4);
+        assert!((ranks_tau_one[2] - 1.5).abs() < 1.0e-6);
+
+        // Tiny tau sharpens the pairwise sigmoids: each summand collapses
+        // to 0 or 1 depending on whether v[i] > v[j], plus the constant
+        // 0.5 from j == i. Hard ranks of [1.0, 3.0, 2.0] are
+        // [0, 2, 1] (zero-indexed by how many values it strictly beats),
+        // so the limiting soft ranks at tau -> 0 are [0.5, 2.5, 1.5].
+        let ranks_tau_tiny = soft_rank(values, 0.01)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32 data");
+        assert!((ranks_tau_tiny[0] - 0.5).abs() < 1.0e-3);
+        assert!((ranks_tau_tiny[1] - 2.5).abs() < 1.0e-3);
+        assert!((ranks_tau_tiny[2] - 1.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn pearson_per_row_handles_perfect_and_inverse_correlation() {
+        // Three rows: identical -> +1, reversed -> -1, constant -> 0
+        // (zero-variance row, denominator clamp routes through to 0).
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let left = Tensor::<B, 2>::from_floats(
+            [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]],
+            &device,
+        );
+        let right = Tensor::<B, 2>::from_floats(
+            [[1.0, 2.0, 3.0], [3.0, 2.0, 1.0], [5.0, 5.0, 5.0]],
+            &device,
+        );
+        let values = pearson_per_row(left, right, 3)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32 data");
+        assert!((values[0] - 1.0).abs() < 1.0e-5, "got {}", values[0]);
+        assert!((values[1] + 1.0).abs() < 1.0e-5, "got {}", values[1]);
+        assert!(values[2].abs() < 1.0e-3, "got {}", values[2]);
+    }
+
+    #[test]
+    fn softrank_loss_is_zero_when_latent_matches_teacher_ranking() {
+        // Three anchors, two candidates each. Build a latent whose
+        // pairwise cosine ordering on each anchor row matches the
+        // teacher's candidate_scores ordering exactly; the SoftRank
+        // Spearman surrogate should land near zero (Pearson of two
+        // identically-ranked rows is +1, so `1 - Pearson` ~ 0).
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // Latent rows i=0..2 are the anchors; rows i=3..8 are the
+        // candidate partners. Each anchor sees [near, far] candidates
+        // where "near" has the higher cosine to the anchor.
+        let latent = Tensor::<B, 2>::from_floats(
+            [
+                [1.0, 0.0],   // anchor 0
+                [0.0, 1.0],   // anchor 1
+                [1.0, 1.0],   // anchor 2
+                [1.0, 0.0],   // anchor 0's "near"
+                [-1.0, 0.0],  // anchor 0's "far"
+                [0.0, 1.0],   // anchor 1's "near"
+                [0.0, -1.0],  // anchor 1's "far"
+                [1.0, 1.0],   // anchor 2's "near"
+                [-1.0, -1.0], // anchor 2's "far"
+            ],
+            &device,
+        );
+        let batch = TanimotoRankingBatch {
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![3_i64, 4, 5, 6, 7, 8], [3, 2]),
+                &device,
+            ),
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![0_i64, 0, 0], [3]),
+                &device,
+            ),
+            top2_gap: Tensor::<B, 2>::from_floats([[0.9], [0.9], [0.9]], &device),
+            // Teacher: position 0 has higher Tanimoto than position 1
+            // on every anchor, matching the latent ordering above.
+            candidate_scores: Tensor::<B, 2>::from_floats(
+                [[0.9, 0.1], [0.9, 0.1], [0.9, 0.1]],
+                &device,
+            ),
+        };
+
+        // `max_pairs = 3` limits the anchor sweep to the first 3 latent
+        // rows, matching the metadata shape; the trailing 6 latent rows
+        // are referenced only via candidate_index.
+        let loss = tanimoto_ranking_output(
+            latent,
+            batch,
+            3,
+            0.10,
+            0.10,
+            0.01,
+            TanimotoLossKind::SoftRankSpearman,
+            0.05,
+        )
+        .loss
+        .into_scalar();
+
+        // Soft ranks at finite tau are never exactly hard, but with
+        // candidate_count == 2 and a wide separation between the
+        // teacher's two scores, `1 - Pearson` collapses to within 1e-4
+        // of zero.
+        assert!(loss.abs() < 1.0e-4, "expected ~0, got {loss}");
+    }
+
+    #[test]
+    fn softrank_loss_with_k4_responds_to_ordering_quality() {
+        // Larger K (=4) so the soft ranks are no longer trivially hard;
+        // verifies that a perfectly-aligned latent gives a near-zero
+        // loss and that flipping the latent ordering produces a strictly
+        // larger loss. Catches regressions that only manifest when
+        // multiple candidates compete inside the pairwise sigmoid cube.
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // One anchor (row 0) + four candidates (rows 1..=4). The four
+        // candidate vectors are placed on a circle around the anchor at
+        // monotonically increasing angles so their cosine similarities
+        // to the anchor are strictly decreasing.
+        let latent = Tensor::<B, 2>::from_floats(
+            [
+                [1.0, 0.0],       // anchor
+                [1.0, 0.0],       // candidate 0, cos = 1.0
+                [0.866_025, 0.5], // candidate 1, cos ≈ 0.866 (30°)
+                [0.5, 0.866_025], // candidate 2, cos ≈ 0.5   (60°)
+                [0.0, 1.0],       // candidate 3, cos = 0.0   (90°)
+            ],
+            &device,
+        );
+        let aligned = TanimotoRankingBatch {
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+                &device,
+            ),
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![0_i64], [1]),
+                &device,
+            ),
+            top2_gap: Tensor::<B, 2>::from_data(TensorData::new(vec![0.5_f32], [1, 1]), &device),
+            // Teacher ranking matches the latent ordering exactly.
+            candidate_scores: Tensor::<B, 2>::from_floats([[0.9, 0.7, 0.4, 0.1]], &device),
+        };
+        let misaligned = TanimotoRankingBatch {
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+                &device,
+            ),
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![0_i64], [1]),
+                &device,
+            ),
+            top2_gap: Tensor::<B, 2>::from_data(TensorData::new(vec![0.5_f32], [1, 1]), &device),
+            // Teacher ranking is reversed.
+            candidate_scores: Tensor::<B, 2>::from_floats([[0.1, 0.4, 0.7, 0.9]], &device),
+        };
+
+        let aligned_loss = tanimoto_ranking_output(
+            latent.clone(),
+            aligned,
+            1,
+            0.10,
+            0.10,
+            0.01,
+            TanimotoLossKind::SoftRankSpearman,
+            0.20,
+        )
+        .loss
+        .into_scalar();
+        let misaligned_loss = tanimoto_ranking_output(
+            latent,
+            misaligned,
+            1,
+            0.10,
+            0.10,
+            0.01,
+            TanimotoLossKind::SoftRankSpearman,
+            0.20,
+        )
+        .loss
+        .into_scalar();
+
+        // Aligned soft ranks should give Pearson ~ +1, so `1 - Pearson`
+        // is small (finite tau leaves a tiny residual that is still well
+        // below 0.05 for K = 4).
+        assert!(
+            aligned_loss < 0.05,
+            "aligned SoftRank loss should be near zero, got {aligned_loss}"
+        );
+        // Reversed ordering should yield Pearson ~ -1, so `1 - Pearson`
+        // approaches 2 (the maximum). The aligned case must be strictly
+        // smaller; we leave plenty of margin to absorb tau-driven slack.
+        assert!(
+            misaligned_loss > 1.5,
+            "misaligned SoftRank loss should be near 2, got {misaligned_loss}"
+        );
+        assert!(
+            misaligned_loss > aligned_loss,
+            "misaligned loss {misaligned_loss} should exceed aligned loss {aligned_loss}"
+        );
     }
 }

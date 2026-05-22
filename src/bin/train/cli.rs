@@ -9,8 +9,9 @@ use molecular_autoencoder::{
     DEFAULT_LATENT_NOISE_STD, DEFAULT_LATENT_WIDTH, DEFAULT_NEGATIVES_PER_POSITIVE,
     DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR, DEFAULT_TANIMOTO_RANKING_LATENT_TEMPERATURE,
     DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE, DEFAULT_TANIMOTO_RANKING_MIN_GAP,
-    DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH, DEFAULT_TANIMOTO_RANKING_WEIGHT,
-    DEFAULT_VIOLATION_WEIGHT, MoleculeAutoencoderConfig, SmilesQualityFilter,
+    DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH, DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE,
+    DEFAULT_TANIMOTO_RANKING_WEIGHT, DEFAULT_VIOLATION_WEIGHT, MoleculeAutoencoderConfig,
+    SmilesQualityFilter, TanimotoLossKind,
 };
 
 use crate::{AppResult, invalid_input};
@@ -335,6 +336,39 @@ pub struct Args {
     /// Per-position weight applied to active bins inside the BCE term.
     #[arg(long, default_value_t = DEFAULT_BCE_NONZERO_WEIGHT)]
     pub bce_nonzero_weight: f64,
+
+    /// Tanimoto-geometry ranking loss kind. `softmax-ce` is the shipping
+    /// baseline (gap-weighted softmax cross-entropy on the top-1 target);
+    /// `softrank-spearman` is the differentiable Spearman surrogate
+    /// `1 − Pearson(soft_rank(logits), soft_rank(teacher_scores))`.
+    #[arg(long, value_enum, default_value_t = TanimotoLossKindArg::SoftmaxCe)]
+    pub tanimoto_ranking_loss: TanimotoLossKindArg,
+
+    /// Pairwise-sigmoid temperature for the SoftRank Spearman surrogate
+    /// (ignored when `--tanimoto-ranking-loss` is `softmax-ce`).
+    #[arg(long, default_value_t = DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE)]
+    pub tanimoto_ranking_softrank_temperature: f64,
+}
+
+/// CLI mirror of [`molecular_autoencoder::TanimotoLossKind`] derived as
+/// [`clap::ValueEnum`] so the library does not need a `clap` dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TanimotoLossKindArg {
+    /// Gap-weighted softmax cross-entropy against the one-hot top-1
+    /// candidate (shipping baseline).
+    SoftmaxCe,
+    /// Gap-weighted `1 − Pearson(soft_rank(logits),
+    /// soft_rank(teacher_scores))` SoftRank Spearman surrogate.
+    SoftrankSpearman,
+}
+
+impl From<TanimotoLossKindArg> for TanimotoLossKind {
+    fn from(value: TanimotoLossKindArg) -> Self {
+        match value {
+            TanimotoLossKindArg::SoftmaxCe => Self::SoftmaxCe,
+            TanimotoLossKindArg::SoftrankSpearman => Self::SoftRankSpearman,
+        }
+    }
 }
 
 impl Args {
@@ -432,6 +466,8 @@ impl Args {
             .tanimoto_ranking_min_gap(self.tanimoto_ranking_min_gap)
             .tanimoto_ranking_candidates(self.tanimoto_ranking_candidates)
             .tanimoto_ranking_pairs_per_batch(self.tanimoto_ranking_pairs_per_batch)
+            .tanimoto_ranking_loss_kind(self.tanimoto_ranking_loss.into())
+            .tanimoto_ranking_softrank_temperature(self.tanimoto_ranking_softrank_temperature)
             .ecfp_radius(ecfp_radius)
             .bce_weight(self.bce_weight)
             .bce_zero_weight(self.bce_zero_weight)

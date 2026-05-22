@@ -56,6 +56,16 @@ pub const DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR: usize = 32;
 /// Default max anchors per batch for the ranking loss (`0` uses all rows).
 pub const DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH: usize = 0;
 
+/// Default SoftRank Spearman surrogate temperature.
+///
+/// `0.20` keeps the pairwise sigmoid in a less-saturated regime than the
+/// `0.10` spectral default — Tanimoto similarities live in `[0, 1]`
+/// natively, so the divided-by-`latent_temperature` logits are on a
+/// different scale than the spectral cosine logits the SoftRank surrogate
+/// was originally tuned against. Sweep `{0.05, 0.10, 0.20, 0.50}` when
+/// A/B-ing against the softmax CE baseline.
+pub const DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE: f64 = 0.20;
+
 /// Default Huber transition point in log-count space.
 pub const DEFAULT_RECONSTRUCTION_BETA: f64 = 1.0;
 
@@ -105,6 +115,45 @@ const fn default_tanimoto_ranking_latent_temperature() -> f64 {
 /// Serde fallback for the metric-side temperature kept for diagnostics.
 const fn default_tanimoto_ranking_metric_temperature() -> f64 {
     DEFAULT_TANIMOTO_RANKING_METRIC_TEMPERATURE
+}
+
+/// Serde fallback for the SoftRank Spearman surrogate temperature.
+const fn default_tanimoto_ranking_softrank_temperature() -> f64 {
+    DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE
+}
+
+/// Selectable Tanimoto-geometry ranking loss kind.
+///
+/// Picks between the existing gap-weighted softmax cross-entropy on the
+/// top-1 target and the Taylor-style SoftRank Spearman surrogate
+/// `1 - Pearson(soft_rank(logits), soft_rank(teacher_scores))`.
+/// Diagnostics (MRR / Pearson / Spearman / accuracy) are computed
+/// identically in both modes; only the gradient signal changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TanimotoLossKind {
+    /// Gap-weighted softmax cross-entropy against the one-hot top-1
+    /// candidate. Tested and shipping baseline.
+    #[default]
+    SoftmaxCe,
+    /// Gap-weighted `1 − Pearson(soft_rank(logits),
+    /// soft_rank(teacher_scores))` SoftRank Spearman surrogate, used to
+    /// learn the full per-candidate ordering instead of just the
+    /// argmax. Experimental.
+    ///
+    /// `#[serde(rename = ...)]` pins the on-disk spelling to the same
+    /// `softrank-spearman` form the CLI accepts; the default kebab-case
+    /// rule would produce `soft-rank-spearman` (three words), which
+    /// would not round-trip with the CLI flag.
+    #[serde(rename = "softrank-spearman")]
+    SoftRankSpearman,
+}
+
+/// Serde fallback for the Tanimoto ranking loss kind. Returns the
+/// shipping baseline (`SoftmaxCe`) so deserializing an older config
+/// keeps its existing behavior.
+const fn default_tanimoto_ranking_loss_kind() -> TanimotoLossKind {
+    TanimotoLossKind::SoftmaxCe
 }
 
 /// Serde fallback for the counted-ECFP radius hyperparameter.
@@ -773,6 +822,15 @@ pub struct TanimotoRankingConfig {
     /// Maximum anchors used per batch by the geometry loss; `0` uses
     /// every row.
     pairs_per_batch: usize,
+    /// Which ranking loss the training loop should optimise. Defaults to
+    /// the shipping softmax cross-entropy baseline.
+    #[serde(default = "default_tanimoto_ranking_loss_kind")]
+    loss_kind: TanimotoLossKind,
+    /// Temperature for the pairwise sigmoid inside the SoftRank Spearman
+    /// surrogate. Ignored when [`Self::loss_kind`] is
+    /// [`TanimotoLossKind::SoftmaxCe`].
+    #[serde(default = "default_tanimoto_ranking_softrank_temperature")]
+    softrank_temperature: f64,
 }
 
 impl Default for TanimotoRankingConfig {
@@ -819,6 +877,18 @@ impl TanimotoRankingConfig {
     pub const fn pairs_per_batch(&self) -> usize {
         self.pairs_per_batch
     }
+
+    /// Ranking loss kind selected for this configuration.
+    #[must_use]
+    pub const fn loss_kind(&self) -> TanimotoLossKind {
+        self.loss_kind
+    }
+
+    /// SoftRank Spearman surrogate temperature.
+    #[must_use]
+    pub const fn softrank_temperature(&self) -> f64 {
+        self.softrank_temperature
+    }
 }
 
 /// Fluent builder for [`TanimotoRankingConfig`].
@@ -834,6 +904,10 @@ pub struct TanimotoRankingConfigBuilder {
     candidates_per_anchor: usize,
     /// Pending maximum anchors per batch (`0` for all).
     pairs_per_batch: usize,
+    /// Pending ranking loss kind.
+    loss_kind: TanimotoLossKind,
+    /// Pending SoftRank Spearman surrogate temperature.
+    softrank_temperature: f64,
 }
 
 impl Default for TanimotoRankingConfigBuilder {
@@ -852,6 +926,8 @@ impl TanimotoRankingConfigBuilder {
             min_gap: DEFAULT_TANIMOTO_RANKING_MIN_GAP,
             candidates_per_anchor: DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
             pairs_per_batch: DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
+            loss_kind: TanimotoLossKind::SoftmaxCe,
+            softrank_temperature: DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE,
         }
     }
 
@@ -890,6 +966,20 @@ impl TanimotoRankingConfigBuilder {
         self
     }
 
+    /// Sets the ranking loss kind.
+    #[must_use]
+    pub const fn loss_kind(mut self, value: TanimotoLossKind) -> Self {
+        self.loss_kind = value;
+        self
+    }
+
+    /// Sets the SoftRank Spearman surrogate temperature.
+    #[must_use]
+    pub const fn softrank_temperature(mut self, value: f64) -> Self {
+        self.softrank_temperature = value;
+        self
+    }
+
     /// Validates and builds the immutable [`TanimotoRankingConfig`].
     ///
     /// # Errors
@@ -921,12 +1011,22 @@ impl TanimotoRankingConfigBuilder {
                 ),
             });
         }
+        if !self.softrank_temperature.is_finite() || self.softrank_temperature <= 0.0 {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "tanimoto ranking softrank_temperature must be positive and finite, got {}",
+                    self.softrank_temperature
+                ),
+            });
+        }
         Ok(TanimotoRankingConfig {
             latent_temperature: self.latent_temperature,
             metric_temperature: self.metric_temperature,
             min_gap: self.min_gap,
             candidates_per_anchor: self.candidates_per_anchor,
             pairs_per_batch: self.pairs_per_batch,
+            loss_kind: self.loss_kind,
+            softrank_temperature: self.softrank_temperature,
         })
     }
 }
@@ -952,6 +1052,11 @@ pub struct TanimotoRankingRuntimeConfig {
     candidates_per_anchor: usize,
     /// Maximum anchors used per batch; `0` uses every row.
     pairs_per_batch: usize,
+    /// Active ranking loss kind for this run.
+    loss_kind: TanimotoLossKind,
+    /// SoftRank Spearman surrogate temperature (ignored when `loss_kind`
+    /// is [`TanimotoLossKind::SoftmaxCe`]).
+    softrank_temperature: f64,
 }
 
 impl TanimotoRankingRuntimeConfig {
@@ -989,6 +1094,18 @@ impl TanimotoRankingRuntimeConfig {
     #[must_use]
     pub const fn pairs_per_batch(&self) -> usize {
         self.pairs_per_batch
+    }
+
+    /// Ranking loss kind selected for this run.
+    #[must_use]
+    pub const fn loss_kind(&self) -> TanimotoLossKind {
+        self.loss_kind
+    }
+
+    /// SoftRank Spearman surrogate temperature.
+    #[must_use]
+    pub const fn softrank_temperature(&self) -> f64 {
+        self.softrank_temperature
     }
 }
 
@@ -1118,6 +1235,8 @@ impl MoleculeAutoencoderConfig {
             min_gap: self.tanimoto_ranking.min_gap,
             candidates_per_anchor: self.tanimoto_ranking.candidates_per_anchor,
             pairs_per_batch: self.tanimoto_ranking.pairs_per_batch,
+            loss_kind: self.tanimoto_ranking.loss_kind,
+            softrank_temperature: self.tanimoto_ranking.softrank_temperature,
         }
     }
 
@@ -1293,6 +1412,8 @@ impl MoleculeAutoencoderConfig {
             tanimoto_ranking_metric_temperature: self.tanimoto_ranking.metric_temperature,
             tanimoto_ranking_min_gap: self.tanimoto_ranking.min_gap,
             tanimoto_ranking_pairs_per_batch: self.tanimoto_ranking.pairs_per_batch,
+            tanimoto_ranking_loss_kind: self.tanimoto_ranking.loss_kind,
+            tanimoto_ranking_softrank_temperature: self.tanimoto_ranking.softrank_temperature,
             latent_noise_std: self.latent_noise_std,
         }
     }
@@ -1347,6 +1468,10 @@ pub struct MoleculeAutoencoderConfigBuilder {
     bce_zero_weight: f64,
     /// Per-position BCE weight for active bins.
     bce_nonzero_weight: f64,
+    /// Ranking loss kind (softmax CE baseline vs SoftRank Spearman).
+    tanimoto_ranking_loss_kind: TanimotoLossKind,
+    /// SoftRank Spearman surrogate temperature.
+    tanimoto_ranking_softrank_temperature: f64,
 }
 
 impl Default for MoleculeAutoencoderConfigBuilder {
@@ -1376,6 +1501,8 @@ impl MoleculeAutoencoderConfigBuilder {
             bce_weight: DEFAULT_BCE_WEIGHT,
             bce_zero_weight: DEFAULT_BCE_ZERO_WEIGHT,
             bce_nonzero_weight: DEFAULT_BCE_NONZERO_WEIGHT,
+            tanimoto_ranking_loss_kind: TanimotoLossKind::SoftmaxCe,
+            tanimoto_ranking_softrank_temperature: DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE,
         }
     }
 
@@ -1463,6 +1590,21 @@ impl MoleculeAutoencoderConfigBuilder {
         self
     }
 
+    /// Sets the Tanimoto ranking loss kind (softmax CE baseline vs
+    /// SoftRank Spearman surrogate).
+    #[must_use]
+    pub const fn tanimoto_ranking_loss_kind(mut self, value: TanimotoLossKind) -> Self {
+        self.tanimoto_ranking_loss_kind = value;
+        self
+    }
+
+    /// Sets the SoftRank Spearman surrogate temperature.
+    #[must_use]
+    pub const fn tanimoto_ranking_softrank_temperature(mut self, value: f64) -> Self {
+        self.tanimoto_ranking_softrank_temperature = value;
+        self
+    }
+
     /// Sets the Morgan/ECFP radius the cached fingerprints were built with.
     #[must_use]
     pub const fn ecfp_radius(mut self, value: u8) -> Self {
@@ -1531,6 +1673,8 @@ impl MoleculeAutoencoderConfigBuilder {
                 min_gap: self.min_gap,
                 candidates_per_anchor: self.candidates_per_anchor,
                 pairs_per_batch: self.pairs_per_batch,
+                loss_kind: self.tanimoto_ranking_loss_kind,
+                softrank_temperature: self.tanimoto_ranking_softrank_temperature,
             },
             latent_noise_std: self.latent_noise_std,
             ecfp_radius: self.ecfp_radius,
@@ -1724,6 +1868,13 @@ pub struct MoleculeAutoencoder<B: Backend> {
     tanimoto_ranking_min_gap: f64,
     /// Maximum anchors used per batch by the geometry loss.
     tanimoto_ranking_pairs_per_batch: usize,
+    /// Active Tanimoto ranking loss kind (softmax CE vs SoftRank
+    /// Spearman surrogate). Stored on the module so the forward path
+    /// can dispatch without re-reading the model config.
+    tanimoto_ranking_loss_kind: TanimotoLossKind,
+    /// SoftRank Spearman surrogate temperature; ignored under
+    /// [`TanimotoLossKind::SoftmaxCe`].
+    tanimoto_ranking_softrank_temperature: f64,
     /// Standard deviation of the Gaussian noise injected into the
     /// decoder-side latent at training time.
     latent_noise_std: f64,
@@ -1860,6 +2011,8 @@ impl<B: Backend> MoleculeAutoencoder<B> {
             self.tanimoto_ranking_metric_temperature,
             self.tanimoto_ranking_min_gap,
             self.tanimoto_ranking_weight,
+            self.tanimoto_ranking_loss_kind,
+            self.tanimoto_ranking_softrank_temperature,
         );
         let violation_logits = output.violation_logits;
         let violation_dims = violation_logits.dims();
@@ -3162,6 +3315,8 @@ mod tests {
             .min_gap(0.05)
             .candidates_per_anchor(7)
             .pairs_per_batch(11)
+            .loss_kind(TanimotoLossKind::SoftRankSpearman)
+            .softrank_temperature(0.33)
             .build()
             .expect("valid builder");
         assert!((config.latent_temperature() - 0.42).abs() < 1.0e-12);
@@ -3169,6 +3324,30 @@ mod tests {
         assert!((config.min_gap() - 0.05).abs() < 1.0e-12);
         assert_eq!(config.candidates_per_anchor(), 7);
         assert_eq!(config.pairs_per_batch(), 11);
+        assert_eq!(config.loss_kind(), TanimotoLossKind::SoftRankSpearman);
+        assert!((config.softrank_temperature() - 0.33).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn tanimoto_loss_kind_serde_round_trip_matches_cli_spelling() {
+        // The CLI flag spells the SoftRank variant `softrank-spearman`
+        // (two words); the library variant is `SoftRankSpearman` (three
+        // words in Rust camel-case). Without the explicit
+        // `#[serde(rename = "softrank-spearman")]` override, serde's
+        // default kebab-case rule would emit `soft-rank-spearman` and
+        // configs written by the trainer would not round-trip with the
+        // CLI parser.
+        assert_eq!(
+            serde_json::to_string(&TanimotoLossKind::SoftmaxCe).expect("serialize"),
+            "\"softmax-ce\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TanimotoLossKind::SoftRankSpearman).expect("serialize"),
+            "\"softrank-spearman\""
+        );
+        let parsed: TanimotoLossKind =
+            serde_json::from_str("\"softrank-spearman\"").expect("deserialize");
+        assert_eq!(parsed, TanimotoLossKind::SoftRankSpearman);
     }
 
     #[test]
