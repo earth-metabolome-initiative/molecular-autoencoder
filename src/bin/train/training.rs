@@ -1423,6 +1423,7 @@ mod tests {
             inactive_huber_mean: 0.0,
             violation_bce: 0.0,
             violation_mcc: 0.0,
+            violation_mcc_per_class: [0.0; molecular_autoencoder::VIOLATION_CLASS_COUNT],
         }
     }
 

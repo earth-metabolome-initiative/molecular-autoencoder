@@ -246,6 +246,14 @@ impl TrainingReporter {
                     metrics.violation_mcc,
                     examples,
                 ));
+                for (id, value) in self
+                    .metric_ids
+                    .violation_mcc_per_class
+                    .iter()
+                    .zip(metrics.violation_mcc_per_class.iter())
+                {
+                    renderer.update_train(metric_state(id.clone(), *value, examples));
+                }
                 renderer.update_train(metric_state(
                     self.metric_ids.huber_balance_ratio.clone(),
                     huber_balance_ratio(metrics.active_huber_mean, metrics.inactive_huber_mean),
@@ -420,6 +428,14 @@ impl TrainingReporter {
                     metrics.violation_mcc,
                     examples,
                 ));
+                for (id, value) in self
+                    .metric_ids
+                    .violation_mcc_per_class
+                    .iter()
+                    .zip(metrics.violation_mcc_per_class.iter())
+                {
+                    renderer.update_valid(metric_state(id.clone(), *value, examples));
+                }
                 renderer.update_valid(metric_state(
                     self.metric_ids.huber_balance_ratio.clone(),
                     huber_balance_ratio(metrics.active_huber_mean, metrics.inactive_huber_mean),
@@ -678,6 +694,29 @@ enum ReporterMetric {
     /// Macro-averaged Matthews correlation coefficient over the eight
     /// violation classes.
     ViolationMcc,
+    /// Per-class violation MCC: atomic-number out-of-range (Z = 0 or Z > 118).
+    ViolationMccImpossibleAtomicNumber,
+    /// Per-class violation MCC: atom degree exceeds the element's known
+    /// maximum valence.
+    ViolationMccHypervalent,
+    /// Per-class violation MCC: hydrogen count incompatible with the
+    /// element's valence.
+    ViolationMccImpossibleHCount,
+    /// Per-class violation MCC: formal charge outside the per-element
+    /// plausibility window.
+    ViolationMccImpossibleCharge,
+    /// Per-class violation MCC: isotope mass delta not in the IUPAC
+    /// table for that element.
+    ViolationMccImpossibleIsotope,
+    /// Per-class violation MCC: ring-membership flag inconsistent with
+    /// the atom's actual topology.
+    ViolationMccImpossibleRingFlag,
+    /// Per-class violation MCC: bond invariant outside the RDKit-
+    /// recognised set `{1, 2, 3, 12}`.
+    ViolationMccImpossibleBondType,
+    /// Per-class violation MCC: cross-atom topological inconsistency
+    /// (e.g. broken aromaticity across atoms of the same SSSR ring).
+    ViolationMccTopologicalPathology,
     /// `active_huber_mean / inactive_huber_mean` — the signal that
     /// drives the adaptive reconstruction-loss-kind scheduler.
     HuberBalanceRatio,
@@ -685,7 +724,7 @@ enum ReporterMetric {
 
 impl ReporterMetric {
     /// All gauges in the canonical order the reporter renders them.
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 28] = [
         Self::Loss,
         Self::Reconstruction,
         Self::ReconstructionBce,
@@ -705,6 +744,14 @@ impl ReporterMetric {
         Self::BceCorrection,
         Self::Violation,
         Self::ViolationMcc,
+        Self::ViolationMccImpossibleAtomicNumber,
+        Self::ViolationMccHypervalent,
+        Self::ViolationMccImpossibleHCount,
+        Self::ViolationMccImpossibleCharge,
+        Self::ViolationMccImpossibleIsotope,
+        Self::ViolationMccImpossibleRingFlag,
+        Self::ViolationMccImpossibleBondType,
+        Self::ViolationMccTopologicalPathology,
         Self::HuberBalanceRatio,
     ];
 
@@ -730,6 +777,14 @@ impl ReporterMetric {
             Self::BceCorrection => "Reconstruction BCE (Correction)",
             Self::Violation => "Violation BCE",
             Self::ViolationMcc => "Violation MCC",
+            Self::ViolationMccImpossibleAtomicNumber => "Violation MCC: Atomic Number",
+            Self::ViolationMccHypervalent => "Violation MCC: Hypervalence",
+            Self::ViolationMccImpossibleHCount => "Violation MCC: H Count",
+            Self::ViolationMccImpossibleCharge => "Violation MCC: Charge",
+            Self::ViolationMccImpossibleIsotope => "Violation MCC: Isotope",
+            Self::ViolationMccImpossibleRingFlag => "Violation MCC: Ring Flag",
+            Self::ViolationMccImpossibleBondType => "Violation MCC: Bond Type",
+            Self::ViolationMccTopologicalPathology => "Violation MCC: Topology",
             Self::HuberBalanceRatio => "Huber Balance (active/inactive)",
         }
     }
@@ -784,6 +839,30 @@ impl ReporterMetric {
             Self::ViolationMcc => {
                 "macro-averaged Matthews correlation coefficient across the 8 violation classes"
             }
+            Self::ViolationMccImpossibleAtomicNumber => {
+                "per-class MCC: atomic number outside the periodic table (Z = 0 or Z > 118)"
+            }
+            Self::ViolationMccHypervalent => {
+                "per-class MCC: atom degree exceeds the element's known maximum valence"
+            }
+            Self::ViolationMccImpossibleHCount => {
+                "per-class MCC: hydrogen count incompatible with the element's valence"
+            }
+            Self::ViolationMccImpossibleCharge => {
+                "per-class MCC: formal charge outside the per-element plausibility window"
+            }
+            Self::ViolationMccImpossibleIsotope => {
+                "per-class MCC: isotope mass delta not present in the IUPAC table for that element"
+            }
+            Self::ViolationMccImpossibleRingFlag => {
+                "per-class MCC: ring-membership flag inconsistent with the atom's actual topology"
+            }
+            Self::ViolationMccImpossibleBondType => {
+                "per-class MCC: bond invariant outside the RDKit-recognised set {1, 2, 3, 12}"
+            }
+            Self::ViolationMccTopologicalPathology => {
+                "per-class MCC: cross-atom topological inconsistency such as broken aromaticity across SSSR ring atoms"
+            }
             Self::HuberBalanceRatio => {
                 "ratio of active vs inactive symmetric-Huber error per batch; drives the adaptive reconstruction-loss-kind scheduler (lower means active bins are catching up)"
             }
@@ -804,6 +883,14 @@ impl ReporterMetric {
                 | Self::TanimotoRankingPearson
                 | Self::TanimotoRankingSpearman
                 | Self::ViolationMcc
+                | Self::ViolationMccImpossibleAtomicNumber
+                | Self::ViolationMccHypervalent
+                | Self::ViolationMccImpossibleHCount
+                | Self::ViolationMccImpossibleCharge
+                | Self::ViolationMccImpossibleIsotope
+                | Self::ViolationMccImpossibleRingFlag
+                | Self::ViolationMccImpossibleBondType
+                | Self::ViolationMccTopologicalPathology
         )
     }
 
@@ -864,6 +951,11 @@ struct ReporterMetricIds {
     violation: MetricId,
     /// Metric ID for the macro-MCC violation-classifier quality gauge.
     violation_mcc: MetricId,
+    /// Per-class MCC IDs, indexed by `finge_rs::ViolationClass::ALL`
+    /// declaration order: [ImpossibleAtomicNumber, Hypervalent,
+    /// ImpossibleHCount, ImpossibleCharge, ImpossibleIsotope,
+    /// ImpossibleRingFlag, ImpossibleBondType, TopologicalPathology].
+    violation_mcc_per_class: [MetricId; molecular_autoencoder::VIOLATION_CLASS_COUNT],
     /// Metric ID for the active/inactive Huber balance ratio gauge.
     huber_balance_ratio: MetricId,
 }
@@ -891,6 +983,16 @@ impl ReporterMetricIds {
             bce_correction: metric_id(ReporterMetric::BceCorrection),
             violation: metric_id(ReporterMetric::Violation),
             violation_mcc: metric_id(ReporterMetric::ViolationMcc),
+            violation_mcc_per_class: [
+                metric_id(ReporterMetric::ViolationMccImpossibleAtomicNumber),
+                metric_id(ReporterMetric::ViolationMccHypervalent),
+                metric_id(ReporterMetric::ViolationMccImpossibleHCount),
+                metric_id(ReporterMetric::ViolationMccImpossibleCharge),
+                metric_id(ReporterMetric::ViolationMccImpossibleIsotope),
+                metric_id(ReporterMetric::ViolationMccImpossibleRingFlag),
+                metric_id(ReporterMetric::ViolationMccImpossibleBondType),
+                metric_id(ReporterMetric::ViolationMccTopologicalPathology),
+            ],
             huber_balance_ratio: metric_id(ReporterMetric::HuberBalanceRatio),
         }
     }
@@ -921,6 +1023,24 @@ impl ReporterMetricIds {
             ReporterMetric::BceCorrection => self.bce_correction.clone(),
             ReporterMetric::Violation => self.violation.clone(),
             ReporterMetric::ViolationMcc => self.violation_mcc.clone(),
+            ReporterMetric::ViolationMccImpossibleAtomicNumber => {
+                self.violation_mcc_per_class[0].clone()
+            }
+            ReporterMetric::ViolationMccHypervalent => self.violation_mcc_per_class[1].clone(),
+            ReporterMetric::ViolationMccImpossibleHCount => self.violation_mcc_per_class[2].clone(),
+            ReporterMetric::ViolationMccImpossibleCharge => self.violation_mcc_per_class[3].clone(),
+            ReporterMetric::ViolationMccImpossibleIsotope => {
+                self.violation_mcc_per_class[4].clone()
+            }
+            ReporterMetric::ViolationMccImpossibleRingFlag => {
+                self.violation_mcc_per_class[5].clone()
+            }
+            ReporterMetric::ViolationMccImpossibleBondType => {
+                self.violation_mcc_per_class[6].clone()
+            }
+            ReporterMetric::ViolationMccTopologicalPathology => {
+                self.violation_mcc_per_class[7].clone()
+            }
             ReporterMetric::HuberBalanceRatio => self.huber_balance_ratio.clone(),
         }
     }
@@ -1073,6 +1193,9 @@ mod tests {
             inactive_huber_mean: 0.21,
             violation_bce: 0.07,
             violation_mcc: 0.62,
+            // Distinct per-class values so the dimensional plumbing
+            // breaks visibly if any index gets swapped or dropped.
+            violation_mcc_per_class: [0.95, 0.88, 0.74, 0.61, 0.40, 0.18, 0.05, -0.10],
         }
     }
 

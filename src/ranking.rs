@@ -8,6 +8,7 @@ use burn::{
     },
 };
 
+use crate::fingerprints::VIOLATION_CLASS_COUNT;
 use crate::model::TanimotoLossKind;
 
 /// Metric-derived Tanimoto geometry candidates and score gaps.
@@ -153,6 +154,14 @@ pub struct ViolationClassificationQuality {
     /// `0.0`, matching the convention used by `sklearn` and most
     /// retrieval benchmarks.
     pub mcc_macro: f32,
+    /// Per-class MCC indexed by `finge_rs::ViolationClass::ALL`
+    /// declaration order. Slots beyond `class_count` are left at
+    /// `0.0` (the only production caller passes
+    /// `class_count == VIOLATION_CLASS_COUNT`; the smaller-class
+    /// unit tests do not consume this array). Same degenerate-case
+    /// convention as `mcc_macro`: a class whose confusion-matrix
+    /// denominator is zero contributes `0.0`.
+    pub mcc_per_class: [f32; VIOLATION_CLASS_COUNT],
     /// Fraction of `(sample, class)` cells where the thresholded
     /// prediction matches the target bit, averaged over the entire
     /// `batch * class_count` matrix. Falls back to `0.0` when the
@@ -193,6 +202,11 @@ pub fn violation_classification_quality(
 
     let mut mcc_sum = 0.0_f64;
     let mut correct = 0_u64;
+    let mut mcc_per_class = [0.0_f32; VIOLATION_CLASS_COUNT];
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "`class` is also used as an offset into `logits`/`targets` (sample * class_count + class), not just to index `mcc_per_class`"
+    )]
     for class in 0..class_count {
         let mut tp = 0_u64;
         let mut tn = 0_u64;
@@ -210,10 +224,15 @@ pub fn violation_classification_quality(
             }
         }
         correct += tp + tn;
-        mcc_sum += binary_mcc(tp, tn, fp, fn_count);
+        let class_mcc = binary_mcc(tp, tn, fp, fn_count);
+        mcc_sum += class_mcc;
+        if class < VIOLATION_CLASS_COUNT {
+            mcc_per_class[class] = class_mcc as f32;
+        }
     }
     ViolationClassificationQuality {
         mcc_macro: (mcc_sum / class_count as f64) as f32,
+        mcc_per_class,
         accuracy: correct as f32 / expected as f32,
     }
 }
@@ -1015,6 +1034,43 @@ mod tests {
         let quality = violation_classification_quality(&logits, &targets, 4, 2);
         assert!((quality.mcc_macro - 0.5).abs() < 1.0e-5);
         assert!((quality.accuracy - 0.75).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn violation_classification_quality_records_per_class_mcc_in_declaration_order() {
+        // Same fixture as the mixed-classes test, but assert each
+        // individual class entry rather than just the macro mean.
+        let logits = vec![5.0, 5.0, -5.0, 5.0, -5.0, -5.0, 5.0, -5.0];
+        let targets = vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        let quality = violation_classification_quality(&logits, &targets, 4, 2);
+        assert!(
+            quality.mcc_per_class[0].abs() < 1.0e-6,
+            "class 0 MCC should be 0.0"
+        );
+        assert!(
+            (quality.mcc_per_class[1] - 1.0).abs() < 1.0e-6,
+            "class 1 MCC should be 1.0"
+        );
+        // Slots beyond the declared class count stay at the default 0.0.
+        for slot in &quality.mcc_per_class[2..] {
+            assert_eq!(*slot, 0.0);
+        }
+    }
+
+    #[test]
+    fn violation_classification_quality_per_class_mcc_is_zero_for_degenerate_classes() {
+        // Single class, all-positive targets, model predicts all positive
+        // -> TN+FP = 0 -> MCC = 0 by convention. Per-class entry should
+        // mirror this.
+        let quality = violation_classification_quality(&[5.0_f32; 4], &[1.0_f32; 4], 4, 1);
+        assert_eq!(quality.mcc_per_class[0], 0.0);
+        assert_eq!(quality.mcc_macro, 0.0);
+
+        // All-negative targets with all-negative predictions -> TP+FP = 0
+        // -> MCC = 0.
+        let quality = violation_classification_quality(&[-5.0_f32; 4], &[0.0_f32; 4], 4, 1);
+        assert_eq!(quality.mcc_per_class[0], 0.0);
+        assert_eq!(quality.mcc_macro, 0.0);
     }
 
     #[test]

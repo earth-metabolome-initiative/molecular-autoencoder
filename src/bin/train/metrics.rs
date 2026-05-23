@@ -92,6 +92,13 @@ pub struct BatchLossMetrics {
     /// in the batch has both positive and negative samples (the
     /// standard `sklearn`-style degenerate-case convention).
     pub violation_mcc: f32,
+    /// Per-class violation MCC, indexed in
+    /// `finge_rs::ViolationClass::ALL` declaration order. Lets the TUI
+    /// surface each chemistry-class signal independently so the user
+    /// can see which classes saturate first vs. which lag behind. Same
+    /// degenerate-case convention as `violation_mcc`: classes with
+    /// either no positives or no negatives in the batch report `0.0`.
+    pub violation_mcc_per_class: [f32; molecular_autoencoder::VIOLATION_CLASS_COUNT],
 }
 
 /// Polarity-split per-row Tanimoto / Huber / BCE sums plus the matching
@@ -322,6 +329,7 @@ where
         inactive_huber_mean,
         violation_bce: scalar_data(&data[20], "violation BCE loss")?,
         violation_mcc: violation_quality.mcc_macro,
+        violation_mcc_per_class: violation_quality.mcc_per_class,
     })
 }
 
