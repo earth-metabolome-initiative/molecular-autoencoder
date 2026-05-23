@@ -23,6 +23,11 @@ name = "embed"
 path = "src/bin/embed/main.rs"
 required-features = ["std", "ndarray", "embed", "embed-mgf", "embed-parquet"]
 
+[[bin]]
+name = "analyze_nnz"
+path = "src/bin/analyze_nnz/main.rs"
+required-features = ["std"]
+
 [features]
 default = ["std", "ndarray", "train", "tui"]
 std = [
