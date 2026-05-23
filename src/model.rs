@@ -206,10 +206,15 @@ pub enum TanimotoLossKind {
 }
 
 /// Serde fallback for the Tanimoto ranking loss kind. Returns the
-/// shipping baseline (`SoftmaxCe`) so deserializing an older config
-/// keeps its existing behavior.
+/// current default `SoftRankSpearman`, the gap-weighted Spearman
+/// surrogate that has out-performed the legacy softmax-CE baseline at
+/// `--tanimoto-ranking-candidates 8`. Pre-`loss_kind` checkpoints are
+/// from a period when only the legacy SoftmaxCe path existed, so
+/// reloading one will silently switch the loss kind on continuation:
+/// pass an explicit `loss_kind` in the JSON to preserve the old
+/// behavior.
 const fn default_tanimoto_ranking_loss_kind() -> TanimotoLossKind {
-    TanimotoLossKind::SoftmaxCe
+    TanimotoLossKind::SoftRankSpearman
 }
 
 /// Serde fallback for the counted-ECFP radius hyperparameter.
@@ -942,13 +947,16 @@ pub struct TanimotoRankingConfig {
     /// Maximum anchors used per batch by the geometry loss; `0` uses
     /// every row.
     pairs_per_batch: usize,
-    /// Which ranking loss the training loop should optimise. Defaults to
-    /// the shipping softmax cross-entropy baseline.
+    /// Which ranking loss the training loop should optimise. Defaults
+    /// to the gap-weighted SoftRank Spearman surrogate, which
+    /// out-performed the legacy softmax cross-entropy baseline at
+    /// `--tanimoto-ranking-candidates 8`. Pass
+    /// [`TanimotoLossKind::SoftmaxCe`] to opt into the legacy path.
     #[serde(default = "default_tanimoto_ranking_loss_kind")]
     loss_kind: TanimotoLossKind,
-    /// Temperature for the pairwise sigmoid inside the SoftRank Spearman
-    /// surrogate. Ignored when [`Self::loss_kind`] is
-    /// [`TanimotoLossKind::SoftmaxCe`].
+    /// Temperature for the pairwise sigmoid inside the SoftRank
+    /// Spearman surrogate. Only consulted when [`Self::loss_kind`] is
+    /// [`TanimotoLossKind::SoftRankSpearman`].
     #[serde(default = "default_tanimoto_ranking_softrank_temperature")]
     softrank_temperature: f64,
 }
@@ -1046,7 +1054,7 @@ impl TanimotoRankingConfigBuilder {
             min_gap: DEFAULT_TANIMOTO_RANKING_MIN_GAP,
             candidates_per_anchor: DEFAULT_TANIMOTO_RANKING_CANDIDATES_PER_ANCHOR,
             pairs_per_batch: DEFAULT_TANIMOTO_RANKING_PAIRS_PER_BATCH,
-            loss_kind: TanimotoLossKind::SoftmaxCe,
+            loss_kind: TanimotoLossKind::SoftRankSpearman,
             softrank_temperature: DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE,
         }
     }
@@ -1174,8 +1182,8 @@ pub struct TanimotoRankingRuntimeConfig {
     pairs_per_batch: usize,
     /// Active ranking loss kind for this run.
     loss_kind: TanimotoLossKind,
-    /// SoftRank Spearman surrogate temperature (ignored when `loss_kind`
-    /// is [`TanimotoLossKind::SoftmaxCe`]).
+    /// SoftRank Spearman surrogate temperature (consulted only when
+    /// `loss_kind` is [`TanimotoLossKind::SoftRankSpearman`]).
     softrank_temperature: f64,
 }
 
@@ -1632,7 +1640,7 @@ impl MoleculeAutoencoderConfigBuilder {
             bce_weight: DEFAULT_BCE_WEIGHT,
             bce_zero_weight: DEFAULT_BCE_ZERO_WEIGHT,
             bce_nonzero_weight: DEFAULT_BCE_NONZERO_WEIGHT,
-            tanimoto_ranking_loss_kind: TanimotoLossKind::SoftmaxCe,
+            tanimoto_ranking_loss_kind: TanimotoLossKind::SoftRankSpearman,
             tanimoto_ranking_softrank_temperature: DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE,
             reconstruction_loss_kind: ReconstructionLossKind::Huber,
             reconstruction_poisson_max_log_count: DEFAULT_RECONSTRUCTION_POISSON_MAX_LOG_COUNT,
@@ -2027,8 +2035,8 @@ pub struct MoleculeAutoencoder<B: Backend> {
     /// Spearman surrogate). Stored on the module so the forward path
     /// can dispatch without re-reading the model config.
     tanimoto_ranking_loss_kind: TanimotoLossKind,
-    /// SoftRank Spearman surrogate temperature; ignored under
-    /// [`TanimotoLossKind::SoftmaxCe`].
+    /// SoftRank Spearman surrogate temperature; consulted only under
+    /// [`TanimotoLossKind::SoftRankSpearman`].
     tanimoto_ranking_softrank_temperature: f64,
     /// Active reconstruction loss kind (Huber baseline vs Poisson NLL).
     /// Stored on the module so the forward path can dispatch without

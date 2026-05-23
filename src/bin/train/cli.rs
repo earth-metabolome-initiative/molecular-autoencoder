@@ -342,15 +342,19 @@ pub struct Args {
     #[arg(long, default_value_t = DEFAULT_BCE_NONZERO_WEIGHT)]
     pub bce_nonzero_weight: f64,
 
-    /// Tanimoto-geometry ranking loss kind. `softmax-ce` is the shipping
-    /// baseline (gap-weighted softmax cross-entropy on the top-1 target);
-    /// `softrank-spearman` is the differentiable Spearman surrogate
-    /// `1 − Pearson(soft_rank(logits), soft_rank(teacher_scores))`.
-    #[arg(long, value_enum, default_value_t = TanimotoLossKindArg::SoftmaxCe)]
+    /// Tanimoto-geometry ranking loss kind. `softrank-spearman`
+    /// (default) is the gap-weighted differentiable Spearman surrogate
+    /// `1 - Pearson(soft_rank(logits), soft_rank(teacher_scores))`,
+    /// which has out-performed the legacy `softmax-ce` baseline at
+    /// `--tanimoto-ranking-candidates 8`. Pass `softmax-ce` to opt
+    /// back into the legacy gap-weighted softmax cross-entropy on the
+    /// top-1 target.
+    #[arg(long, value_enum, default_value_t = TanimotoLossKindArg::SoftrankSpearman)]
     pub tanimoto_ranking_loss: TanimotoLossKindArg,
 
-    /// Pairwise-sigmoid temperature for the SoftRank Spearman surrogate
-    /// (ignored when `--tanimoto-ranking-loss` is `softmax-ce`).
+    /// Pairwise-sigmoid temperature for the SoftRank Spearman
+    /// surrogate (consulted only when `--tanimoto-ranking-loss` is
+    /// `softrank-spearman`).
     #[arg(long, default_value_t = DEFAULT_TANIMOTO_RANKING_SOFTRANK_TEMPERATURE)]
     pub tanimoto_ranking_softrank_temperature: f64,
 
@@ -442,10 +446,11 @@ impl From<ReconstructionLossKindArg> for ReconstructionLossKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TanimotoLossKindArg {
     /// Gap-weighted softmax cross-entropy against the one-hot top-1
-    /// candidate (shipping baseline).
+    /// candidate (legacy baseline).
     SoftmaxCe,
-    /// Gap-weighted `1 − Pearson(soft_rank(logits),
-    /// soft_rank(teacher_scores))` SoftRank Spearman surrogate.
+    /// Gap-weighted `1 - Pearson(soft_rank(logits),
+    /// soft_rank(teacher_scores))` SoftRank Spearman surrogate
+    /// (current default).
     SoftrankSpearman,
 }
 
