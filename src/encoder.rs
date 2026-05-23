@@ -527,11 +527,8 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
             output.reconstructed_log_counts.clone(),
         );
 
-        let dense_target = batch.fingerprints.to_dense_log_counts();
-        let log_mse_2d: Tensor<B, 2> = (dense_target - output.reconstructed_log_counts.clone())
-            .powf_scalar(2.0)
-            .mean_dim(1);
-        let log_mse: Tensor<B, 1> = log_mse_2d.squeeze_dim(1);
+        let log_mse =
+            sparse_log_mse_per_row(output.reconstructed_log_counts.clone(), &batch.fingerprints);
 
         let [
             latent,
@@ -600,5 +597,108 @@ impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
             descriptor_targets: vec![0.0; REGRESSION_TARGET_WIDTH],
             ..Default::default()
         })
+    }
+}
+
+/// Per-row mean squared error between the dense `reconstructed` tensor and
+/// the sparse target stored in `fingerprints`, computed without ever
+/// materialising the dense target.
+///
+/// Decomposition:
+///
+/// ```text
+/// sum_j (recon[j] - target[j])^2
+///   = sum_j recon[j]^2 - sum_active recon[active]^2
+///                      + sum_active (target_active - recon[active])^2
+/// ```
+///
+/// Exact when each row's active indices are unique (finge-rs guarantees
+/// this during fingerprint construction).
+fn sparse_log_mse_per_row<B: Backend>(
+    reconstructed: Tensor<B, 2>,
+    fingerprints: &crate::batch::SparseFingerprintBatch<B>,
+) -> Tensor<B, 1> {
+    let recon_at_active = reconstructed
+        .clone()
+        .gather(1, fingerprints.indices.clone());
+    let mask = fingerprints.mask.clone();
+    let diff_at_active_sq: Tensor<B, 1> =
+        ((fingerprints.log_counts.clone() - recon_at_active.clone()) * mask.clone())
+            .powi_scalar(2)
+            .sum_dim(1)
+            .squeeze_dim(1);
+    let recon_sq_sum: Tensor<B, 1> = reconstructed.powi_scalar(2).sum_dim(1).squeeze_dim(1);
+    let recon_active_sq_sum: Tensor<B, 1> = (recon_at_active * mask)
+        .powi_scalar(2)
+        .sum_dim(1)
+        .squeeze_dim(1);
+    let width = fingerprints.fingerprint_size as f32;
+    (recon_sq_sum - recon_active_sq_sum + diff_at_active_sq) / width
+}
+
+#[cfg(all(test, feature = "ndarray"))]
+mod tests {
+    use super::*;
+    use burn::tensor::{IndexingUpdateOp, TensorData};
+
+    #[test]
+    fn sparse_log_mse_matches_dense_reference() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // batch=2, fingerprint_size=8, max_nnz=3
+        let reconstructed = Tensor::<B, 2>::from_floats(
+            [
+                [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+                [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            ],
+            &device,
+        );
+        let indices = Tensor::<B, 2, burn::tensor::Int>::from_data(
+            TensorData::new(vec![1_i64, 4, 7, 0, 3, 0], [2, 3]),
+            &device,
+        );
+        let log_counts = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![1.0_f32, 0.5, 0.8, 0.9, 0.4, 0.0], [2, 3]),
+            &device,
+        );
+        let mask = Tensor::<B, 2>::from_data(
+            TensorData::new(vec![1.0_f32, 1.0, 1.0, 1.0, 1.0, 0.0], [2, 3]),
+            &device,
+        );
+        let fingerprints = crate::batch::SparseFingerprintBatch::<B> {
+            indices: indices.clone(),
+            counts: log_counts.clone(),
+            log_counts: log_counts.clone(),
+            mask: mask.clone(),
+            fingerprint_size: 8,
+            max_nnz: 3,
+        };
+
+        let sparse_mse = sparse_log_mse_per_row(reconstructed.clone(), &fingerprints)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32");
+
+        // Dense reference via the now-removed scatter pattern.
+        let dense_target = Tensor::<B, 2>::zeros([2, 8], &device).scatter(
+            1,
+            indices,
+            log_counts * mask,
+            IndexingUpdateOp::Add,
+        );
+        let dense_mse_2d: Tensor<B, 2> = (dense_target - reconstructed).powi_scalar(2).mean_dim(1);
+        let dense_mse = dense_mse_2d
+            .squeeze_dim::<1>(1)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32");
+
+        assert_eq!(sparse_mse.len(), dense_mse.len());
+        for (i, (s, d)) in sparse_mse.iter().zip(&dense_mse).enumerate() {
+            assert!(
+                (s - d).abs() < 1.0e-6,
+                "row {i} mismatch: sparse={s} dense={d}"
+            );
+        }
     }
 }

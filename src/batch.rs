@@ -4,10 +4,7 @@
 use burn::data::dataloader::batcher::Batcher;
 #[cfg(any(feature = "std", test))]
 use burn::tensor::TensorData;
-use burn::{
-    prelude::*,
-    tensor::{IndexingUpdateOp, Int},
-};
+use burn::{prelude::*, tensor::Int};
 #[cfg(feature = "std")]
 use std::time::{Duration, Instant};
 
@@ -64,19 +61,6 @@ impl<B: Backend> SparseFingerprintBatch<B> {
     #[must_use]
     pub fn batch_size(&self) -> usize {
         self.indices.dims()[0]
-    }
-
-    /// Materializes a dense `log1p(count)` tensor on the current backend device.
-    #[must_use]
-    pub fn to_dense_log_counts(&self) -> Tensor<B, 2> {
-        let batch_size = self.batch_size();
-        let device = self.log_counts.device();
-        Tensor::<B, 2>::zeros([batch_size, self.fingerprint_size], &device).scatter(
-            1,
-            self.indices.clone(),
-            self.log_counts.clone() * self.mask.clone(),
-            IndexingUpdateOp::Add,
-        )
     }
 }
 

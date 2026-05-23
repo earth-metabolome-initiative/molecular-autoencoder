@@ -1876,9 +1876,30 @@ pub struct SparseInputLinear<B: Backend> {
 }
 
 impl<B: Backend> SparseInputLinear<B> {
-    /// Applies `xW + b` after materializing dense input fingerprints on the backend device.
+    /// Applies `xW + b` directly on the sparse `(indices, log_counts, mask)`
+    /// triple, without ever materialising the dense `[batch, fingerprint_size]`
+    /// intermediate. Gathers the active rows of `W` by `indices`, scales them
+    /// by `log_counts * mask`, sums across the padded axis, and adds `b`.
+    ///
+    /// Assumes each row's `indices` contains no duplicates (finge-rs
+    /// aggregates collisions into per-bin counts during fingerprint
+    /// construction, so this holds for normal data).
     pub fn forward(&self, fingerprints: &SparseFingerprintBatch<B>) -> Tensor<B, 2> {
-        self.forward_dense(fingerprints.to_dense_log_counts())
+        let weight = self.linear.weight.val();
+        let [_input_width, hidden] = weight.dims();
+        let [batch_size, max_nnz] = fingerprints.indices.dims();
+        let flat_idx = fingerprints.indices.clone().reshape([batch_size * max_nnz]);
+        let gathered = weight
+            .select(0, flat_idx)
+            .reshape([batch_size, max_nnz, hidden]);
+        let scaling =
+            (fingerprints.log_counts.clone() * fingerprints.mask.clone()).unsqueeze_dim::<3>(2);
+        let weighted: Tensor<B, 3> = gathered * scaling;
+        let summed: Tensor<B, 2> = weighted.sum_dim(1).squeeze_dim(1);
+        match self.linear.bias.as_ref() {
+            Some(bias) => summed + bias.val().unsqueeze_dim::<2>(0),
+            None => summed,
+        }
     }
 
     /// Applies the same projection to an already dense tensor.
@@ -4102,5 +4123,171 @@ mod tests {
         // Bin counts: 1 active, 3 inactive in both rows.
         assert_eq!(active_counts, vec![1.0, 1.0]);
         assert_eq!(inactive_counts, vec![3.0, 3.0]);
+    }
+
+    /// Builds a fixed `SparseFingerprintBatch` of shape `[batch=4, max_nnz=3]`
+    /// with `fingerprint_size=16` for the sparse-input-linear tests.
+    fn sparse_input_test_batch<B: Backend>(
+        device: &B::Device,
+    ) -> crate::batch::SparseFingerprintBatch<B> {
+        let indices = Tensor::<B, 2, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(
+                vec![
+                    0_i64, 5, 11, // row 0: bins 0, 5, 11 active
+                    3, 7, 0, // row 1: bins 3, 7 active; last slot padded
+                    15, 0, 0, // row 2: only bin 15 active
+                    1, 2, 9, // row 3: bins 1, 2, 9 active
+                ],
+                [4, 3],
+            ),
+            device,
+        );
+        let log_counts = Tensor::<B, 2>::from_data(
+            TensorData::new(
+                vec![
+                    0.7_f32, 1.1, 0.5, 1.4, 0.3, 0.0, 0.9, 0.0, 0.0, 0.6, 0.8, 1.2,
+                ],
+                [4, 3],
+            ),
+            device,
+        );
+        let mask = Tensor::<B, 2>::from_data(
+            TensorData::new(
+                vec![
+                    1.0_f32, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0,
+                ],
+                [4, 3],
+            ),
+            device,
+        );
+        let counts = log_counts.clone();
+        crate::batch::SparseFingerprintBatch {
+            indices,
+            counts,
+            log_counts,
+            mask,
+            fingerprint_size: 16,
+            max_nnz: 3,
+        }
+    }
+
+    /// Recomputes the dense reference via the scatter-then-matmul path the
+    /// sparse forward replaces, using the same `SparseInputLinear` weights.
+    fn dense_reference_forward<B: Backend>(
+        linear: &SparseInputLinear<B>,
+        batch: &crate::batch::SparseFingerprintBatch<B>,
+    ) -> Tensor<B, 2> {
+        let device = batch.log_counts.device();
+        let batch_size = batch.indices.dims()[0];
+        let dense = Tensor::<B, 2>::zeros([batch_size, batch.fingerprint_size], &device).scatter(
+            1,
+            batch.indices.clone(),
+            batch.log_counts.clone() * batch.mask.clone(),
+            burn::tensor::IndexingUpdateOp::Add,
+        );
+        linear.forward_dense(dense)
+    }
+
+    #[test]
+    fn sparse_input_linear_forward_matches_dense_reference() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let linear = SparseInputLinear {
+            linear: LinearConfig::new(16, 8).init::<B>(&device),
+        };
+        let batch = sparse_input_test_batch::<B>(&device);
+
+        let sparse_out = linear
+            .forward(&batch)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("sparse output is f32");
+        let dense_out = dense_reference_forward(&linear, &batch)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("dense output is f32");
+
+        assert_eq!(sparse_out.len(), dense_out.len());
+        for (i, (s, d)) in sparse_out.iter().zip(&dense_out).enumerate() {
+            assert!(
+                (s - d).abs() < 1.0e-5,
+                "mismatch at index {i}: sparse={s} dense={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_input_linear_forward_handles_fully_padded_row() {
+        // Edge case: a row with only one active bin (rest masked) must
+        // still match the dense reference exactly.
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let linear = SparseInputLinear {
+            linear: LinearConfig::new(16, 8).init::<B>(&device),
+        };
+        let batch = sparse_input_test_batch::<B>(&device);
+        // Row 2 has mask = [1, 0, 0] (only bin 15 active). Compare per row.
+        let sparse = linear
+            .forward(&batch)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("sparse output is f32");
+        let dense = dense_reference_forward(&linear, &batch)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("dense output is f32");
+        // Row 2 occupies slice [2*8 .. 3*8] = [16 .. 24].
+        for i in 16..24 {
+            assert!(
+                (sparse[i] - dense[i]).abs() < 1.0e-5,
+                "row 2 mismatch at column {} (flat idx {i}): sparse={} dense={}",
+                i - 16,
+                sparse[i],
+                dense[i]
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_input_linear_backward_updates_only_active_weight_rows() {
+        use burn::backend::Autodiff;
+        type B = Autodiff<burn::backend::NdArray<f32, i64>>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let linear = SparseInputLinear {
+            linear: LinearConfig::new(16, 8).init::<B>(&device),
+        };
+        let batch = sparse_input_test_batch::<B>(&device);
+
+        // Forward then sum to a scalar to backprop through the sparse path.
+        let out = linear.forward(&batch);
+        let loss = out.sum();
+        let grads = loss.backward();
+        let weight_grad = linear
+            .linear
+            .weight
+            .grad(&grads)
+            .expect("weight gradient should exist");
+
+        // Active indices across the whole batch: 0, 5, 11 (row 0); 3, 7
+        // (row 1); 15 (row 2); 1, 2, 9 (row 3). Every other row of the
+        // weight gradient must be zero.
+        let active: std::collections::HashSet<usize> =
+            [0_usize, 5, 11, 3, 7, 15, 1, 2, 9].into_iter().collect();
+        let grad_data = weight_grad.into_data().to_vec::<f32>().expect("f32 grad");
+        let hidden = 8;
+        for row in 0..16 {
+            let row_norm: f32 = grad_data[row * hidden..(row + 1) * hidden]
+                .iter()
+                .map(|v| v.abs())
+                .sum();
+            if active.contains(&row) {
+                assert!(row_norm > 0.0, "active row {row} has zero gradient");
+            } else {
+                assert!(
+                    row_norm == 0.0,
+                    "inactive row {row} has non-zero gradient {row_norm}"
+                );
+            }
+        }
     }
 }
