@@ -17,7 +17,11 @@ impl<B> SparseInputLinearKernelBackend for Fusion<B>
 where
     B: FusionBackend + SparseInputLinearKernelBackend + Send + Sync,
 {
-    fn sparse_input_linear_forward(
+    // `sparse_input_linear_forward` inherits the composed-ops default
+    // (cubecl-fusion folds it naturally). Only the kernel variant
+    // needs explicit recording via CustomOpIr.
+
+    fn sparse_input_linear_forward_kernel(
         weight: FloatTensor<Self>,
         indices: IntTensor<Self>,
         values: FloatTensor<Self>,
@@ -108,7 +112,7 @@ where
             None
         };
 
-        let output = B::sparse_input_linear_forward(weight, indices, values, mask, bias);
+        let output = B::sparse_input_linear_forward_kernel(weight, indices, values, mask, bias);
         let _ = B::FloatElem::dtype();
         handles.register_float_tensor::<B>(&self.desc.outputs[0].id, output);
     }

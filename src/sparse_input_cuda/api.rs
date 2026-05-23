@@ -1,32 +1,75 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::ops::{FloatTensor, IntTensor};
-use burn::tensor::{Int as TensorInt, Tensor as BurnTensor, TensorPrimitive};
+use burn::tensor::{
+    IndexingUpdateOp, Int as TensorInt, Tensor as BurnTensor, TensorMetadata, TensorPrimitive,
+};
 
 /// Backend extension that implements the EmbeddingBag-style sparse-input
 /// linear projection
 /// `out[b, h] = sum_k W[indices[b, k], h] * values[b, k] * mask[b, k] + bias[h]`.
 ///
-/// Forward streams over the K active indices per `(b, h)` cell with no
-/// `[batch, max_nnz, hidden]` intermediate, eliminating the 22% scatter
-/// cost nsys flagged. The backward path runs entirely through Burn's
-/// composed dense ops (scatter to reconstruct the dense input, then
-/// dense matmul backward); since `cubecl-cpu` does not implement
-/// `atomic<f32>` and the cubecl `FloatAtomicAddFamily` boilerplate is
-/// substantial, the win we currently capture is forward-only. A custom
-/// backward kernel can slot in behind this same trait later without
-/// touching callers.
+/// Two entry points so training and inference take different paths:
+///
+/// - [`Self::sparse_input_linear_forward`] uses the composed
+///   `scatter -> matmul (+ bias)` pattern. cubecl-fusion folds the
+///   scatter into the matmul on the inference path (no autodiff graph
+///   to block it), so the dense formulation is the fast option for
+///   `MoleculeEncoder` and validation batches.
+/// - [`Self::sparse_input_linear_forward_kernel`] dispatches to the
+///   custom `#[cube]` kernel that never materialises the dense
+///   `[batch, fingerprint_size]` intermediate. Training cannot fuse the
+///   scatter under autodiff (the original `select_assign_kernel` cost
+///   nsys flagged at 22%), so the autodiff forward routes here instead.
+///
+/// Both methods have default composed-ops bodies, so a backend that
+/// has no kernel implementation (NdArray) just needs an empty `impl`.
 pub trait SparseInputLinearKernelBackend: Backend {
-    /// Forward kernel. `weight` is `[vocab, hidden]`, `indices` is
-    /// `[batch, max_nnz]` (padded), `values` and `mask` mirror
-    /// `indices`. `bias` is `[hidden]` or `None`. Output is
-    /// `[batch, hidden]`.
+    /// Composed-ops forward. cubecl-fusion folds `scatter + matmul` on
+    /// the inference path; this is the inference-friendly default.
     fn sparse_input_linear_forward(
         weight: FloatTensor<Self>,
         indices: IntTensor<Self>,
         values: FloatTensor<Self>,
         mask: FloatTensor<Self>,
         bias: Option<FloatTensor<Self>>,
-    ) -> FloatTensor<Self>;
+    ) -> FloatTensor<Self> {
+        let [vocab, _hidden] = weight.shape().dims();
+        let weight_t = BurnTensor::<Self, 2>::from_primitive(TensorPrimitive::Float(weight));
+        let indices_t = BurnTensor::<Self, 2, TensorInt>::from_primitive(indices);
+        let values_t = BurnTensor::<Self, 2>::from_primitive(TensorPrimitive::Float(values));
+        let mask_t = BurnTensor::<Self, 2>::from_primitive(TensorPrimitive::Float(mask));
+        let [batch, _max_nnz] = indices_t.dims();
+        let device = values_t.device();
+        let dense = BurnTensor::<Self, 2>::zeros([batch, vocab], &device).scatter(
+            1,
+            indices_t,
+            values_t * mask_t,
+            IndexingUpdateOp::Add,
+        );
+        let proj = dense.matmul(weight_t);
+        let out = match bias {
+            Some(b) => {
+                let b_t = BurnTensor::<Self, 1>::from_primitive(TensorPrimitive::Float(b));
+                proj + b_t.unsqueeze_dim::<2>(0)
+            }
+            None => proj,
+        };
+        out.into_primitive().tensor()
+    }
+
+    /// Kernel forward. Default delegates to
+    /// [`Self::sparse_input_linear_forward`] so non-kernel backends
+    /// just inherit composed ops; CubeBackend overrides this with the
+    /// `#[cube]` launch.
+    fn sparse_input_linear_forward_kernel(
+        weight: FloatTensor<Self>,
+        indices: IntTensor<Self>,
+        values: FloatTensor<Self>,
+        mask: FloatTensor<Self>,
+        bias: Option<FloatTensor<Self>>,
+    ) -> FloatTensor<Self> {
+        Self::sparse_input_linear_forward(weight, indices, values, mask, bias)
+    }
 }
 
 /// Free-function entry that hides the trait machinery from call sites.

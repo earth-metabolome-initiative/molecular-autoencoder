@@ -1,6 +1,7 @@
+use super::api::SparseInputLinearKernelBackend;
 use super::*;
 use burn::backend::Autodiff;
-use burn::tensor::{IndexingUpdateOp, Tensor as BurnTensor, TensorData};
+use burn::tensor::{IndexingUpdateOp, Tensor as BurnTensor, TensorData, TensorPrimitive};
 
 #[cfg(feature = "cuda")]
 mod backend_alias {
@@ -129,6 +130,109 @@ fn forward_kernel_matches_dense_reference_no_bias() {
         assert!(
             (k - d).abs() < 1.0e-5,
             "mismatch at index {i}: kernel={k} dense={d}"
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::default_constructed_unit_structs,
+    reason = "TestDevice cross-feature alias requires Default::default()."
+)]
+fn explicit_kernel_method_matches_dense_reference() {
+    // Exercises `B::sparse_input_linear_forward_kernel` directly,
+    // bypassing the autodiff path. Without this we'd only validate the
+    // composed-ops default; the kernel itself would only ever run via
+    // the autodiff backward test.
+    let device = TestDevice::default();
+    let (weight, indices, values, mask) = fixture(&device);
+    let vocab = weight.dims()[0];
+
+    let kernel_primitive =
+        <TestBackend as SparseInputLinearKernelBackend>::sparse_input_linear_forward_kernel(
+            weight.clone().into_primitive().tensor(),
+            indices.clone().into_primitive(),
+            values.clone().into_primitive().tensor(),
+            mask.clone().into_primitive().tensor(),
+            None,
+        );
+    let kernel_out: BurnTensor<TestBackend, 2> =
+        BurnTensor::<TestBackend, 2>::from_primitive(TensorPrimitive::Float(kernel_primitive));
+    let kernel_vec = kernel_out
+        .into_data()
+        .to_vec::<f32>()
+        .expect("f32 kernel output");
+    let dense_vec = dense_reference(weight, indices, values, mask, None, vocab)
+        .into_data()
+        .to_vec::<f32>()
+        .expect("f32 dense output");
+
+    assert_eq!(kernel_vec.len(), dense_vec.len());
+    for (i, (k, d)) in kernel_vec.iter().zip(&dense_vec).enumerate() {
+        assert!(
+            (k - d).abs() < 1.0e-5,
+            "kernel mismatch at index {i}: kernel={k} dense={d}"
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::default_constructed_unit_structs,
+    reason = "TestDevice cross-feature alias requires Default::default()."
+)]
+fn inference_path_uses_composed_default_not_kernel() {
+    // Sanity: the high-level free function on a non-autodiff backend
+    // routes through `sparse_input_linear_forward` (composed ops), not
+    // `sparse_input_linear_forward_kernel`. We can't directly observe
+    // the kernel pick without an instrumentation hook, but we can
+    // confirm equivalence with the explicit composed-ops invocation.
+    let device = TestDevice::default();
+    let (weight, indices, values, mask) = fixture(&device);
+    let vocab = weight.dims()[0];
+
+    let free_fn_out = sparse_input_linear_forward(
+        weight.clone(),
+        indices.clone(),
+        values.clone(),
+        mask.clone(),
+        None,
+    )
+    .into_data()
+    .to_vec::<f32>()
+    .expect("f32");
+
+    let composed_primitive =
+        <TestBackend as SparseInputLinearKernelBackend>::sparse_input_linear_forward(
+            weight.clone().into_primitive().tensor(),
+            indices.clone().into_primitive(),
+            values.clone().into_primitive().tensor(),
+            mask.clone().into_primitive().tensor(),
+            None,
+        );
+    let composed_vec: Vec<f32> =
+        BurnTensor::<TestBackend, 2>::from_primitive(TensorPrimitive::Float(composed_primitive))
+            .into_data()
+            .to_vec::<f32>()
+            .expect("f32");
+    let dense_vec = dense_reference(weight, indices, values, mask, None, vocab)
+        .into_data()
+        .to_vec::<f32>()
+        .expect("f32");
+
+    for (i, ((free, comp), dense)) in free_fn_out
+        .iter()
+        .zip(&composed_vec)
+        .zip(&dense_vec)
+        .enumerate()
+    {
+        assert!(
+            (free - dense).abs() < 1.0e-5,
+            "free-fn vs dense mismatch at {i}"
+        );
+        assert!(
+            (comp - dense).abs() < 1.0e-5,
+            "composed-default vs dense mismatch at {i}"
         );
     }
 }

@@ -13,7 +13,12 @@ where
     I: IntElement,
     BT: BoolElement,
 {
-    fn sparse_input_linear_forward(
+    // `sparse_input_linear_forward` inherits the trait default
+    // (composed `scatter -> matmul + bias`), which cubecl-fusion folds
+    // into one fused kernel on inference paths. The custom kernel below
+    // is the autodiff-training path where fusion cannot help.
+
+    fn sparse_input_linear_forward_kernel(
         weight: FloatTensor<Self>,
         indices: IntTensor<Self>,
         values: FloatTensor<Self>,

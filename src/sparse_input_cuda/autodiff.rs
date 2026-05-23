@@ -114,7 +114,12 @@ where
         let prep = backward.prepare::<C>(parents).compute_bound().stateful();
 
         let bias_primitive = bias.map(|b| b.primitive);
-        let output = B::sparse_input_linear_forward(
+        // Autodiff training path: always route through the custom
+        // kernel since autodiff blocks the cubecl-fusion fold of the
+        // composed `scatter + matmul` pattern. Inference paths bypass
+        // this impl entirely (B::sparse_input_linear_forward, the
+        // composed default, runs for `MoleculeEncoder` and validation).
+        let output = B::sparse_input_linear_forward_kernel(
             weight.primitive,
             indices,
             values.primitive,
