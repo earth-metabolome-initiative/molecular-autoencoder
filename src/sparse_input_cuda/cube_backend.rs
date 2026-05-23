@@ -5,11 +5,9 @@ use super::kernels::{
 };
 use burn::tensor::Shape;
 use burn::tensor::ops::{FloatTensor, IntTensor};
-use burn_cubecl::cubecl::ir::{FloatKind, StorageType, Type};
 use burn_cubecl::cubecl::{CubeDim, calculate_cube_count_elemwise};
 use burn_cubecl::ops::numeric::{empty_device_dtype, zeros_client};
 use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement};
-use cubecl::ir::features::AtomicUsage;
 
 impl<R, F, I, BT> SparseInputLinearKernelBackend for CubeBackend<R, F, I, BT>
 where
@@ -116,19 +114,21 @@ where
 
         let client = grad_out.client.clone();
 
-        // CUDA (sm_60+) has intrinsic atomic add on f32. cubecl-cpu
-        // does not, and its CAS-on-u32 fallback silently produces
-        // zeros in current cubecl (tested on 0.10). When the runtime
-        // does not advertise intrinsic atomic-f32-add support, fall
-        // back to the trait's composed-ops default. The fallback only
-        // affects tests; production training uses CUDA where the
-        // intrinsic path is selected.
-        let supports_fadd = client
-            .properties()
-            .atomic_type_usage(Type::new(StorageType::Atomic(FloatKind::F32.into())))
-            .contains(AtomicUsage::Add);
-
-        if !supports_fadd {
+        // CUDA (sm_60+) has intrinsic `atomicAdd(float*)` in hardware,
+        // but cubecl-cuda 0.10 does not register scalar `Atomic<F32>`
+        // Add in its runtime.rs (only F64 at sm_60+, F16 at sm_70+,
+        // F32x2/F32x4 at sm_90+; see lines 177-258). So the standard
+        // `client.properties().atomic_type_usage(...)` check returns
+        // false even on a 4090 where the op runs fine. We gate on the
+        // `cuda` feature instead: production training has it on and
+        // takes the kernel path; cubecl-cpu test builds do not and
+        // fall back to composed ops (cubecl-cpu has neither intrinsic
+        // atomic f32 nor a working CAS-on-u32 fallback in 0.10).
+        //
+        // Cleanup path: a cubecl-cuda PR adding the missing scalar
+        // `Atomic<F32>` Add registration at the `arch_version >= 60`
+        // block lets us swap the cfg gate back for the runtime probe.
+        if !cfg!(feature = "cuda") {
             return default_backward_weight::<Self>(grad_out, indices, values, mask, vocab);
         }
 
