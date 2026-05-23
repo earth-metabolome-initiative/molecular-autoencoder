@@ -1,10 +1,15 @@
 use super::api::SparseInputLinearKernelBackend;
-use super::kernels::sparse_input_linear_forward_kernel;
+use super::kernels::{
+    IntrinsicFloatAtomicAddFamily, sparse_input_linear_backward_weight_kernel,
+    sparse_input_linear_forward_kernel,
+};
 use burn::tensor::Shape;
 use burn::tensor::ops::{FloatTensor, IntTensor};
+use burn_cubecl::cubecl::ir::{FloatKind, StorageType, Type};
 use burn_cubecl::cubecl::{CubeDim, calculate_cube_count_elemwise};
 use burn_cubecl::ops::numeric::{empty_device_dtype, zeros_client};
 use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement};
+use cubecl::ir::features::AtomicUsage;
 
 impl<R, F, I, BT> SparseInputLinearKernelBackend for CubeBackend<R, F, I, BT>
 where
@@ -97,4 +102,110 @@ where
 
         output
     }
+
+    fn sparse_input_linear_backward_weight(
+        grad_out: FloatTensor<Self>,
+        indices: IntTensor<Self>,
+        values: FloatTensor<Self>,
+        mask: FloatTensor<Self>,
+        vocab: usize,
+    ) -> FloatTensor<Self> {
+        indices.assert_is_on_same_device(&grad_out);
+        indices.assert_is_on_same_device(&values);
+        indices.assert_is_on_same_device(&mask);
+
+        let client = grad_out.client.clone();
+
+        // CUDA (sm_60+) has intrinsic atomic add on f32. cubecl-cpu
+        // does not, and its CAS-on-u32 fallback silently produces
+        // zeros in current cubecl (tested on 0.10). When the runtime
+        // does not advertise intrinsic atomic-f32-add support, fall
+        // back to the trait's composed-ops default. The fallback only
+        // affects tests; production training uses CUDA where the
+        // intrinsic path is selected.
+        let supports_fadd = client
+            .properties()
+            .atomic_type_usage(Type::new(StorageType::Atomic(FloatKind::F32.into())))
+            .contains(AtomicUsage::Add);
+
+        if !supports_fadd {
+            return default_backward_weight::<Self>(grad_out, indices, values, mask, vocab);
+        }
+
+        let device = grad_out.device.clone();
+        let dtype = grad_out.dtype;
+
+        let [batch, max_nnz] = indices.meta.shape().dims();
+        let [_grad_batch, hidden] = grad_out.meta.shape().dims();
+
+        let grad_w = zeros_client::<R>(
+            client.clone(),
+            device.clone(),
+            Shape::new([vocab, hidden]),
+            dtype,
+        );
+
+        let total = batch * max_nnz * hidden;
+        let cube_dim = CubeDim::new(&client, total);
+        let cube_count = calculate_cube_count_elemwise(&client, total, cube_dim);
+
+        // Inlined equivalent of the (crate-private) `address_type!`
+        // macro: the kernel's dynamic-address resolution wants the max
+        // address-type across all tensor args.
+        let address_type = [
+            grad_out.required_address_type(),
+            indices.required_address_type(),
+            values.required_address_type(),
+            mask.required_address_type(),
+            grad_w.required_address_type(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or_default();
+
+        sparse_input_linear_backward_weight_kernel::launch::<IntrinsicFloatAtomicAddFamily, I, R>(
+            &client,
+            cube_count,
+            cube_dim,
+            address_type,
+            grad_out.into_tensor_arg(),
+            indices.into_tensor_arg(),
+            values.into_tensor_arg(),
+            mask.into_tensor_arg(),
+            grad_w.clone().into_tensor_arg(),
+            max_nnz as u32,
+            hidden as u32,
+            [dtype.into(), dtype.into()],
+        );
+
+        grad_w
+    }
+}
+
+/// Composed-ops backward used as the fallback when the runtime cannot
+/// support the intrinsic atomic-f32-add kernel. Replicates the trait's
+/// default impl as a free function so the trait override can delegate
+/// to it without re-entering its own trait method.
+fn default_backward_weight<B: SparseInputLinearKernelBackend>(
+    grad_out: FloatTensor<B>,
+    indices: IntTensor<B>,
+    values: FloatTensor<B>,
+    mask: FloatTensor<B>,
+    vocab: usize,
+) -> FloatTensor<B> {
+    use burn::tensor::{IndexingUpdateOp, Int, Tensor, TensorPrimitive};
+    let grad_out_t = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(grad_out));
+    let indices_t = Tensor::<B, 2, Int>::from_primitive(indices);
+    let values_t = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(values));
+    let mask_t = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(mask));
+    let [batch, _max_nnz] = indices_t.dims();
+    let device = values_t.device();
+    let dense = Tensor::<B, 2>::zeros([batch, vocab], &device).scatter(
+        1,
+        indices_t,
+        values_t * mask_t,
+        IndexingUpdateOp::Add,
+    );
+    let grad_w = dense.transpose().matmul(grad_out_t);
+    grad_w.into_primitive().tensor()
 }

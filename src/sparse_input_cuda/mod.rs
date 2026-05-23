@@ -18,7 +18,10 @@
     clippy::cast_possible_truncation,
     clippy::comparison_chain,
     clippy::too_many_arguments,
-    clippy::trivially_copy_pass_by_ref
+    clippy::trivially_copy_pass_by_ref,
+    clippy::used_underscore_binding,
+    missing_docs,
+    clippy::missing_docs_in_private_items
 )]
 
 /// Public trait + free function entry point. Always compiled so the

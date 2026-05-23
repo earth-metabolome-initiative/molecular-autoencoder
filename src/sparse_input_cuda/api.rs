@@ -70,6 +70,38 @@ pub trait SparseInputLinearKernelBackend: Backend {
     ) -> FloatTensor<Self> {
         Self::sparse_input_linear_forward(weight, indices, values, mask, bias)
     }
+
+    /// Weight-gradient backward for the kernel forward. `vocab` is the
+    /// dense weight first-dim, needed to allocate `grad_W` since the
+    /// indices tensor does not encode it.
+    ///
+    /// Default body reconstructs the dense input via `scatter` and uses
+    /// `dense.transpose().matmul(grad_out)` to produce the gradient.
+    /// CubeBackend overrides with the atomic scatter-add kernel that
+    /// never materialises the dense intermediate. ulp-nondeterministic
+    /// in the kernel path; acceptable for ML training.
+    fn sparse_input_linear_backward_weight(
+        grad_out: FloatTensor<Self>,
+        indices: IntTensor<Self>,
+        values: FloatTensor<Self>,
+        mask: FloatTensor<Self>,
+        vocab: usize,
+    ) -> FloatTensor<Self> {
+        let grad_out_t = BurnTensor::<Self, 2>::from_primitive(TensorPrimitive::Float(grad_out));
+        let indices_t = BurnTensor::<Self, 2, TensorInt>::from_primitive(indices);
+        let values_t = BurnTensor::<Self, 2>::from_primitive(TensorPrimitive::Float(values));
+        let mask_t = BurnTensor::<Self, 2>::from_primitive(TensorPrimitive::Float(mask));
+        let [batch, _max_nnz] = indices_t.dims();
+        let device = values_t.device();
+        let dense = BurnTensor::<Self, 2>::zeros([batch, vocab], &device).scatter(
+            1,
+            indices_t,
+            values_t * mask_t,
+            IndexingUpdateOp::Add,
+        );
+        let grad_w = dense.transpose().matmul(grad_out_t);
+        grad_w.into_primitive().tensor()
+    }
 }
 
 /// Free-function entry that hides the trait machinery from call sites.

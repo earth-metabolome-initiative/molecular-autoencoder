@@ -4,16 +4,15 @@ use burn::backend::autodiff::checkpoint::{base::Checkpointer, strategy::Checkpoi
 use burn::backend::autodiff::grads::Gradients;
 use burn::backend::autodiff::ops::{Backward, Ops, OpsKind};
 use burn::tensor::ops::{FloatTensor, IntTensor};
-use burn::tensor::{IndexingUpdateOp, Int, Tensor, TensorMetadata, TensorPrimitive};
+use burn::tensor::{Tensor, TensorMetadata, TensorPrimitive};
 
 /// Hand-written backward for the forward EmbeddingBag-style kernel.
 ///
-/// The forward saves nothing (no `[batch, max_nnz, hidden]`
-/// intermediate); the backward re-materialises the dense input via the
-/// standard `scatter`-add and routes `grad_W` through the inner
-/// backend's dense matmul. This wastes the would-be matmul of a
-/// custom backward kernel but keeps the change reversible and avoids
-/// the `atomic<f32>` cubecl-cpu gap. `grad_b` is just
+/// Delegates the weight gradient to
+/// [`SparseInputLinearKernelBackend::sparse_input_linear_backward_weight`]
+/// on the inner backend, which uses an atomic scatter-add kernel on
+/// CubeBackend (no dense `[batch, vocab]` intermediate, replaces the
+/// dense forward-side `select_assign` that nsys flagged). `grad_b` is
 /// `grad_out.sum_dim(0)` when bias is present.
 #[derive(Debug)]
 struct SparseInputLinearBackward<B>
@@ -56,19 +55,14 @@ where
         };
 
         if let Some(weight_parent) = weight_parent {
-            let indices_t = Tensor::<B, 2, Int>::from_primitive(self.indices);
-            let values_t = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(self.values));
-            let mask_t = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(self.mask));
-            let [batch, _max_nnz] = indices_t.dims();
-            let device = grad_out_t.device();
-            let dense = Tensor::<B, 2>::zeros([batch, self.vocab], &device).scatter(
-                1,
-                indices_t,
-                values_t * mask_t,
-                IndexingUpdateOp::Add,
+            let grad_w = B::sparse_input_linear_backward_weight(
+                grad_out,
+                self.indices,
+                self.values,
+                self.mask,
+                self.vocab,
             );
-            let grad_w = dense.transpose().matmul(grad_out_t.clone());
-            grads.register::<B>(weight_parent.id, grad_w.into_primitive().tensor());
+            grads.register::<B>(weight_parent.id, grad_w);
         }
 
         if let Some(bias_parent) = bias_parent {
