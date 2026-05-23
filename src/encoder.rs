@@ -254,7 +254,9 @@ pub struct MoleculeEncoder<B: Backend> {
     device: B::Device,
 }
 
-impl<B: Backend<FloatElem = f32>> MoleculeEncoder<B> {
+impl<B: Backend<FloatElem = f32> + crate::sparse_input_cuda::SparseInputLinearKernelBackend>
+    MoleculeEncoder<B>
+{
     /// Loads `model-config.json` and `model.mpk` from a training run
     /// directory.
     ///

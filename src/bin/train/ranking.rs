@@ -17,18 +17,36 @@ use molecular_autoencoder::{
 };
 
 /// Backend trait alias used by training loops to allow CUDA-only metric paths.
+/// Always includes `SparseInputLinearKernelBackend` so the model's
+/// encoder-input op is callable on any backend that wears this alias.
 #[cfg(feature = "cuda")]
-pub trait TanimotoMetricBackend: Backend + CountedTanimotoKernelBackend {}
+pub trait TanimotoMetricBackend:
+    Backend
+    + CountedTanimotoKernelBackend
+    + molecular_autoencoder::sparse_input_cuda::SparseInputLinearKernelBackend
+{
+}
 
 #[cfg(feature = "cuda")]
-impl<B> TanimotoMetricBackend for B where B: Backend + CountedTanimotoKernelBackend {}
+impl<B> TanimotoMetricBackend for B where
+    B: Backend
+        + CountedTanimotoKernelBackend
+        + molecular_autoencoder::sparse_input_cuda::SparseInputLinearKernelBackend
+{
+}
 
 /// Backend trait alias used by training loops to allow CUDA-only metric paths.
 #[cfg(not(feature = "cuda"))]
-pub trait TanimotoMetricBackend: Backend {}
+pub trait TanimotoMetricBackend:
+    Backend + molecular_autoencoder::sparse_input_cuda::SparseInputLinearKernelBackend
+{
+}
 
 #[cfg(not(feature = "cuda"))]
-impl<B> TanimotoMetricBackend for B where B: Backend {}
+impl<B> TanimotoMetricBackend for B where
+    B: Backend + molecular_autoencoder::sparse_input_cuda::SparseInputLinearKernelBackend
+{
+}
 
 /// Per-batch deterministic seed derived from `(epoch, batch_index, peer_id)`.
 ///

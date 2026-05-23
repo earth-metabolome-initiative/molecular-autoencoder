@@ -16,6 +16,7 @@ pub mod fingerprints;
 pub mod metrics;
 pub mod model;
 pub mod ranking;
+pub mod sparse_input_cuda;
 #[cfg(any(feature = "cuda", feature = "cubecl-cpu"))]
 pub mod tanimoto_cuda;
 #[cfg(feature = "train")]

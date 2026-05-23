@@ -1848,7 +1848,7 @@ pub struct Encoder<B: Backend> {
     activation: Relu,
 }
 
-impl<B: Backend> Encoder<B> {
+impl<B: crate::sparse_input_cuda::SparseInputLinearKernelBackend> Encoder<B> {
     /// Encodes sparse log-count features.
     pub fn forward(&self, fingerprints: &SparseFingerprintBatch<B>) -> Tensor<B, 2> {
         let mut features = self.activation.forward(self.input.forward(fingerprints));
@@ -1875,13 +1875,27 @@ pub struct SparseInputLinear<B: Backend> {
     linear: Linear<B>,
 }
 
-impl<B: Backend> SparseInputLinear<B> {
-    /// Applies `xW + b` after materializing dense input fingerprints on the backend device.
+impl<B: crate::sparse_input_cuda::SparseInputLinearKernelBackend> SparseInputLinear<B> {
+    /// Applies `xW + b` directly on the sparse `(indices, log_counts,
+    /// mask)` triple via the EmbeddingBag-style kernel (cubecl path) or
+    /// the ndarray composed-ops fallback, depending on which backend
+    /// implementation is selected. Eliminates the dense `[batch,
+    /// fingerprint_size]` intermediate that previously cost ~22% of
+    /// training GPU time as `select_assign_kernel`.
     pub fn forward(&self, fingerprints: &SparseFingerprintBatch<B>) -> Tensor<B, 2> {
-        self.forward_dense(fingerprints.to_dense_log_counts())
+        let weight = self.linear.weight.val();
+        let bias = self.linear.bias.as_ref().map(burn::module::Param::val);
+        let values = fingerprints.log_counts.clone();
+        let mask = fingerprints.mask.clone();
+        let indices = fingerprints.indices.clone();
+        crate::sparse_input_cuda::sparse_input_linear_forward(weight, indices, values, mask, bias)
     }
+}
 
-    /// Applies the same projection to an already dense tensor.
+impl<B: Backend> SparseInputLinear<B> {
+    /// Applies the same projection to an already dense tensor. Retained
+    /// for the metric-side callers that already hold a dense tensor and
+    /// for the unit tests that need a reference forward path.
     pub fn forward_dense(&self, features: Tensor<B, 2>) -> Tensor<B, 2> {
         self.linear.forward(features)
     }
@@ -2049,7 +2063,7 @@ pub struct MoleculeAutoencoder<B: Backend> {
     latent_noise_std: f64,
 }
 
-impl<B: Backend> MoleculeAutoencoder<B> {
+impl<B: crate::sparse_input_cuda::SparseInputLinearKernelBackend> MoleculeAutoencoder<B> {
     /// Reconstructs the per-bin reconstruction-loss config from the
     /// scalar fields stored on the module (Burn modules can't hold
     /// nested config structs directly).

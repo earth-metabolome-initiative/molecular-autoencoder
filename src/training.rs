@@ -106,7 +106,9 @@ mod train_impl {
         training::MoleculeAutoencoderTrainingOutput,
     };
 
-    impl<B: AutodiffBackend> TrainStep for MoleculeAutoencoder<B> {
+    impl<B: AutodiffBackend + crate::sparse_input_cuda::SparseInputLinearKernelBackend> TrainStep
+        for MoleculeAutoencoder<B>
+    {
         type Input = MoleculeAutoencoderBatch<B>;
         type Output = MoleculeAutoencoderTrainingOutput<B>;
 
@@ -135,7 +137,9 @@ mod train_impl {
         }
     }
 
-    impl<B: burn::prelude::Backend> InferenceStep for MoleculeAutoencoder<B> {
+    impl<B: burn::prelude::Backend + crate::sparse_input_cuda::SparseInputLinearKernelBackend>
+        InferenceStep for MoleculeAutoencoder<B>
+    {
         type Input = MoleculeAutoencoderBatch<B>;
         type Output = MoleculeAutoencoderTrainingOutput<B>;
 
