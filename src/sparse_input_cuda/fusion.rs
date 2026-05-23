@@ -80,6 +80,47 @@ where
             .pop()
             .expect("sparse-input-linear custom op has one output")
     }
+
+    fn sparse_input_linear_backward_weight(
+        grad_out: FloatTensor<Self>,
+        indices: IntTensor<Self>,
+        values: FloatTensor<Self>,
+        mask: FloatTensor<Self>,
+        vocab: usize,
+    ) -> FloatTensor<Self> {
+        let [_grad_batch, hidden] = grad_out.shape.dims();
+        let dtype = grad_out.dtype;
+        let output_shape = Shape::new([vocab, hidden]);
+        let client = grad_out.client.clone();
+        let output = TensorIr::uninit(client.create_empty_handle(), output_shape, dtype);
+
+        let streams = OperationStreams::with_inputs([&grad_out, &indices, &values, &mask]);
+        let inputs = [
+            grad_out.clone().into_ir(),
+            indices.clone().into_ir(),
+            values.clone().into_ir(),
+            mask.clone().into_ir(),
+        ];
+        let desc = CustomOpIr::new(
+            "sparse_input_linear_backward_weight",
+            &inputs,
+            std::slice::from_ref(&output),
+        );
+
+        let mut outputs = client.register(
+            streams,
+            OperationIr::Custom(desc.clone()),
+            SparseInputLinearBackwardWeightFusion::<B> {
+                desc,
+                vocab,
+                backend: PhantomData,
+            },
+        );
+
+        outputs
+            .pop()
+            .expect("sparse-input-linear backward custom op has one output")
+    }
 }
 
 /// Fusion operation shim that replays the kernel on the inner backend
@@ -115,5 +156,35 @@ where
         let output = B::sparse_input_linear_forward_kernel(weight, indices, values, mask, bias);
         let _ = B::FloatElem::dtype();
         handles.register_float_tensor::<B>(&self.desc.outputs[0].id, output);
+    }
+}
+
+/// Fusion operation shim for the backward weight gradient.
+#[cfg(feature = "cuda-fusion")]
+#[derive(Debug)]
+struct SparseInputLinearBackwardWeightFusion<B: FusionBackend> {
+    /// Fusion-IR descriptor binding the inputs/outputs to handles.
+    desc: CustomOpIr,
+    /// Dense weight first-dim, needed to allocate `grad_W` at replay.
+    vocab: usize,
+    /// Phantom marker for the inner fusion backend.
+    backend: PhantomData<B>,
+}
+
+#[cfg(feature = "cuda-fusion")]
+impl<B> Operation<B::FusionRuntime> for SparseInputLinearBackwardWeightFusion<B>
+where
+    B: FusionBackend + SparseInputLinearKernelBackend + Send + Sync,
+{
+    fn execute(&self, handles: &mut burn_ir::HandleContainer<B::Handle>) {
+        let inputs = self.desc.inputs.as_slice();
+        let grad_out = handles.get_float_tensor::<B>(&inputs[0]);
+        let indices = handles.get_int_tensor::<B>(&inputs[1]);
+        let values = handles.get_float_tensor::<B>(&inputs[2]);
+        let mask = handles.get_float_tensor::<B>(&inputs[3]);
+
+        let grad_w =
+            B::sparse_input_linear_backward_weight(grad_out, indices, values, mask, self.vocab);
+        handles.register_float_tensor::<B>(&self.desc.outputs[0].id, grad_w);
     }
 }
