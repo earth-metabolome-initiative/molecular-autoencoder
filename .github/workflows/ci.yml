@@ -16,7 +16,7 @@ permissions:
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout
@@ -49,7 +49,7 @@ jobs:
     name: CUDA type-check
     # Pin to 22.04 (jammy). NVIDIA only began publishing ubuntu2404 (noble)
     # CUDA packages from 12.5 onwards, so the Jimver action's 12.4.x apt path
-    # fails on `ubuntu-latest` (24.04). 22.04 carries the full 12.x history.
+    # fails on `ubuntu-24.04`. 22.04 carries the full 12.x history.
     runs-on: ubuntu-22.04
 
     steps:
@@ -90,7 +90,7 @@ jobs:
 
   coverage:
     name: Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -127,7 +127,7 @@ jobs:
 
   shell:
     name: Shell scripts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout
@@ -149,7 +149,7 @@ jobs:
 
   wasm:
     name: wasm32 build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout
